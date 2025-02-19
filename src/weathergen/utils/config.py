@@ -10,6 +10,7 @@
 from pathlib import Path
 import json
 import os
+from weathergen.utils.configconf_validation import read, write
 
 ###########################################
 class Config :
@@ -43,9 +44,8 @@ class Config :
       epoch_str = '_latest' if epoch==-1 else '_epoch{:05d}'.format(epoch)
     fname += '{}.json'.format( epoch_str)
 
+    write(self.__dict__, fname)
     json_str = json.dumps(self.__dict__ )
-    with open(fname, 'w') as f :
-      f.write( json_str)
 
   @staticmethod
   def load( run_id, epoch=None) :
@@ -63,7 +63,7 @@ class Config :
       json_str = f.readlines()
 
     cf = Config()
-    cf.__dict__ = json.loads( json_str[0])
+    cf.__dict__ = read(fname))
 
     return cf
 
