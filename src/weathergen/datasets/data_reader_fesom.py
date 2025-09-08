@@ -8,7 +8,6 @@
 # nor does it submit to any jurisdiction.
 
 import glob
-import logging
 from pathlib import Path
 from typing import override
 
@@ -17,7 +16,6 @@ import dask.array as da
 import numpy as np
 import zarr
 
-from weathergen.utils.logger import logger
 from weathergen.datasets.data_reader_base import (
     DataReaderTimestep,
     DTRange,
@@ -27,6 +25,7 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
     t_epsilon,
 )
+from weathergen.utils.logger import logger
 
 
 class DataReaderFesom(DataReaderTimestep):
