@@ -17,6 +17,7 @@ import dask.array as da
 import numpy as np
 import zarr
 
+from weathergen.utils.grids import temporal_coords, healpix_coords, regular_grid_coords
 from weathergen.datasets.data_reader_base import (
     DataReaderTimestep,
     DTRange,
@@ -65,6 +66,8 @@ class DataReaderFesom(DataReaderTimestep):
         self.geoinfo_channels = []
         self.geoinfo_idx = []
         self.properties = {}
+        self.fake_specs = {}
+        self.fake_target = False
 
         if len(self.filenames) == 0:
             name = stream_info["name"]
@@ -81,6 +84,11 @@ class DataReaderFesom(DataReaderTimestep):
 
         # This flag ensures initialization happens only once per worker
         self._initialized = False
+        # print(f"checking stream info {list(stream_info.keys())}")
+        if "fake" in stream_info:
+            self.fake_lat, self.fake_lon = self.make_fake_coords(stream_info["fake"])
+            self.fake_target = True
+            self.fake_specs = stream_info["fake"]
 
     def _lazy_init(self) -> None:
         """
@@ -198,6 +206,17 @@ class DataReaderFesom(DataReaderTimestep):
         self.geoinfo_idx = []
 
         self._initialized = True
+
+    def make_fake_coords(self, specs: dict) -> tuple[NDArray, NDArray]:
+        """
+        Based on specification creates coordinates regardless of underlying dataset
+        """
+        if specs["type"] == "healpix":
+            return healpix_coords(specs)
+        elif specs["type"] == "regular":
+            return regular_grid_coords(specs)
+        else:
+            raise NotImplementedError("Only healpix and regular grid types are supported")
 
     def select(
         self, ch_filters: list[str] | None, excl: list[str] | None = None
@@ -321,3 +340,26 @@ class DataReaderFesom(DataReaderTimestep):
         )
 
         return rd
+
+    @override
+    def get_target(self, idx: TIndex) -> ReaderData:
+        if self.fake_target:
+            coords = np.stack([self.fake_lat, self.fake_lon], axis=1)
+            dtr = self.time_window_handler.window(idx)
+            datetimes = temporal_coords(dtr, self.fake_specs)
+            samples = coords.shape[0]
+            steps = datetimes.shape[0]
+
+            datetimes = np.repeat(datetimes, samples)
+            coords = np.vstack([coords] * steps)
+            geoinfos = np.zeros((coords.shape[0], 0), dtype=np.float32)
+            data = np.zeros((coords.shape[0], len(self.target_idx)), dtype=np.float32)
+            # print(f"faking the data for data: {data.shape} coords: {coords.shape}")
+            return ReaderData(
+                data=data,
+                coords=coords,
+                datetimes=datetimes,
+                geoinfos=geoinfos,
+            )
+        else:
+            return self._get(idx, self.target_idx)
