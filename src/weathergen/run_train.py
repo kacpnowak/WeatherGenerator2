@@ -16,6 +16,7 @@ import pdb
 import sys
 import time
 import traceback
+from omegaconf import OmegaConf
 from pathlib import Path
 
 import weathergen.utils.cli as cli
@@ -47,8 +48,10 @@ def inference_from_args(argl: list[str]):
         log_validation=args.samples if args.save_samples else 0,
         analysis_streams_output=args.analysis_streams_output,
     )
-
+    fake_grid = {"fake": cli.parse_key_value_args(args.fake_grid)}
+    print(f"faking args: {fake_grid}")
     cli_overwrite = config.from_cli_arglist(args.options)
+
     cf = config.load_config(
         args.private_config,
         args.from_run_id,
@@ -58,6 +61,17 @@ def inference_from_args(argl: list[str]):
         cli_overwrite,
     )
     cf = config.set_run_id(cf, args.run_id, args.reuse_run_id)
+
+    if args.fake_grid:
+        cf.masking_rate = 1.0  # Cancel masking rate
+        cf.masking_rate_sampling = False
+        cf.training_mode = "forecast"  # Set mode to forecast
+        streams = cf.streams
+        new_streams = []
+        for stream in streams:
+            new_streams += [OmegaConf.merge(stream, fake_grid)]
+
+        cf.streams = new_streams
 
     fname_debug_logging = f"./logs/debug_log_{cf.run_id}.txt"
     init_loggers(logging_level=logging.DEBUG, debug_output_streams=fname_debug_logging)

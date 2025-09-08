@@ -19,27 +19,27 @@ def regular_grid_coords(specs: dict) -> tuple[np.ndarray, np.ndarray]:
     lat_res = 1
     lon_res = 1
     if "res" in specs:
-        lat_res = int(specs["res"])
+        lat_res = float(specs["res"])
         lon_res = lat_res
     elif "lat_res" in specs and "lon_res" in specs:
-        lat_res = int(specs["lat_res"])
-        lon_res = int(specs["lon_res"])
+        lat_res = float(specs["lat_res"])
+        lon_res = float(specs["lon_res"])
     else:
         raise AttributeError("Specification must contain res or lat_res and lon_res")
 
-    lat_min = specs["lat_min"] if "lat_min" in specs else 0
-    lat_max = specs["lat_max"] if "lat_max" in specs else 180
+    lat_min = float(specs["lat_min"]) if "lat_min" in specs else -90
+    lat_max = float(specs["lat_max"]) if "lat_max" in specs else 90
 
-    lon_min = specs["lon_min"] if "lon_min" in specs else 0
-    lon_max = specs["lon_max"] if "lon_max" in specs else 360
+    lon_min = float(specs["lon_min"]) if "lon_min" in specs else 0
+    lon_max = float(specs["lon_max"]) if "lon_max" in specs else 360
 
-    lat = np.arange(lat_min, lat_max, lat_res)
-    lon = np.arange(lon_min, lon_max, lon_res)
+    lat = np.arange(lat_min, lat_max, lat_res, dtype=np.float32)
+    lon = np.arange(lon_min, lon_max, lon_res, dtype=np.float32)
 
     nx = len(lon)
     ny = len(lat)
 
-    lats = np.zeros((nx, ny))
+    lats = np.zeros((nx, ny), dtype=np.float32)
     lons = lats.copy()
 
     for i in range(nx):
