@@ -17,6 +17,7 @@ import dask.array as da
 import numpy as np
 import zarr
 
+from weathergen.utils.logger import logger
 from weathergen.datasets.data_reader_base import (
     DataReaderTimestep,
     DTRange,
@@ -26,8 +27,6 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
     t_epsilon,
 )
-
-_logger = logging.getLogger(__name__)
 
 
 class DataReaderFesom(DataReaderTimestep):
@@ -68,7 +67,7 @@ class DataReaderFesom(DataReaderTimestep):
 
         if len(self.filenames) == 0:
             name = stream_info["name"]
-            _logger.warning(
+            logger.warning(
                 f"{name} couldn't find any files matching {filename}. Stream is skipped."
             )
             super().__init__(tw_handler, stream_info)
@@ -108,7 +107,7 @@ class DataReaderFesom(DataReaderTimestep):
 
         if start_ds > self._tw_handler.t_end or end_ds < self._tw_handler.t_start:
             name = self._stream_info["name"]
-            _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
+            logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
             self.init_empty()
             self._initialized = True
             return
