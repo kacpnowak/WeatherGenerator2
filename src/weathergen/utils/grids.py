@@ -73,7 +73,7 @@ def healpix_coords(specs: dict) -> tuple[np.ndarray, np.ndarray]:
 
     # Get spherical coordinates (lon, lat)
     lon, lat = hp.healpix_to_lonlat(pix)
-    return np.degrees(lat) + 90.0, np.degrees(lon)
+    return np.degrees(lat).astype(np.float32), np.degrees(lon).astype(np.float32)
 
 
 def temporal_coords(range: DTRange, specs: dict) -> np.ndarray:
