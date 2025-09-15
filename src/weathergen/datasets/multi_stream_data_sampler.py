@@ -134,11 +134,10 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                         raise FileNotFoundError(msg)
 
                 ds_type = stream_info["type"]
-                if is_root():
-                    logger.info(
-                        f"Opening dataset with type: {ds_type}"
-                        + f"from stream config {stream_info['name']}.",
-                    )
+                logger.info(
+                    f"Opening dataset with type: {ds_type}"
+                    + f" from stream config {stream_info['name']}.",
+                )
                 ds = dataset(filename=filename, **kwargs)
 
                 fsm = self.forecast_steps[0]
