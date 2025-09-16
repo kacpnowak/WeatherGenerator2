@@ -8,6 +8,7 @@
 # nor does it submit to any jurisdiction.
 
 import glob
+import logging
 from pathlib import Path
 from typing import override
 
@@ -25,7 +26,8 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
     t_epsilon,
 )
-from weathergen.utils.logger import logger
+
+_logger = logging.getLogger(__name__)
 
 
 class DataReaderFesom(DataReaderTimestep):
@@ -66,7 +68,7 @@ class DataReaderFesom(DataReaderTimestep):
 
         if len(self.filenames) == 0:
             name = stream_info["name"]
-            logger.warning(
+            _logger.warning(
                 f"{name} couldn't find any files matching {filename}. Stream is skipped."
             )
             super().__init__(tw_handler, stream_info)
@@ -106,7 +108,7 @@ class DataReaderFesom(DataReaderTimestep):
 
         if start_ds > self._tw_handler.t_end or end_ds < self._tw_handler.t_start:
             name = self._stream_info["name"]
-            logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
+            _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
             self.init_empty()
             self._initialized = True
             return
