@@ -12,9 +12,11 @@ start_date_val: 220001010000
 end_date_val: 222012310000
 
 num_epochs: 111
-samples_per_epoch: 16392
-samples_per_validation: 1024
+samples_per_epoch: 16 #16392
+samples_per_validation: 4 #1024
 shuffle: True
-loader_num_workers: 4
+
+loader_num_workers: 2
+training_mode: "forecast"
 
 lr_max: 2e-5
