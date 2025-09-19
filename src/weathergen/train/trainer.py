@@ -219,12 +219,14 @@ class Trainer(TrainerBase):
 
         if cf.with_ddp and cf.with_fsdp:
             fsdp_kwargs = {
-                "mp_policy": MixedPrecisionPolicy(
-                    param_dtype=self.mixed_precision_dtype,
-                    reduce_dtype=torch.float32,
-                )
-                if cf.with_mixed_precision
-                else None,
+                "mp_policy": (
+                    MixedPrecisionPolicy(
+                        param_dtype=self.mixed_precision_dtype,
+                        reduce_dtype=torch.float32,
+                    )
+                    if cf.with_mixed_precision
+                    else None
+                ),
             }
             modules_to_shard = (
                 MLP,
@@ -255,12 +257,14 @@ class Trainer(TrainerBase):
                     fully_shard(module, **fsdp_kwargs)
 
             full_precision_fsdp_kwargs = {
-                "mp_policy": MixedPrecisionPolicy(
-                    param_dtype=torch.float32,
-                    reduce_dtype=torch.float32,
-                )
-                if cf.with_mixed_precision
-                else None,
+                "mp_policy": (
+                    MixedPrecisionPolicy(
+                        param_dtype=torch.float32,
+                        reduce_dtype=torch.float32,
+                    )
+                    if cf.with_mixed_precision
+                    else None
+                ),
             }
             for module in self.model.pred_adapter_kv.modules():
                 if isinstance(module, modules_to_shard):
@@ -287,6 +291,31 @@ class Trainer(TrainerBase):
             self.load_model(self.cf.from_run_id, epoch_contd)
             if is_root():
                 logger.info(f"Loaded model id={run_id_contd}.")
+
+            if cf.forecast_freeze_model:
+                needs_initialization = any(
+                    p.device.type == "meta" for p in self.model.fe_blocks.parameters()
+                )
+
+                if needs_initialization:
+                    if is_root():
+                        logger.info(
+                            "Forecasting engine not found in checkpoint. "
+                            "Materializing and initializing for the first fine-tuning epoch."
+                        )
+
+                    # 1. Materialize the fe_blocks from 'meta' to the actual device.
+                    self.model.fe_blocks.to_empty(device=self.device)
+
+                    # 2. Apply the specific small-variance initialization for fine-tuning layers.
+                    def init_weights_final(m):
+                        if isinstance(m, torch.nn.Linear):
+                            torch.nn.init.normal_(m.weight, mean=0, std=0.001)
+                            if m.bias is not None:
+                                torch.nn.init.normal_(m.bias, mean=0, std=0.001)
+
+                    self.model.fe_blocks.apply(init_weights_final)
+
         self.model_params.reset_parameters(cf)
         self.model_params = self.model_params.to(self.device)
 
@@ -692,7 +721,7 @@ class Trainer(TrainerBase):
         """
 
         path_run = Path(self.cf.model_path) / run_id
-        epoch_id = f"epoch{epoch:05d}" if epoch != -1 and epoch is not None else "latest"
+        epoch_id = f"epoch{epoch:05d}" if epoch != -1 and epoch is not None else ""
         filename = f"{run_id}_{epoch_id}.chkpt"
 
         params = torch.load(
