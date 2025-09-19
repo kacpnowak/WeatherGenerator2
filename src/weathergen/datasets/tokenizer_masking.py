@@ -243,6 +243,7 @@ class TokenizerMasking(Tokenizer):
             return [], 0
 
         num_selected = valid_mask.sum().item()
+        perm = torch.tensor(perm)
         selected_indices = perm[:num_selected]
         selected_indices = torch.zeros_like(perm).scatter(0, selected_indices, 1)
 

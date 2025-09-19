@@ -15,7 +15,7 @@ import pathlib
 from datetime import datetime
 from functools import cache
 
-from weathergen.utils.config import _load_private_conf
+from weathergen.common.config import _load_private_conf
 
 LOGGING_CONFIG = """
 {
@@ -117,10 +117,12 @@ def init_loggers(run_id, logging_config=None):
     """
 
     # Get current time
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%d-%H%M")
+    # Shelved until decided how to change logging directory structure
+    # now = datetime.now()
+    # timestamp = now.strftime("%Y-%m-%d-%H%M")
 
-    output_dir = f"./output/{timestamp}-{run_id}"
+    # output_dir = f"./output/{timestamp}-{run_id}"
+    output_dir = f"./output/{run_id}"
 
     # load the structure for logging config
     if logging_config is None:

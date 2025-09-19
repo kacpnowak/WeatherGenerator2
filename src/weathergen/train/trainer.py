@@ -29,7 +29,8 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.tensor import DTensor, distribute_tensor
 
-import weathergen.utils.config as config
+import weathergen.common.config as config
+from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.attention import (
     MultiCrossAttentionHeadVarlen,
@@ -44,9 +45,9 @@ from weathergen.model.utils import freeze_weights
 from weathergen.train.loss_calculator import LossCalculator
 from weathergen.train.lr_scheduler import LearningRateScheduler
 from weathergen.train.trainer_base import TrainerBase
-from weathergen.utils.config import Config, get_dtype
-from weathergen.utils.distributed import all_gather_vlen, is_root
+from weathergen.utils.distributed import all_gather_vlen, is_root, ddp_average
 from weathergen.utils.train_logger import TRAIN, VAL, Stage, TrainLogger
+from weathergen.utils.utils import get_dtype
 from weathergen.utils.validation_io import write_output
 
 logger = logging.getLogger(__name__)
@@ -233,9 +234,9 @@ class Trainer(TrainerBase):
                 MultiCrossAttentionHeadVarlenSlicedQ,
                 MultiSelfAttentionHeadVarlen,
             )
-            for module in self.model.embeds.modules():
-                if isinstance(module, modules_to_shard):
-                    fully_shard(module, **fsdp_kwargs)
+            # for module in self.model.embeds.modules():
+            #     if isinstance(module, modules_to_shard):
+            #         fully_shard(module, **fsdp_kwargs)
 
             for module in self.model.ae_local_blocks.modules():
                 if isinstance(module, modules_to_shard):
@@ -282,8 +283,8 @@ class Trainer(TrainerBase):
             self.model.reset_parameters()
         else:
             if is_root():
-                logger.info(f"Continuing run with id={run_id_contd} at epoch {epoch_contd}.")
-            self.load_model(run_id_contd, epoch_contd)
+                logger.info(f"Continuing run with id={self.cf.from_run_id} at epoch {epoch_contd}.")
+            self.load_model(self.cf.from_run_id, epoch_contd)
             if is_root():
                 logger.info(f"Loaded model id={run_id_contd}.")
         self.model_params.reset_parameters(cf)
@@ -528,6 +529,7 @@ class Trainer(TrainerBase):
     def train(self, epoch):
         cf = self.cf
         self.model.train()
+        # torch.autograd.set_detect_anomaly(True)
         log_interval = self.cf.train_log.log_interval
 
         dataset_iter = iter(self.data_loader)
@@ -545,23 +547,25 @@ class Trainer(TrainerBase):
 
             # evaluate model
             with torch.autocast(
-                device_type="cuda",
+                device_type=f"cuda:{cf.local_rank}",
                 dtype=self.mixed_precision_dtype,
                 enabled=cf.with_mixed_precision,
             ):
                 preds, posteriors = self.model(
                     self.model_params, batch, cf.forecast_offset, forecast_steps
                 )
-                loss_values = self.loss_calculator.compute_loss(
-                    preds=preds,
-                    streams_data=batch[0],
-                )
-                if cf.latent_noise_kl_weight > 0.0:
-                    kl = torch.cat([posterior.kl() for posterior in posteriors])
-                    loss_values.loss += cf.latent_noise_kl_weight * kl.mean()
+            loss_values = self.loss_calculator.compute_loss(
+                preds=preds,
+                streams_data=batch[0],
+            )
+            if cf.latent_noise_kl_weight > 0.0:
+                kl = torch.cat([posterior.kl() for posterior in posteriors])
+                loss_values.loss += cf.latent_noise_kl_weight * kl.mean()
 
             # backward pass
+            self.optimizer.zero_grad()
             self.grad_scaler.scale(loss_values.loss).backward()
+            # loss_values.loss.backward()
 
             # gradient clipping
             self.grad_scaler.unscale_(self.optimizer)
@@ -570,7 +574,7 @@ class Trainer(TrainerBase):
             # optimizer step
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
-            self.optimizer.zero_grad()
+            # self.optimizer.step()
 
             # update learning rate
             self.lr_scheduler.step()
@@ -580,15 +584,15 @@ class Trainer(TrainerBase):
             self.stdev_unweighted_hist += [loss_values.stddev_all]
 
             perf_gpu, perf_mem = self.get_perf()
-            self.perf_gpu = 0  # ddp_average(torch.tensor([perf_gpu])).item()
-            self.perf_mem = 0  # ddp_average(torch.tensor([perf_mem])).item()
+            self.perf_gpu = ddp_average(torch.tensor([perf_gpu], device=self.device)).item()
+            self.perf_mem = ddp_average(torch.tensor([perf_mem], device=self.device)).item()
 
             self._log_terminal(bidx, epoch, TRAIN)
             if bidx % log_interval == 0:
                 self._log(TRAIN)
 
             # model checkpoint
-            if bidx % self.checkpoint_freq == (bidx - 1):
+            if bidx % self.checkpoint_freq == 0 and bidx > 0:
                 self.save_model(-1)
 
             self.cf.istep += cf.batch_size_per_gpu
@@ -613,7 +617,7 @@ class Trainer(TrainerBase):
 
                     # evaluate model
                     with torch.autocast(
-                        device_type="cuda",
+                        device_type=f"cuda:{cf.local_rank}",
                         dtype=self.mixed_precision_dtype,
                         enabled=cf.with_mixed_precision,
                     ):
@@ -697,7 +701,7 @@ class Trainer(TrainerBase):
         is_model_sharded = self.cf.with_ddp and self.cf.with_fsdp
         if is_model_sharded:
             meta_sharded_sd = self.model.state_dict()
-            sharded_sd = {}
+            maybe_sharded_sd = {}
             for param_name, full_tensor in params.items():
                 sharded_meta_param = meta_sharded_sd.get(param_name)
                 sharded_tensor = distribute_tensor(
@@ -705,15 +709,16 @@ class Trainer(TrainerBase):
                     sharded_meta_param.device_mesh,
                     sharded_meta_param.placements,
                 )
-                sharded_sd[param_name.replace("module.", "")] = nn.Parameter(sharded_tensor)
+                maybe_sharded_sd[param_name.replace("module.", "")] = nn.Parameter(sharded_tensor)
         else:
             maybe_sharded_sd = {}
             for k in params.keys():
                 maybe_sharded_sd[k.replace("module.", "")] = params[k]
         # choose `assign=True` for sharded model since we cannot call `copy_` on meta tensor
-        mkeys, ukeys = self.model.load_state_dict(
-            maybe_sharded_sd, strict=False, assign=is_model_sharded
-        )
+        mkeys, ukeys = self.model.load_state_dict(maybe_sharded_sd, strict=False, assign=True)
+
+        if not is_model_sharded:
+            self.model = self.model.to(self.device)
 
         if len(mkeys) > 0:
             logger.warning(f"Missing keys when loading model: {mkeys}")
@@ -863,7 +868,7 @@ class Trainer(TrainerBase):
         # Gather all tensors from all ranks into a list and stack them into one tensor again
         real_loss = torch.cat(all_gather_vlen(real_loss))
 
-        for stream in self.cf.streams:  # Loop over all steams
+        for stream in self.cf.streams:  # Loop over all streams
             stream_hist = [losses_all[stream.name] for losses_all in self.loss_unweighted_hist]
             stream_all = torch.stack(stream_hist).to(torch.float64)
             losses_all[stream.name] = torch.cat(all_gather_vlen(stream_all))

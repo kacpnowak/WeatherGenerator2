@@ -22,6 +22,7 @@ import torch.nn as nn
 from astropy_healpix import healpy
 from torch.utils.checkpoint import checkpoint
 
+from weathergen.common.config import Config
 from weathergen.model.engines import (
     EmbeddingEngine,
     EnsPredictionHead,
@@ -35,8 +36,8 @@ from weathergen.model.engines import (
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.parametrised_prob_dist import LatentInterpolator
 from weathergen.model.utils import get_num_parameters
-from weathergen.utils.config import Config, get_dtype
 from weathergen.utils.distributed import is_root
+from weathergen.utils.utils import get_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -712,7 +713,7 @@ class Model(torch.nn.Module):
             + [model_params.q_cells_lens[1:] for _ in range(batch_size)]
         )
 
-        # # local assimilation model
+        # local assimilation model
         # for block in self.ae_local_blocks:
         #     tokens = checkpoint(block, tokens, cell_lens, use_reentrant=False)
 
