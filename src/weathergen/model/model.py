@@ -250,13 +250,13 @@ class Model(torch.nn.Module):
         ###############
         # forecasting engine
         if isinstance(cf.forecast_steps, int):
-            assert not (cf.forecast_steps > 0 and cf.fe_num_blocks == 0), (
-                "Empty forecast engine (fe_num_blocks = 0), but forecast_steps > 0"
-            )
+            assert not (
+                cf.forecast_steps > 0 and cf.fe_num_blocks == 0
+            ), "Empty forecast engine (fe_num_blocks = 0), but forecast_steps > 0"
         else:
-            assert not (min(cf.forecast_steps) > 0 and cf.fe_num_blocks == 0), (
-                "Empty forecast engine (fe_num_blocks = 0), but forecast_steps[i] > 0 for some i"
-            )
+            assert not (
+                min(cf.forecast_steps) > 0 and cf.fe_num_blocks == 0
+            ), "Empty forecast engine (fe_num_blocks = 0), but forecast_steps[i] > 0 for some i"
 
         self.fe_blocks = ForecastingEngine(cf, self.num_healpix_cells).create()
 
@@ -398,6 +398,29 @@ class Model(torch.nn.Module):
 
         # unfreeze forecast part
         for p in self.fe_blocks.parameters():
+            p.requires_grad = True
+
+        return self
+
+    def freeze_weights_downscaling(self) -> "Model":
+        """Freezes core model weights and makes forecasting prediction heads weights trainable"""
+
+        # freeze everything
+        for p in self.parameters():
+            p.requires_grad = False
+        self.q_cells.requires_grad = False
+
+        # unfreeze prediction part
+        for p in self.pred_heads.parameters():
+            p.requires_grad = True
+
+        for p in self.pred_adapter_kv.parameters():
+            p.requires_grad = True
+
+        for p in self.target_token_engines.parameters():
+            p.requires_grad = True
+
+        for p in self.embed_target_coords.parameters():
             p.requires_grad = True
 
         return self
@@ -790,13 +813,15 @@ class Model(torch.nn.Module):
             with torch.amp.autocast("cuda", dtype=torch.float32, enabled=False):
                 tc_tokens = torch.cat(
                     [
-                        checkpoint(
-                            tc_embed,
-                            streams_data[i_b][ii].target_coords[fstep],
-                            use_reentrant=False,
+                        (
+                            checkpoint(
+                                tc_embed,
+                                streams_data[i_b][ii].target_coords[fstep],
+                                use_reentrant=False,
+                            )
+                            if len(streams_data[i_b][ii].target_coords[fstep].shape) > 1
+                            else streams_data[i_b][ii].target_coords[fstep]
                         )
-                        if len(streams_data[i_b][ii].target_coords[fstep].shape) > 1
-                        else streams_data[i_b][ii].target_coords[fstep]
                         for i_b in range(len(streams_data))
                     ]
                 )

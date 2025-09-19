@@ -26,6 +26,16 @@ def get_continue_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--finetune_downscaling",
+        action="store_true",
+        help=(
+            "Fine tune for forecasting. It overwrites some of the Config settings. "
+            "It reloads streams config from files!"
+            "Overwrites specified with --config take precedence."
+        ),
+    )
+
     return parser
 
 

@@ -66,6 +66,10 @@ def inference_from_args(argl: list[str]):
         cf.masking_rate = 1.0  # Cancel masking rate
         cf.masking_rate_sampling = False
         cf.training_mode = "forecast"  # Set mode to forecast
+        cf.forecast_offset = 0
+        cf.forecast_delta_hrs = 0
+        cf.forecast_steps = 0
+        cf.forecast_policy = None
         streams = cf.streams
         new_streams = []
         for stream in streams:
@@ -127,6 +131,17 @@ def train_continue_from_args(argl: list[str]):
             num_epochs=12,  # len(cf.forecast_steps) + 4
             istep=0,
         )
+    elif args.finetune_downscaling:
+        finetune_overwrite = dict(
+            masking_rate=1.0,  # Cancel masking rate
+            masking_rate_sampling=False,
+            downscaling_freeze_model=True,
+            training_mode="forecast",  # Set mode to forecast
+            forecast_offset=0,
+            forecast_delta_hrs=0,
+            forecast_steps=0,
+            forecast_policy=None,
+        )
     else:
         finetune_overwrite = dict()
 
@@ -139,6 +154,10 @@ def train_continue_from_args(argl: list[str]):
         *args.config,
         cli_overwrite,
     )
+
+    if args.finetune_downscaling:
+        cf.streams = config.load_streams(Path(cf.streams_directory))
+
     cf = config.set_run_id(cf, args.run_id, args.reuse_run_id)
 
     fname_debug_logging = f"./logs/debug_log_{cf.run_id}.txt"
@@ -147,8 +166,8 @@ def train_continue_from_args(argl: list[str]):
     # track history of run to ensure traceability of results
     cf.run_history += [(args.from_run_id, cf.istep)]
 
-    if args.finetune_forecast:
-        if cf.forecast_freeze_model:
+    if args.finetune_forecast or args.finetune_downscaling:
+        if cf.forecast_freeze_model or cf.downscaling_freeze_model:
             cf.with_fsdp = False
             import torch
 

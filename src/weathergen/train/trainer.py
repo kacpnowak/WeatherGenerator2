@@ -61,6 +61,7 @@ class Trainer(TrainerBase):
                     "latent_noise_use_additive_noise": False,
                     "latent_noise_deterministic_latents": True,
                     "latent_noise_saturate_encodings": 5,
+                    "downscaling_freeze_model": False,
                 }
             ),
             cf,
@@ -201,6 +202,9 @@ class Trainer(TrainerBase):
 
         if cf.forecast_freeze_model:
             self.model = self.model.freeze_weights_forecast()
+
+        if cf.downscaling_freeze_model:
+            self.model = self.model.freeze_weights_downscaling()
 
         for name, module in self.model.named_modules():
             name = module.name if hasattr(module, "name") else name
