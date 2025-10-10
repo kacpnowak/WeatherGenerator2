@@ -36,6 +36,7 @@ from weathergen.model.engines import (
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.parametrised_prob_dist import LatentInterpolator
 from weathergen.model.utils import get_num_parameters
+from weathergen.datasets.data_reader_wg import convert_wg_output_to_dataloader_output
 from weathergen.utils.distributed import is_root
 from weathergen.utils.utils import get_dtype
 
@@ -313,15 +314,16 @@ class Model(torch.nn.Module):
         ###############
         # forecasting engine
         if isinstance(cf.forecast_steps, int):
-            assert not (cf.forecast_steps > 0 and cf.fe_num_blocks == 0), (
-                "Empty forecast engine (fe_num_blocks = 0), but forecast_steps > 0"
-            )
+            assert not (
+                cf.forecast_steps > 0 and cf.fe_num_blocks == 0
+            ), "Empty forecast engine (fe_num_blocks = 0), but forecast_steps > 0"
         else:
-            assert not (min(cf.forecast_steps) > 0 and cf.fe_num_blocks == 0), (
-                "Empty forecast engine (fe_num_blocks = 0), but forecast_steps[i] > 0 for some i"
-            )
+            assert not (
+                min(cf.forecast_steps) > 0 and cf.fe_num_blocks == 0
+            ), "Empty forecast engine (fe_num_blocks = 0), but forecast_steps[i] > 0 for some i"
 
         self.fe_blocks = ForecastingEngine(cf, self.num_healpix_cells).create()
+        # self.res_weight = torch.nn.Parameter(torch.tensor([0.5]))
 
         ###############
         # embed coordinates yielding one query token for each target token
@@ -590,7 +592,13 @@ class Model(torch.nn.Module):
                 )
             ]
 
+            # if self.training:
+            #     tokens = tokens + torch.randn_like(tokens) * torch.norm(tokens) * 0.1
+
             tokens = self.forecast(model_params, tokens)
+            # tokens = self.res_weight * tokens + (1 - self.res_weight) * self.forecast(
+            #    model_params, tokens
+            # )
 
         # prediction for final step
         preds_all += [
@@ -604,6 +612,62 @@ class Model(torch.nn.Module):
         ]
 
         return preds_all, posteriors
+
+    #########################################
+    def forward_physical_space(
+        self,
+        model_params: ModelParams,
+        batch,
+        forecast_offset: int,
+        forecast_steps: int,
+        streams_dataset_val,
+    ):
+        """Performs the forward pass of the model to generate forecasts
+
+        Tokens are processed through the model components, which were defined in the create method.
+        Args:
+            model_params : Query and embedding parameters
+            batch :
+                streams_data : Contains tokenized source data and target data for each dataset and
+                    each stream
+                source_cell_lens : Used to identify range of tokens to use from generated tokens in
+                    cell embedding
+                target_coords_idxs : Indices of target coordinates for each dataset.
+            forecast_offset : Starting index for iteration
+            forecast_steps : Number of forecast steps to calculate from forecast_offset
+        Returns:
+            A list containing all prediction results
+        """
+
+        (streams_data, source_cell_lens, target_coords_idxs) = batch
+
+        streams_data_for_source = streams_data
+
+        preds_all = []
+
+        for fstep in range(forecast_offset, forecast_offset + forecast_steps + 1):
+
+            print(f"Processing {fstep}")
+            # embed
+            tokens = self.embed_cells(model_params, streams_data_for_source)
+
+            # local assimilation engine and adapter
+            tokens = self.assimilate_local(model_params, tokens, source_cell_lens)
+
+            tokens = self.assimilate_global(model_params, tokens)
+
+            preds = self.predict(
+                model_params,
+                fstep,
+                tokens,
+                streams_data,
+                target_coords_idxs,
+            )
+            preds_all += [preds]
+            streams_data_for_source, source_cell_lens = convert_wg_output_to_dataloader_output(
+                preds, streams_data, streams_dataset_val, self.healpix_level, fstep
+            )
+        return preds_all
 
     #########################################
     def embed_cells(self, model_params: ModelParams, streams_data) -> torch.Tensor:
@@ -801,6 +865,7 @@ class Model(torch.nn.Module):
 
         for it, block in enumerate(self.fe_blocks):
             aux_info = torch.tensor([it], dtype=torch.float32, device="cuda")
+            # aux_info = torch.zeros_like(aux_info)
             tokens = checkpoint(block, tokens, aux_info, use_reentrant=False)
 
         return tokens
@@ -850,13 +915,15 @@ class Model(torch.nn.Module):
             # arguably we should to the mixed precision policy when creating the model in FSDP
             tc_tokens = torch.cat(
                 [
-                    checkpoint(
-                        tc_embed,
-                        streams_data[i_b][ii].target_coords[fstep],
-                        use_reentrant=False,
+                    (
+                        checkpoint(
+                            tc_embed,
+                            streams_data[i_b][ii].target_coords[fstep],
+                            use_reentrant=False,
+                        )
+                        if len(streams_data[i_b][ii].target_coords[fstep].shape) > 1
+                        else streams_data[i_b][ii].target_coords[fstep]
                     )
-                    if len(streams_data[i_b][ii].target_coords[fstep].shape) > 1
-                    else streams_data[i_b][ii].target_coords[fstep]
                     for i_b in range(len(streams_data))
                 ]
             )

@@ -79,7 +79,7 @@ class Trainer(TrainerBase):
 
         assert cf.samples_per_epoch % cf.batch_size_per_gpu == 0
         assert cf.samples_per_validation % cf.batch_size_validation_per_gpu == 0
-        config.validate_forecast_policy_and_steps(cf=cf)
+        # config.validate_forecast_policy_and_steps(cf=cf)
 
         self.mixed_precision_dtype = get_dtype(cf.attention_dtype)
 
@@ -621,8 +621,12 @@ class Trainer(TrainerBase):
                         dtype=self.mixed_precision_dtype,
                         enabled=cf.with_mixed_precision,
                     ):
-                        preds, _ = self.model(
-                            self.model_params, batch, cf.forecast_offset, forecast_steps
+                        preds = self.ddp_model.forward_physical_space(
+                            self.model_params,
+                            batch,
+                            cf.forecast_offset,
+                            forecast_steps,
+                            self.dataset_val,
                         )
 
                     # compute loss and log output

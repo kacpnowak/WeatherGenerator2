@@ -188,6 +188,24 @@ class TimeWindowHandler:
 
         return DTRange(t_start_win, t_end_win)
 
+    def window_from_time(self, datetimes) -> DTRange:
+        """
+        Temporal window corresponding to index
+
+        Parameters
+        ----------
+        idx :
+            index of temporal window
+
+        Returns
+        -------
+            start and end of temporal window
+        """
+        time = str_to_datetime64(datetimes[0])
+        idx = np.int64((time - self.t_start) // self.t_window_step)
+        t_start_win = self.t_start + self.t_window_step * idx
+        t_end_win = t_start_win + self.t_window_len
+        return DTRange(t_start_win, t_end_win)
 
 @dataclass
 class ReaderData:
