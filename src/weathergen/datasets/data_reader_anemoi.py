@@ -200,6 +200,8 @@ class DataReaderAnemoi(DataReaderTimestep):
         # Assuming a fixed frequency for the dataset
         datetimes = np.repeat(self.ds.dates[didx_start:didx_end], len(data) // len(t_idxs))
 
+        # print(datetimes)
+        # breakpoint()
         rd = ReaderData(
             coords=coords,
             geoinfos=geoinfos,

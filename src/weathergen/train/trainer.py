@@ -75,6 +75,9 @@ class Trainer(TrainerBase):
         )
         cf = self.cf
 
+        self.device_type = torch.accelerator.current_accelerator()
+        self.device = torch.device(f"{self.device_type}:{cf.local_rank}")
+
         self.freeze_modules = cf.get("freeze_modules", "")
 
         assert cf.samples_per_epoch % cf.batch_size_per_gpu == 0
@@ -136,7 +139,7 @@ class Trainer(TrainerBase):
         self.model = self.model.to(self.devices[0])
         self.model.load(run_id_trained, epoch)
         logger.info(f"Loaded model {run_id_trained} at epoch {epoch}.")
-        self.model_params = ModelParams().create(cf)
+        self.model_params = ModelParams(cf).create(cf)
         self.model_params = self.model_params.to(self.devices[0])
         logger.info(f"Loaded model id={run_id_trained} at epoch={epoch}.")
 
@@ -155,9 +158,6 @@ class Trainer(TrainerBase):
         # general initalization
         self.init(cf, devices)
         cf = self.cf
-
-        self.device_type = torch.accelerator.current_accelerator()
-        self.device = torch.device(f"{self.device_type}:{cf.local_rank}")
 
         self.dataset = MultiStreamDataSampler(
             cf,
@@ -621,7 +621,7 @@ class Trainer(TrainerBase):
                         dtype=self.mixed_precision_dtype,
                         enabled=cf.with_mixed_precision,
                     ):
-                        preds = self.ddp_model.forward_physical_space(
+                        preds = self.model.forward_physical_space(
                             self.model_params,
                             batch,
                             cf.forecast_offset,
