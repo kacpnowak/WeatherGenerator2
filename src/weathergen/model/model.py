@@ -652,7 +652,7 @@ class Model(torch.nn.Module):
             tokens = self.embed_cells(model_params, streams_data_for_source)
 
             # local assimilation engine and adapter
-            tokens = self.assimilate_local(model_params, tokens, source_cell_lens)
+            tokens, _ = self.assimilate_local(model_params, tokens, source_cell_lens)
 
             tokens = self.assimilate_global(model_params, tokens)
 
