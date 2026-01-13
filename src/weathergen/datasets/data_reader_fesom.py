@@ -274,6 +274,8 @@ class DataReaderFesom(DataReaderTimestep):
             np.concatenate((np.array([1, 1]), np.array(t_groups[0].data.attrs["std"])))
         )
         self.target_stdev[self.target_stdev <= 1e-5] = 1.0
+        self.mean = self.target_mean
+        self.stdev = self.target_stdev
 
         self.source = da.concatenate(source_reorderd, axis=0)
         self.target = da.concatenate(target_reorderd, axis=0)
