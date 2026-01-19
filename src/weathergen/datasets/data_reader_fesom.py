@@ -145,40 +145,25 @@ class DataReaderFesom(DataReaderTimestep):
         s_times: list[zarr.Array] = [group["dates"] for group in s_groups]
         t_times: list[zarr.Array] = [group["dates"] for group in t_groups]
 
-        self.source_time = da.concatenate(s_times, axis=0)
-        self.target_time = da.concatenate(t_times, axis=0)
+        self.source_time = da.concatenate(s_times, axis=0).squeeze()
+        self.target_time = da.concatenate(t_times, axis=0).squeeze()
 
         # Use the first group for metadata
         self.source_mesh_size = self._get_mesh_size(s_groups[0])
         self.target_mesh_size = self._get_mesh_size(t_groups[0])
 
-        # Metadata reading is cheap, but let's do it with the rest of the init
-        self.start_source = self.source_time[0][0].compute()
-        self.end_source = self.source_time[-1][0].compute()
+        self.start_source = np.datetime64(self.source_time[0].compute())
+        self.end_source = np.datetime64(self.source_time[-1].compute())
 
-        if self.start_source > self._tw_handler.t_end or self.end_source < self._tw_handler.t_start:
-            name = self._stream_info["name"]
-            _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
-            self.init_empty()
-            self._initialized = True
-            return
-
-        self.start_target = self.target_time[0][0].compute()
-        self.end_target = self.target_time[-1][0].compute()
-
-        if self.start_target > self._tw_handler.t_end or self.end_target < self._tw_handler.t_start:
-            name = self._stream_info["name"]
-            _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
-            self.init_empty()
-            self._initialized = True
-            return
+        self.start_target = np.datetime64(self.target_time[0].compute())
+        self.end_target = np.datetime64(self.target_time[-1].compute())
 
         self.source_period = (
-            self.source_time[self.source_mesh_size][0] - self.source_time[0][0]
-        ).compute()
+            np.datetime64(self.source_time[self.source_mesh_size].compute()) - self.start_source
+        )
         self.target_period = (
-            self.target_time[self.target_mesh_size][0] - self.target_time[0][0]
-        ).compute()
+            np.datetime64(self.target_time[self.target_mesh_size].compute()) - self.start_target
+        )
 
         # Re-initialize the parent class with correct time info
         super().__init__(  # Initialise only for source as source-target split is not supported
@@ -257,22 +242,39 @@ class DataReaderFesom(DataReaderTimestep):
         self.target_cols_idx.remove(self.trg_lon_index)
         self.target_cols_idx = np.array(self.target_cols_idx)
 
-        self.properties = {"stream_id": s_groups[0].data.attrs["obs_id"]}
+        self.properties = {}  # {"stream_id": s_groups[0].data.attrs["obs_id"]}
 
-        self.source_mean = np.concatenate(
-            (np.array([0, 0]), np.array(s_groups[0].data.attrs["means"]))
-        )
-        self.source_stdev = np.sqrt(
-            np.concatenate((np.array([1, 1]), np.array(s_groups[0].data.attrs["std"])))
-        )
+        if len(self.source_colnames) == len(np.array(s_groups[0].data.attrs["means"])):
+            self.source_mean = np.concatenate(
+                (np.array([0, 0]), np.array(s_groups[0].data.attrs["means"]))
+            )
+            self.source_stdev = np.sqrt(
+                np.concatenate((np.array([1, 1]), np.array(s_groups[0].data.attrs["std"])))
+            )
+        elif len(self.source_colnames) + 2 == len(np.array(s_groups[0].data.attrs["means"])):
+            self.source_mean = np.array(s_groups[0].data.attrs["means"])
+            self.source_mean[0:2] = 0.0
+            self.source_stdev = np.array(s_groups[0].data.attrs["std"])
+            self.source_stdev[0:2] = 1.0
+        else:
+            assert False, "Mean or std size doesn't match colnames size for source"
+
+        if len(self.target_colnames) == len(np.array(t_groups[0].data.attrs["means"])):
+            self.target_mean = np.concatenate(
+                (np.array([0, 0]), np.array(t_groups[0].data.attrs["means"]))
+            )
+            self.target_stdev = np.sqrt(
+                np.concatenate((np.array([1, 1]), np.array(t_groups[0].data.attrs["std"])))
+            )
+        elif len(self.target_colnames) + 2 == len(np.array(t_groups[0].data.attrs["means"])):
+            self.target_mean = np.array(t_groups[0].data.attrs["means"])
+            self.target_mean[0:2] = 0.0
+            self.target_stdev = np.array(t_groups[0].data.attrs["std"])
+            self.target_stdev[0:2] = 1.0
+        else:
+            assert False, "Mean or std dimension doesn't match colnames size for target"
+
         self.source_stdev[self.source_stdev <= 1e-5] = 1.0
-
-        self.target_mean = np.concatenate(
-            (np.array([0, 0]), np.array(t_groups[0].data.attrs["means"]))
-        )
-        self.target_stdev = np.sqrt(
-            np.concatenate((np.array([1, 1]), np.array(t_groups[0].data.attrs["std"])))
-        )
         self.target_stdev[self.target_stdev <= 1e-5] = 1.0
         self.mean = self.target_mean
         self.stdev = self.target_stdev
@@ -336,6 +338,20 @@ class DataReaderFesom(DataReaderTimestep):
 
         self.geoinfo_channels = []
         self.geoinfo_idx = []
+
+        if self.start_source > self._tw_handler.t_end or self.end_source < self._tw_handler.t_start:
+            name = self._stream_info["name"]
+            _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
+            self.init_empty()
+            self._initialized = True
+            return
+
+        if self.start_target > self._tw_handler.t_end or self.end_target < self._tw_handler.t_start:
+            name = self._stream_info["name"]
+            _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
+            self.init_empty()
+            self._initialized = True
+            return
 
         self._initialized = True
 
@@ -508,7 +524,7 @@ class DataReaderFesom(DataReaderTimestep):
 
         coords = np.stack([lat, lon], axis=1)
         geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
-        datetimes = np.squeeze(datetimes)
+        datetimes = np.squeeze(datetimes).astype("datetime64")
 
         rd = ReaderData(
             coords=coords,
@@ -554,7 +570,7 @@ class DataReaderFesom(DataReaderTimestep):
 
         coords = np.stack([lat, lon], axis=1)
         geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
-        datetimes = np.squeeze(datetimes)
+        datetimes = np.squeeze(datetimes).astype("datetime64")
 
         rd = ReaderData(
             coords=coords,
