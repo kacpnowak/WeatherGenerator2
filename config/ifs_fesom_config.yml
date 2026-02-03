@@ -1,21 +1,11 @@
 streams_directory: "./config/streams/fesom_multiscale/"
 
-# ae_local_num_queries: 1
-# ae_adapter_embed: 512
-# # ae_local_dim_embed: 1024
-# ae_local_num_blocks: 4
-# ae_local_num_heads: 32
-# ae_adapter_num_heads: 32
-# ae_local_dim_embed: 128
-# ae_local_num_blocks: 4
-# # ae_local_num_heads: 4
-# ae_global_dim_embed: 
-# healpix_level: 6
+healpix_level: 6
 
 start_date: 2000-01-02T00:00
-end_date: 2046-12-31T00:00
-start_date_val: 2047-01-01T00:00
-end_date_val: 2047-12-30T00:00
+end_date: 2047-12-31T00:00
+start_date_val: 1997-01-01T00:00
+end_date_val: 1999-12-30T00:00
 
 num_epochs: 111
 samples_per_epoch: 4096
@@ -26,12 +16,12 @@ loader_num_workers: 4
 # lr_max: 2e-5
 # lr_start: 5e-7
 # training_mode: "forecast"
-# len_hrs: 24
-# step_hrs: 24
+len_hrs: 24
+step_hrs: 24
 # forecast_delta_hrs: 24
 # forecast_offset : 1
 # forecast_policy: "fixed"
-# with_fsdp: False
+with_fsdp: False
 
 # lr_steps_warmup: 4096 
 # lr_steps_cooldown: 512

@@ -7,13 +7,13 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-IFS_ATMO :
+FESOM_NODE_HR:
   type : fesom
-  filenames : ['atmos_all']
+  filenames : ['/work/ab0995/a270225/atmorep_data/regrid_data_025d/ocean_2d_nodes']
+  target_file : '/work/ab0995/a270206/Kacper/newEERIE_zarr_2026/ocean_2d_nodes'
   loss_weight : 1.
-  source : ['10u', '10v', '2t']
-  target : ['10u', '10v', '2t']
-  target_exclude: ['msl', 'tsr', 'tsrc', 'z']
+  source : ['avg_sos', 'avg_tos', 'avg_zos']
+  target : ['avg_sos', 'avg_tos', 'avg_zos']
   masking_rate : 0.6
   masking_rate_none : 0.05
   token_size : 128

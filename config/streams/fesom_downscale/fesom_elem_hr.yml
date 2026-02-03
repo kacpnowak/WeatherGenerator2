@@ -7,13 +7,13 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-FESOM_ELEM:
+FESOM_ELEM_HR:
   type : fesom
-  filenames : ['/work/ab0995/a270225/atmorep_data/regrid_data_25d/ocean_elem']
-  target_file: "/work/ab0995/a270088/Kacper/weathergenertor/AWICM3/ocean_elem"
+  filenames : ['/work/ab0995/a270225/atmorep_data/regrid_data_025d/ocean_3d_elems']
+  target_file : '/work/ab0995/a270206/Kacper/newEERIE_zarr_2026/ocean_3d_elems'
   loss_weight : 1.
-  source : null
-  target : ['v_2', 'u_2']
+  source : ['avg_uoe_2.5', 'avg_von_2.5']
+  target : ['avg_uoe_2.5', 'avg_von_2.5']
   masking_rate : 0.6
   masking_rate_none : 0.05
   token_size : 128
