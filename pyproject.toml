@@ -24,7 +24,6 @@ dependencies = [
  "dask~=2025.5.1",
  "hatchling",
  "numexpr>=2.11.0",
- "anemoi-datasets",
  "weathergen-common",
  "weathergen-evaluate",
  "weathergen-readers-extra"
@@ -254,8 +253,6 @@ torch = [
   # TODO: explore pytorch + metal backend
   { index = "pytorch-cpu", marker = "sys_platform == 'darwin'", extra="gpu"},
 ]
-# branch = "feature/any-zarr-version-in-pyproject/"
-anemoi-datasets = { git = "https://github.com/tjhunter/anemoi-datasets", tag = "0.0.1"}
 
 [tool.pytest.ini_options]
 log_cli = true

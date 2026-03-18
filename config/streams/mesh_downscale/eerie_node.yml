@@ -1,0 +1,32 @@
+EERIE_NODE:
+  type : mesh
+  filenames : ['/work/ab0995/a270225/data_transformation/eerie_ocean_gr025_2d_gridded_daily.parq']
+  # target_file : '/work/ab0995/a270225/data_transformation/eerie_ocean_3d_nodes_daily.parq'
+  loss_weight : 0.2
+  stream_id : 2138
+  source : ['avg_tos', 'avg_sos', 'avg_zos']
+  target : ['avg_tos', 'avg_sos', 'avg_zos']
+  # roi : [0, 0, 90, 90] # min_lon, min_lat, max_lon, max_lat
+  patch_size_deg: null
+  sampling_mode: null
+  # sample_points: 524288
+  masking_rate : 0.6
+  masking_rate_none : 0.05
+  token_size : 256
+  embed : 
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 512
+    num_blocks : 4
+  embed_target_coords :
+    net : mlp
+    dim_embed : 256
+  target_readout :
+    type : 'obs_value'  # token or obs_value
+    num_layers : 2
+    num_heads : 4 
+    # sampling_rate : 0.2
+  pred_head :
+    ens_size : 1
+    num_layers : 3
