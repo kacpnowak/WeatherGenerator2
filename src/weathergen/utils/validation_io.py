@@ -82,12 +82,12 @@ def write_output(
                     t_coords = target_data["target_coords"][i_batch]
                     t_times = target_data["target_times"][i_batch]
 
-                    idxs_inv = target_aux_out.physical[t_idx][sname]["idxs_inv"][i_batch]
-                    if idxs_inv is not None:
-                        pred = pred[:, idxs_inv]
-                        target = target[idxs_inv]
-                        t_coords = t_coords[idxs_inv]
-                        t_times = t_times[idxs_inv]
+                    # idxs_inv = target_aux_out.physical[t_idx][sname]["idxs_inv"][i_batch]
+                    # if idxs_inv is not None:
+                    #     pred = pred[:, idxs_inv]
+                    #     target = target[idxs_inv]
+                    #     t_coords = t_coords[idxs_inv]
+                    #     t_times = t_times[idxs_inv]
 
                     # denormalize data if requested and map to storage format
                     preds_s += [dn_data(sname, pred.to(fp32)).detach().cpu().numpy()]

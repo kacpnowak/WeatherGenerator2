@@ -85,6 +85,8 @@ class LossPhysical(LossModuleBase):
                 if "target_channel_weights" in stream_info
                 else None
             )
+            if weights_channels is not None and len(weights_channels) == 0:
+                weights_channels = None
         elif self.stage == VAL:
             # in validation mode, always unweighted loss
             stream_info_loss_weight = 1.0

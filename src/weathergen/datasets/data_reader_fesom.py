@@ -94,7 +94,55 @@ class DataReaderFesom(DataReaderTimestep):
 
         # This flag ensures initialization happens only once per worker
         self._initialized = False
-        # print(f"checking stream info {list(stream_info.keys())}")
+
+        if len(self.filenames) > 0 and len(self.target_files) > 0:
+            # We need to initialize the channels in __init__ so that the
+            # MultiStreamDataSampler can correctly identify if a stream is forcing or not.
+            s_group = zarr.open_group(self.filenames[0], mode="r")
+            t_group = zarr.open_group(self.target_files[0], mode="r")
+
+            self.source_mesh_size = self._get_mesh_size(s_group)
+            self.target_mesh_size = self._get_mesh_size(t_group)
+
+            source_colnames: list[str] = list(s_group["data"].attrs["colnames"])
+            target_colnames: list[str] = list(t_group["data"].attrs["colnames"])
+
+            source_cols_idx = list(np.arange(len(source_colnames), dtype=int))
+            target_cols_idx = list(np.arange(len(target_colnames), dtype=int))
+
+            src_lat_index: int = source_colnames.index("lat")
+            src_lon_index: int = source_colnames.index("lon")
+            trg_lat_index: int = target_colnames.index("lat")
+            trg_lon_index: int = target_colnames.index("lon")
+
+            source_colnames = self._remove_lonlat(source_colnames)
+            target_colnames = self._remove_lonlat(target_colnames)
+
+            source_cols_idx.remove(src_lat_index)
+            source_cols_idx.remove(src_lon_index)
+            source_cols_idx = np.array(source_cols_idx)
+
+            target_cols_idx.remove(trg_lat_index)
+            target_cols_idx.remove(trg_lon_index)
+            target_cols_idx = np.array(target_cols_idx)
+
+            source_channels = self._stream_info.get("source")
+            source_excl = self._stream_info.get("source_exclude")
+            self.source_channels, self.source_idx = (
+                self.select(source_colnames, source_cols_idx, source_channels, source_excl)
+                if source_channels or source_excl
+                else (source_colnames, source_cols_idx)
+            )
+
+            target_channels = self._stream_info.get("target")
+            target_excl = self._stream_info.get("target_exclude")
+            self.target_channels, self.target_idx = (
+                self.select(target_colnames, target_cols_idx, target_channels, target_excl)
+                if target_channels or target_excl
+                else (target_colnames, target_cols_idx)
+            )
+
+            self.target_channel_weights = self.parse_target_channel_weights()
 
     def _get_mesh_size(self, group: zarr.Group) -> int:
         if "n_points" in group["data"].attrs:
@@ -138,7 +186,7 @@ class DataReaderFesom(DataReaderTimestep):
         if self._initialized:
             return
 
-        _logger.info(f"Initialising {self._stream_info['name']}")
+        # _logger.info(f"Initialising {self._stream_info['name']}")
 
         # Each worker now opens its own file handles safely
         s_groups: list[zarr.Group] = [zarr.open_group(name, mode="r") for name in self.filenames]
@@ -265,17 +313,21 @@ class DataReaderFesom(DataReaderTimestep):
         self.source_mean = np.concatenate(
             (np.array([0, 0]), np.array(s_groups[0]["data"].attrs["means"]))
         )
-        self.source_stdev = np.sqrt(
-            np.concatenate((np.array([1, 1]), np.array(s_groups[0]["data"].attrs["std"])))
+        self.source_stdev = np.concatenate(
+            (np.array([1, 1]), np.array(s_groups[0]["data"].attrs["std"]))
         )
         self.source_stdev[self.source_stdev <= 1e-5] = 1.0
 
         self.target_mean = np.concatenate(
             (np.array([0, 0]), np.array(t_groups[0]["data"].attrs["means"]))
         )
-        self.target_stdev = np.sqrt(
-            np.concatenate((np.array([1, 1]), np.array(t_groups[0]["data"].attrs["std"])))
+        self.target_stdev = np.concatenate(
+            (np.array([1, 1]), np.array(t_groups[0]["data"].attrs["std"]))
         )
+
+        self.mean = self.source_mean
+        self.stdev = self.source_stdev
+
         self.target_stdev[self.target_stdev <= 1e-5] = 1.0
 
         self.source = da.concatenate(source_reorderd, axis=0)
@@ -301,38 +353,38 @@ class DataReaderFesom(DataReaderTimestep):
         trg_timestep_lats = self.target[: self.target_mesh_size, self.trg_lat_index].compute()
 
         if np.any(src_timestep_lats > 90.0):
-            _logger.warning(
-                f"Latitude for stream '{self._stream_info['name']}' "
-                f"source appears to be in a [0, 180] format. "
-                f"It will be automatically converted to the required [-90, 90] format."
-            )
+            # _logger.warning(
+            #     f"Latitude for stream '{self._stream_info['name']}' "
+            #     f"source appears to be in a [0, 180] format. "
+            #     f"It will be automatically converted to the required [-90, 90] format."
+            # )
             self._src_lat_conv = True
 
         if np.any(trg_timestep_lats > 90.0):
-            _logger.warning(
-                f"Latitude for stream '{self._stream_info['name']}' "
-                f"target appears to be in a [0, 180] format. "
-                f"It will be automatically converted to the required [-90, 90] format."
-            )
+            # _logger.warning(
+            #     f"Latitude for stream '{self._stream_info['name']}' "
+            #     f"target appears to be in a [0, 180] format. "
+            #     f"It will be automatically converted to the required [-90, 90] format."
+            # )
             self._trg_lat_conv = True
 
         src_timestep_lons = self.source[: self.source_mesh_size, self.src_lon_index].compute()
         trg_timestep_lons = self.target[: self.target_mesh_size, self.trg_lon_index].compute()
 
         if np.any(src_timestep_lons > 180.0):
-            _logger.warning(
-                f"Longitude for stream '{self._stream_info['name']}' "
-                f"source appears to be in a [0, 360] format. "
-                f"It will be automatically converted to the required [-180, 180] format."
-            )
+            # _logger.warning(
+            #     f"Longitude for stream '{self._stream_info['name']}' "
+            #     f"source appears to be in a [0, 360] format. "
+            #     f"It will be automatically converted to the required [-180, 180] format."
+            # )
             self._src_lon_conv = True
 
         if np.any(trg_timestep_lons > 180.0):
-            _logger.warning(
-                f"Longitude for stream '{self._stream_info['name']}' "
-                f"target appears to be in a [0, 360] format."
-                f"It will be automatically converted to the required [-180, 180] format."
-            )
+            # _logger.warning(
+            #     f"Longitude for stream '{self._stream_info['name']}' "
+            #     f"target appears to be in a [0, 360] format."
+            #     f"It will be automatically converted to the required [-180, 180] format."
+            # )
             self._trg_lon_conv = True
 
         self.geoinfo_channels = []
@@ -510,7 +562,7 @@ class DataReaderFesom(DataReaderTimestep):
         coords = np.stack([lat, lon], axis=1)
         geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
         datetimes = np.squeeze(datetimes)
-
+        # print(f"source shape: {data.shape}, coords shape: {coords.shape}, datetimes shape: {datetimes.shape}")
         rd = ReaderData(
             coords=coords,
             geoinfos=geoinfos,
@@ -556,6 +608,7 @@ class DataReaderFesom(DataReaderTimestep):
         coords = np.stack([lat, lon], axis=1)
         geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
         datetimes = np.squeeze(datetimes)
+        # print(f"target shape: {data.shape}, coords shape: {coords.shape}, datetimes shape: {datetimes.shape}")
 
         rd = ReaderData(
             coords=coords,

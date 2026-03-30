@@ -44,6 +44,7 @@ from weathergen.train.utils import (
     get_batch_size_from_config,
     get_target_idxs_from_cfg,
 )
+from weathergen.utils.profiler import Profiler
 from weathergen.utils.distributed import is_root
 from weathergen.utils.train_logger import TrainLogger, prepare_losses_for_logging
 from weathergen.utils.utils import get_dtype
@@ -83,6 +84,7 @@ class Trainer(TrainerBase):
         self.batch_size_validation_per_gpu = -1
         self.batch_size_test_per_gpu = -1
         self.collapse_monitor: CollapseMonitor | None = None
+        self.profiler: Profiler | None = None
 
     def get_batch_size_total(self, batch_size_per_gpu) -> int:
         """
@@ -157,6 +159,10 @@ class Trainer(TrainerBase):
         # Initialize collapse monitor for SSL training
         collapse_config = cf.train_logging.get("collapse_monitoring", {})
         self.collapse_monitor = CollapseMonitor(collapse_config, None)  # device set later in run()
+
+        # Initialize profiler
+        profiling_enabled = cf.get("data_loading", {}).get("profiling", {}).get("enabled", False)
+        self.profiler = Profiler(enabled=profiling_enabled)
 
     def get_target_aux_calculators(self, mode_cfg):
         """
@@ -251,6 +257,8 @@ class Trainer(TrainerBase):
             "batch_sampler": None,
             "shuffle": False,
             "num_workers": cf.data_loading.num_workers,
+            "persistent_workers": cf.data_loading.num_workers > 0,
+            "pin_memory": cf.data_loading.memory_pinning,
         }
         self.data_loader = torch.utils.data.DataLoader(self.dataset, **loader_params, sampler=None)
         self.data_loader_validation = torch.utils.data.DataLoader(
@@ -420,82 +428,86 @@ class Trainer(TrainerBase):
 
         apply_fct_to_blocks(self.model, cf.freeze_modules, set_to_eval)
 
-        dataset_iter = iter(self.data_loader)
-
         self.optimizer.zero_grad()
 
         # training loop
         self.t_start = time.time()
-        for bidx, batch in enumerate(dataset_iter):
-            if cf.data_loading.get("memory_pinning", False):
-                # pin memory for faster CPU-GPU transfer
-                batch = batch.pin_memory()
+        t_data_start = time.perf_counter()
+        for bidx, batch in enumerate(self.data_loader):
+            t_data_end = time.perf_counter()
+            self.profiler.add_stat("data_loading_wait", t_data_end - t_data_start)
 
-            batch.to_device(self.device)
+            with self.profiler.time_block("data_transfer_to_gpu", synchronize=True):
+                if cf.data_loading.get("memory_pinning", False):
+                    # pin memory for faster CPU-GPU transfer
+                    batch = batch.pin_memory()
 
-            with torch.autocast(
-                device_type=f"cuda:{cf.local_rank}",
-                dtype=self.mixed_precision_dtype,
-                enabled=cf.with_mixed_precision,
-            ):
-                preds = self.model(
-                    self.model_params,
-                    batch.get_source_samples(),
-                )
+                batch.to_device(self.device)
 
-                targets_and_auxs = {}
-                for loss_name, target_aux in self.target_and_aux_calculators.items():
-                    # find targets for this target-aux calculator
-                    target_idxs = get_target_idxs_from_cfg(self.training_cfg, loss_name)
-                    # apply target-aux calculator
-                    targets_and_auxs[loss_name] = target_aux.compute(
-                        self.cf.general.istep,
-                        batch.get_target_samples(target_idxs),
+            with self.profiler.time_block("model_forward_backward", synchronize=True):
+                with torch.autocast(
+                    device_type=f"cuda:{cf.local_rank}",
+                    dtype=self.mixed_precision_dtype,
+                    enabled=cf.with_mixed_precision,
+                ):
+                    preds = self.model(
                         self.model_params,
-                        self.model,
+                        batch.get_source_samples(),
                     )
 
-            loss = self.loss_calculator.compute_loss(
-                preds=preds,
-                targets_and_aux=targets_and_auxs,
-                metadata=extract_batch_metadata(batch),
-            )
+                    targets_and_auxs = {}
+                    for loss_name, target_aux in self.target_and_aux_calculators.items():
+                        # find targets for this target-aux calculator
+                        target_idxs = get_target_idxs_from_cfg(self.training_cfg, loss_name)
+                        # apply target-aux calculator
+                        targets_and_auxs[loss_name] = target_aux.compute(
+                            self.cf.general.istep,
+                            batch.get_target_samples(target_idxs),
+                            self.model_params,
+                            self.model,
+                        )
 
-            # TODO re-enable this, need to think on how to make it compatible with
-            # student-teacher training
-            # if cf.latent_noise_kl_weight > 0.0:
-            #     kl = torch.cat([posterior.kl() for posterior in output.latent["posteriors"]])
-            #     loss_values.loss += cf.latent_noise_kl_weight * kl.mean()
+                loss = self.loss_calculator.compute_loss(
+                    preds=preds,
+                    targets_and_aux=targets_and_auxs,
+                    metadata=extract_batch_metadata(batch),
+                )
 
-            [
-                target_aux.update_state_pre_backward(self.cf.general.istep, batch, self.model)
-                for _, target_aux in self.target_and_aux_calculators.items()
-            ]
-            [
-                target_aux.update_state_pre_backward(self.cf.general.istep, batch, self.model)
-                for _, target_aux in self.target_and_aux_calculators_val.items()
-            ]
+                # TODO re-enable this, need to think on how to make it compatible with
+                # student-teacher training
+                # if cf.latent_noise_kl_weight > 0.0:
+                #     kl = torch.cat([posterior.kl() for posterior in output.latent["posteriors"]])
+                #     loss_values.loss += cf.latent_noise_kl_weight * kl.mean()
 
-            # backward pass
-            self.optimizer.zero_grad()
-            self.grad_scaler.scale(loss).backward()
+                [
+                    target_aux.update_state_pre_backward(self.cf.general.istep, batch, self.model)
+                    for _, target_aux in self.target_and_aux_calculators.items()
+                ]
+                [
+                    target_aux.update_state_pre_backward(self.cf.general.istep, batch, self.model)
+                    for _, target_aux in self.target_and_aux_calculators_val.items()
+                ]
 
-            # gradient clipping
-            self.grad_scaler.unscale_(self.optimizer)
-            total_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_norm=self.training_cfg.optimizer.grad_clip
-            )
+                # backward pass
+                self.optimizer.zero_grad()
+                self.grad_scaler.scale(loss).backward()
 
-            # log gradient norms
-            if self.log_grad_norms:
-                if bidx % self.train_logging.terminal == 0:
-                    self.last_grad_norm = self._get_tensor_item(total_norm)
-                if bidx % self.train_logging.metrics == 0:
-                    self._log_instant_grad_norms(TRAIN)
+                # gradient clipping
+                self.grad_scaler.unscale_(self.optimizer)
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), max_norm=self.training_cfg.optimizer.grad_clip
+                )
 
-            # optimizer step
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
+                # log gradient norms
+                if self.log_grad_norms:
+                    if bidx % self.train_logging.terminal == 0:
+                        self.last_grad_norm = self._get_tensor_item(total_norm)
+                    if bidx % self.train_logging.metrics == 0:
+                        self._log_instant_grad_norms(TRAIN)
+
+                # optimizer step
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
 
             # update learning rate
             self.lr_scheduler.step()
@@ -536,8 +548,17 @@ class Trainer(TrainerBase):
             # save model checkpoint (with designation _latest)
             if bidx % self.train_logging.checkpoint == 0 and bidx > 0:
                 self.save_model(-1)
+            
+            # Log profiler stats periodically
+            if bidx % self.train_logging.terminal == 0:
+                self.profiler.log_stats(rank=self.cf.rank, world_size=self.cf.world_size)
 
             self.cf.general.istep += 1
+            # Before we loop back to 'next(batch)', we must ensure the GPU is done
+            # so that the 'data_loading_wait' time accurately reflects true idle time.
+            if self.profiler.enabled and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_data_start = time.perf_counter()
 
         self.dataset.advance()
 

@@ -71,7 +71,8 @@ def init_model_and_shard(
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             broadcast_buffers=True,
-            find_unused_parameters=cf.get("ddp_find_unused_parameters", True),
+            find_unused_parameters=cf.get("ddp_find_unused_parameters", False),
+            static_graph=True,
             gradient_as_bucket_view=True,
             bucket_cap_mb=512,
         )
