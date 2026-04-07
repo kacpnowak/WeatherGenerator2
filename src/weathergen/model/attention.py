@@ -7,6 +7,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import logging
 from functools import partial
 
 import torch
@@ -16,12 +17,74 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from weathergen.model.norms import AdaLayerNorm, RMSNorm
 from weathergen.model.positional_encoding import rotary_pos_emb_2d
 
+logger = logging.getLogger(__name__)
+
 """
 Attention blocks used by WeatherGenerator.
 
 Some blocks optionally apply 2D RoPE. When enabled, the caller must provide per-token 2D
 coordinates aligned with the token order (lat, lon in radians).
 """
+
+# Maximum number of sequences per flash_attn_varlen_func call.
+_VARLEN_MAX_SEQS = 65534
+
+
+def _flash_attn_varlen_chunked(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs
+):
+    """Automatically chunks the call when the number of sequences exceeds the CUDA limit.
+
+    Each sequence in the varlen packing is independent (no cross-sequence attention),
+    so splitting at sequence boundaries is mathematically exact — it produces
+    bit-identical results to a single un-chunked call.
+    """
+    num_seqs = cu_seqlens_q.shape[0] - 1
+
+    if num_seqs <= _VARLEN_MAX_SEQS:
+        return flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs
+        )
+
+    # --- Chunked path based purely on sequence indices ---
+    chunk_boundaries = list(range(0, num_seqs, _VARLEN_MAX_SEQS))
+    if chunk_boundaries[-1] != num_seqs:
+        chunk_boundaries.append(num_seqs)
+
+    num_chunks = len(chunk_boundaries) - 1
+    logger.debug("flash_attn_varlen_func: chunking %d sequences into %d chunks", num_seqs, num_chunks)
+
+    # Query all sequence token boundaries at the chunk edges in a single GPU->CPU transfer
+    q_bounds = cu_seqlens_q[chunk_boundaries].tolist()
+    k_bounds = cu_seqlens_k[chunk_boundaries].tolist()
+
+    outs = []
+    for i in range(num_chunks):
+        s_idx = chunk_boundaries[i]
+        e_idx = chunk_boundaries[i + 1]
+
+        q_start, q_end = q_bounds[i], q_bounds[i + 1]
+        k_start, k_end = k_bounds[i], k_bounds[i + 1]
+
+        # Slice tensors directly from discrete indices
+        q_chunk = q[q_start:q_end]
+        k_chunk = k[k_start:k_end]
+        v_chunk = v[k_start:k_end]
+
+        # Build local cu_seqlens (rebased to start from 0)
+        cu_q_chunk = cu_seqlens_q[s_idx : e_idx + 1] - q_start
+        cu_k_chunk = cu_seqlens_k[s_idx : e_idx + 1] - k_start
+
+        # Using global max_seqlen is valid and safe upper bound
+        out_chunk = flash_attn_varlen_func(
+            q_chunk, k_chunk, v_chunk,
+            cu_q_chunk, cu_k_chunk,
+            max_seqlen_q, max_seqlen_k,
+            **kwargs,
+        )
+        outs.append(out_chunk)
+
+    return torch.cat(outs, dim=0)
 
 
 class MultiSelfAttentionHeadVarlen(torch.nn.Module):
@@ -100,7 +163,7 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
 
         cum_x_lens = torch.cumsum(x_lens, 0, dtype=torch.int32)
         # ordering of tensors (seq, heads, embed) (which differs from torch's flash attention implt)
-        outs = flash_attn_varlen_func(
+        outs = _flash_attn_varlen_chunked(
             qs,
             ks,
             vs,
@@ -362,7 +425,7 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
         if x_kv_lens is not None:
             cum_x_q_lens = torch.cumsum(x_q_lens, 0, dtype=torch.int32)
             cum_x_kv_lens = torch.cumsum(x_kv_lens, 0, dtype=torch.int32)
-            outs = flash_attn_varlen_func(
+            outs = _flash_attn_varlen_chunked(
                 qs,
                 ks,
                 vs,
@@ -474,7 +537,7 @@ class MultiCrossAttentionHeadVarlenSlicedQ(torch.nn.Module):
         outs = []
         for _i, qs_i in enumerate(qs):
             outs += [
-                flash_attn_varlen_func(
+                _flash_attn_varlen_chunked(
                     qs_i,
                     ks,
                     vs,
