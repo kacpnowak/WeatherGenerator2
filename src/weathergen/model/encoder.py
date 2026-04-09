@@ -262,7 +262,7 @@ class EncoderModule(torch.nn.Module):
         batch_lens = batch_lens + (self.num_class_tokens + self.num_register_tokens)
         batch_lens_patched = torch.cat([zero_pad, batch_lens], dim=0)
         tokens_global_unmasked = self.ae_aggregation_engine(
-            tokens_global_unmasked, batch_lens_patched, use_reentrant=False, coords=packed_coords
+            tokens_global_unmasked, batch_lens_patched, coords=packed_coords
         )
 
         return tokens_global_unmasked

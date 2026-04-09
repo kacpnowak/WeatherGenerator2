@@ -345,18 +345,27 @@ class QueryAggregationEngine(torch.nn.Module):
                 )
             )
 
-    def forward(self, tokens, batch_lens, use_reentrant, coords=None):
+    def forward(self, tokens, batch_lens, coords=None):
         for block in self.ae_aggregation_blocks:
             aux_info = None
-            if isinstance(block, MultiSelfAttentionHeadVarlen):
-                tokens = block(tokens, x_lens=batch_lens, coords=coords)
-            elif isinstance(block, (BiMamba2Block, Mamba2Block)):
-                # Mamba treats the variable length sequence as a flattened sequence
-                # Correctness for independent samples could be improved with cu_seqlens,
-                # but for global aggregation it is often treated as one field.
-                tokens = block(tokens, coords)
+            if self.cf.use_checkpointing:
+                if isinstance(block, MultiSelfAttentionHeadVarlen):
+                    tokens = checkpoint(block, tokens, x_lens=batch_lens, coords=coords, use_reentrant=False)
+                elif isinstance(block, (BiMamba2Block, Mamba2Block)):
+                    tokens = checkpoint(block, tokens, coords=coords, use_reentrant=False)
+                elif isinstance(block, MLP):
+                    tokens = checkpoint(block, tokens, use_reentrant=False)
+                else:
+                    tokens = checkpoint(block, tokens, use_reentrant=False)
             else:
-                tokens = block(tokens, coords, aux_info)
+                if isinstance(block, MultiSelfAttentionHeadVarlen):
+                    tokens = block(tokens, x_lens=batch_lens, coords=coords)
+                elif isinstance(block, (BiMamba2Block, Mamba2Block)):
+                    tokens = block(tokens, coords=coords)
+                elif isinstance(block, MLP):
+                    tokens = block(tokens)
+                else:
+                    tokens = block(tokens)
         return tokens
 
 
@@ -463,7 +472,16 @@ class GlobalAssimilationEngine(torch.nn.Module):
     def forward(self, tokens, coords=None):
         aux_info = None
         for block in self.ae_global_blocks:
-            tokens = checkpoint(block, tokens, coords, aux_info, use_reentrant=False)
+            if self.cf.use_checkpointing:
+                if isinstance(block, (torch.nn.modules.normalization.LayerNorm, MLP)):
+                    tokens = checkpoint(block, tokens, use_reentrant=False)
+                else:
+                    tokens = checkpoint(block, tokens, ada_ln_aux=aux_info, coords=coords, use_reentrant=False)
+            else:
+                if isinstance(block, (torch.nn.modules.normalization.LayerNorm, MLP)):
+                    tokens = block(tokens)
+                else:
+                    tokens = block(tokens, ada_ln_aux=aux_info, coords=coords)
         return tokens
 
 
@@ -610,10 +628,16 @@ class ForecastingEngine(torch.nn.Module):
 
         aux_info = None
         for _b_idx, block in enumerate(self.fe_blocks):
-            if isinstance(block, torch.nn.modules.normalization.LayerNorm):
-                tokens = checkpoint(block, tokens, use_reentrant=False)
+            if self.cf.use_checkpointing:
+                if isinstance(block, (torch.nn.modules.normalization.LayerNorm, MLP)):
+                    tokens = checkpoint(block, tokens, use_reentrant=False)
+                else:
+                    tokens = checkpoint(block, tokens, ada_ln_aux=aux_info, coords=coords, use_reentrant=False)
             else:
-                tokens = checkpoint(block, tokens, coords, aux_info, use_reentrant=False)
+                if isinstance(block, (torch.nn.modules.normalization.LayerNorm, MLP)):
+                    tokens = block(tokens)
+                else:
+                    tokens = block(tokens, ada_ln_aux=aux_info, coords=coords)
         return tokens
 
 
