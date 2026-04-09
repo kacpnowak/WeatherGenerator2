@@ -11,25 +11,28 @@ embed_orientation: "channels"
 embed_unembed_mode: "block"
 embed_dropout_rate: 0.1
 
-ae_local_dim_embed: 1024
+ae_local_dim_embed: 512
 ae_local_num_blocks: 2
-ae_local_num_heads: 16
+ae_local_num_heads: 8
 ae_local_dropout_rate: 0.1
 ae_local_with_qk_lnorm: True
 
 ae_local_num_queries: 1
 ae_local_queries_per_cell: False
-ae_adapter_num_heads: 16
+ae_adapter_num_heads: 8
 ae_adapter_embed: 128
 ae_adapter_with_qk_lnorm: True
 ae_adapter_with_residual: True
 ae_adapter_dropout_rate: 0.1
 
 ae_global_dim_embed: 2048
-ae_global_num_blocks: 2
-ae_global_num_heads: 32
+ae_global_num_blocks: 6
+ae_global_num_heads: 16
 ae_global_dropout_rate: 0.1
 ae_global_with_qk_lnorm: True
+ae_global_mamba_mode: "hybrid"
+ae_global_mamba_attn_indices: []
+ae_global_mamba_expand: 1
 # TODO: switching to < 1 triggers triton-related issues.
 # See https://github.com/ecmwf/WeatherGenerator/issues/1050
 ae_global_att_dense_rate: 1.0
@@ -44,6 +47,9 @@ ae_aggregation_with_qk_lnorm: True
 ae_aggregation_att_dense_rate: 1.0
 ae_aggregation_block_factor: 64
 ae_aggregation_mlp_hidden_factor: 2
+ae_aggregation_mamba_mode: "hybrid"
+ae_aggregation_mamba_attn_indices: []
+ae_aggregation_mamba_expand: 1
 
 decoder_type: PerceiverIOCoordConditioning #  Main options PerceiverIOCoordConditioning or Linear
 pred_adapter_kv: False
@@ -53,7 +59,7 @@ pred_mlp_adaln: True
 
 # number of steps offset applied to first target window; if set to zero and forecast_steps=0 then
 # one is training an auto-encoder
-fe_num_blocks: 6
+fe_num_blocks: 16
 fe_num_heads: 16
 fe_dropout_rate: 0.1
 fe_with_qk_lnorm: True
@@ -65,7 +71,17 @@ forecast_att_dense_rate: 1.0
 num_class_tokens: 0
 num_register_tokens: 0
 
-healpix_level: 5
+# Mamba-2 SSM integration in ForecastingEngine
+# Mode: "none" (pure attention, default), "hybrid" (sparse attention + mamba2)
+fe_mamba_mode: "hybrid"
+fe_mamba_d_state: 64         # SSM state expansion factor
+fe_mamba_d_conv: 4           # Local convolution width
+fe_mamba_expand: 2           # Block expansion factor
+fe_mamba_bidirectional: true # Forward+backward scan
+# Which block indices keep attention (rest become Mamba2) in hybrid mode
+fe_mamba_attn_indices: []
+
+healpix_level: 6
 
 # Use 2D RoPE instead of traditional global positional encoding
 # When True: uses 2D RoPE based on healpix cell coordinates (lat/lon)
@@ -180,7 +196,7 @@ training_config:
   shuffle: True
 
   start_date: 1979-01-01T00:00
-  end_date: 2022-12-31T00:00
+  end_date: 2021-12-31T00:00
 
   time_window_step: 06:00:00
   time_window_len: 06:00:00
@@ -234,8 +250,8 @@ validation_config:
   samples_per_mini_epoch: 256
   shuffle: False
 
-  start_date: 2023-10-01T00:00
-  end_date: 2023-12-31T00:00
+  start_date: 2021-10-01T00:00
+  end_date: 2021-12-31T00:00
   
   # whether to track the exponential moving average of weights for validation
   validate_with_ema: 

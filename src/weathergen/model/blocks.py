@@ -255,5 +255,6 @@ class OriginalPredictionBlock(nn.Module):
             if isinstance(layer, MultiCrossAttentionHeadVarlen):
                 output = layer(output, latent, output_lens, latent_lens, coords)
             else:
-                output = layer(output, output_lens, coords)
+                # Use keyword argument for coords to avoid misrouting to ada_ln_aux in MultiSelfAttentionHeadVarlen
+                output = layer(output, output_lens, coords=coords)
         return output

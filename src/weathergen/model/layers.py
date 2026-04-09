@@ -60,6 +60,7 @@ class MLP(torch.nn.Module):
         self.layers = torch.nn.ModuleList()
 
         norm = torch.nn.LayerNorm if norm_type == "LayerNorm" else RMSNorm
+        norm_eps = float(norm_eps)
 
         if pre_layer_norm:
             self.layers.append(

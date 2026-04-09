@@ -31,6 +31,14 @@ from weathergen.model.layers import MLP
 from weathergen.model.utils import ActivationFactory
 from weathergen.utils.utils import get_dtype
 
+# Optional mamba-ssm dependency for hybrid SSM+attention mode
+try:
+    from weathergen.model.mamba_block import BiMamba2Block, Mamba2Block
+
+    _HAS_MAMBA = True
+except ImportError:
+    _HAS_MAMBA = False
+
 
 class EmbeddingEngine(torch.nn.Module):
     name: "EmbeddingEngine"
@@ -257,12 +265,44 @@ class QueryAggregationEngine(torch.nn.Module):
 
         self.ae_aggregation_blocks = torch.nn.ModuleList()
 
+        ae_mamba_mode = cf.get("ae_aggregation_mamba_mode", "none")
+        mamba_attn_indices = set(cf.get("ae_aggregation_mamba_attn_indices", []))
+        mamba_d_state = cf.get("fe_mamba_d_state", 64)
+        mamba_d_conv = cf.get("fe_mamba_d_conv", 4)
+        mamba_expand = cf.get("fe_mamba_expand", 2)
+        mamba_bidirectional = cf.get("fe_mamba_bidirectional", True)
+
         global_rate = int(1 / self.cf.ae_aggregation_att_dense_rate)
         for i in range(self.cf.ae_aggregation_num_blocks):
-            ## Alternate between local and global attention
-            #  as controlled by cf.ae_dense_local_att_dense_rate
-            # Last block is always global attention
-            if i % global_rate == 0 or i + 1 == self.cf.ae_aggregation_num_blocks:
+            use_mamba = ae_mamba_mode == "hybrid" and i not in mamba_attn_indices
+
+            if use_mamba:
+                if mamba_bidirectional:
+                    self.ae_aggregation_blocks.append(
+                        BiMamba2Block(
+                            dim_embed=self.cf.ae_global_dim_embed,
+                            d_state=mamba_d_state,
+                            d_conv=mamba_d_conv,
+                            expand=mamba_expand,
+                            dropout_rate=self.cf.ae_aggregation_dropout_rate,
+                            norm_type=self.cf.norm_type,
+                            norm_eps=self.cf.norm_eps,
+                        )
+                    )
+                else:
+                    self.ae_aggregation_blocks.append(
+                        Mamba2Block(
+                            dim_embed=self.cf.ae_global_dim_embed,
+                            d_state=mamba_d_state,
+                            d_conv=mamba_d_conv,
+                            expand=mamba_expand,
+                            dropout_rate=self.cf.ae_aggregation_dropout_rate,
+                            norm_type=self.cf.norm_type,
+                            norm_eps=self.cf.norm_eps,
+                            reverse=(i % 2 == 1),
+                        )
+                    )
+            elif i % global_rate == 0 or i + 1 == self.cf.ae_aggregation_num_blocks:
                 self.ae_aggregation_blocks.append(
                     MultiSelfAttentionHeadVarlen(
                         self.cf.ae_global_dim_embed,
@@ -310,6 +350,11 @@ class QueryAggregationEngine(torch.nn.Module):
             aux_info = None
             if isinstance(block, MultiSelfAttentionHeadVarlen):
                 tokens = block(tokens, x_lens=batch_lens, coords=coords)
+            elif isinstance(block, (BiMamba2Block, Mamba2Block)):
+                # Mamba treats the variable length sequence as a flattened sequence
+                # Correctness for independent samples could be improved with cu_seqlens,
+                # but for global aggregation it is often treated as one field.
+                tokens = block(tokens, coords)
             else:
                 tokens = block(tokens, coords, aux_info)
         return tokens
@@ -331,12 +376,44 @@ class GlobalAssimilationEngine(torch.nn.Module):
 
         self.ae_global_blocks = torch.nn.ModuleList()
 
+        ae_mamba_mode = cf.get("ae_global_mamba_mode", "none")
+        mamba_attn_indices = set(cf.get("ae_global_mamba_attn_indices", []))
+        mamba_d_state = cf.get("fe_mamba_d_state", 64)
+        mamba_d_conv = cf.get("fe_mamba_d_conv", 4)
+        mamba_expand = cf.get("fe_mamba_expand", 2)
+        mamba_bidirectional = cf.get("fe_mamba_bidirectional", True)
+
         global_rate = int(1 / self.cf.ae_global_att_dense_rate)
         for i in range(self.cf.ae_global_num_blocks):
-            ## Alternate between local and global attention
-            #  as controlled by cf.ae_global_att_dense_rate
-            # Last block is always global attention
-            if i % global_rate == 0 or i + 1 == self.cf.ae_global_num_blocks:
+            use_mamba = ae_mamba_mode == "hybrid" and i not in mamba_attn_indices
+
+            if use_mamba:
+                if mamba_bidirectional:
+                    self.ae_global_blocks.append(
+                        BiMamba2Block(
+                            dim_embed=self.cf.ae_global_dim_embed,
+                            d_state=mamba_d_state,
+                            d_conv=mamba_d_conv,
+                            expand=mamba_expand,
+                            dropout_rate=self.cf.ae_global_dropout_rate,
+                            norm_type=self.cf.norm_type,
+                            norm_eps=self.cf.norm_eps,
+                        )
+                    )
+                else:
+                    self.ae_global_blocks.append(
+                        Mamba2Block(
+                            dim_embed=self.cf.ae_global_dim_embed,
+                            d_state=mamba_d_state,
+                            d_conv=mamba_d_conv,
+                            expand=mamba_expand,
+                            dropout_rate=self.cf.ae_global_dropout_rate,
+                            norm_type=self.cf.norm_type,
+                            norm_eps=self.cf.norm_eps,
+                            reverse=(i % 2 == 1),
+                        )
+                    )
+            elif i % global_rate == 0 or i + 1 == self.cf.ae_global_num_blocks:
                 self.ae_global_blocks.append(
                     MultiSelfAttentionHead(
                         self.cf.ae_global_dim_embed,
@@ -399,48 +476,104 @@ class ForecastingEngine(torch.nn.Module):
 
         :param cf: Configuration object containing parameters for the engine.
         :param num_healpix_cells: Number of healpix cells used for local queries.
+
+        Supports hybrid Mamba-2 + attention mode via config:
+            fe_mamba_mode: "none" (default, pure attention) or "hybrid"
+            fe_mamba_attn_indices: list of block indices that keep attention (rest become Mamba2)
+            fe_mamba_d_state: SSM state expansion factor (default 64)
+            fe_mamba_d_conv: local convolution width (default 4)
+            fe_mamba_expand: block expansion factor (default 2)
+            fe_mamba_bidirectional: use BiMamba2Block (default True) or Mamba2Block
         """
         super(ForecastingEngine, self).__init__()
         self.cf = cf
         self.num_healpix_cells = num_healpix_cells
         self.fe_blocks = torch.nn.ModuleList()
 
+        fe_mamba_mode = cf.get("fe_mamba_mode", "none")
+        if fe_mamba_mode == "hybrid" and not _HAS_MAMBA:
+            raise ImportError(
+                "fe_mamba_mode='hybrid' requires mamba-ssm. Install with: "
+                "MAMBA_FORCE_BUILD=TRUE pip install mamba-ssm --no-build-isolation"
+            )
+
+        # Mamba-2 config (only used when fe_mamba_mode == "hybrid")
+        mamba_attn_indices = set(cf.get("fe_mamba_attn_indices", []))
+        mamba_d_state = cf.get("fe_mamba_d_state", 64)
+        mamba_d_conv = cf.get("fe_mamba_d_conv", 4)
+        mamba_expand = cf.get("fe_mamba_expand", 2)
+        mamba_bidirectional = cf.get("fe_mamba_bidirectional", True)
+
         global_rate = int(1 / self.cf.forecast_att_dense_rate)
         if mode_cfg.get("forecast", {}).get("policy") is not None:
             for i in range(self.cf.fe_num_blocks):
-                # Alternate between global and local attention
-                if (i % global_rate == 0) or i + 1 == self.cf.fe_num_blocks:
-                    self.fe_blocks.append(
-                        MultiSelfAttentionHead(
-                            self.cf.ae_global_dim_embed,
-                            num_heads=self.cf.fe_num_heads,
-                            dropout_rate=self.cf.fe_dropout_rate,
-                            with_qk_lnorm=self.cf.fe_with_qk_lnorm,
-                            with_flash=self.cf.with_flash_attention,
-                            norm_type=self.cf.norm_type,
-                            dim_aux=dim_aux,
-                            norm_eps=self.cf.norm_eps,
-                            attention_dtype=get_dtype(self.cf.attention_dtype),
-                            with_2d_rope=self.cf.get("rope_2D", False),
+                use_mamba = fe_mamba_mode == "hybrid" and i not in mamba_attn_indices
+
+                if use_mamba:
+                    # Mamba-2 block (bidirectional or unidirectional)
+                    if mamba_bidirectional:
+                        self.fe_blocks.append(
+                            BiMamba2Block(
+                                dim_embed=self.cf.ae_global_dim_embed,
+                                d_state=mamba_d_state,
+                                d_conv=mamba_d_conv,
+                                expand=mamba_expand,
+                                dropout_rate=self.cf.fe_dropout_rate,
+                                norm_type=self.cf.norm_type,
+                                norm_eps=self.cf.norm_eps,
+                                dim_aux=dim_aux,
+                            )
                         )
-                    )
+                    else:
+                        # Alternating-order (Mamba-ND style): odd layers reverse
+                        self.fe_blocks.append(
+                            Mamba2Block(
+                                dim_embed=self.cf.ae_global_dim_embed,
+                                d_state=mamba_d_state,
+                                d_conv=mamba_d_conv,
+                                expand=mamba_expand,
+                                dropout_rate=self.cf.fe_dropout_rate,
+                                norm_type=self.cf.norm_type,
+                                norm_eps=self.cf.norm_eps,
+                                dim_aux=dim_aux,
+                                reverse=(i % 2 == 1),
+                            )
+                        )
                 else:
-                    self.fe_blocks.append(
-                        MultiSelfAttentionHeadLocal(
-                            self.cf.ae_global_dim_embed,
-                            num_heads=self.cf.fe_num_heads,
-                            qkv_len=self.num_healpix_cells * self.cf.ae_local_num_queries,
-                            block_factor=self.cf.ae_global_block_factor,
-                            dropout_rate=self.cf.fe_dropout_rate,
-                            with_qk_lnorm=self.cf.fe_with_qk_lnorm,
-                            with_flash=self.cf.with_flash_attention,
-                            norm_type=self.cf.norm_type,
-                            dim_aux=dim_aux,
-                            norm_eps=self.cf.norm_eps,
-                            attention_dtype=get_dtype(self.cf.attention_dtype),
-                            with_2d_rope=self.cf.get("rope_2D", False),
+                    # Attention block (original behavior)
+                    # Alternate between global and local attention
+                    if (i % global_rate == 0) or i + 1 == self.cf.fe_num_blocks:
+                        self.fe_blocks.append(
+                            MultiSelfAttentionHead(
+                                self.cf.ae_global_dim_embed,
+                                num_heads=self.cf.fe_num_heads,
+                                dropout_rate=self.cf.fe_dropout_rate,
+                                with_qk_lnorm=self.cf.fe_with_qk_lnorm,
+                                with_flash=self.cf.with_flash_attention,
+                                norm_type=self.cf.norm_type,
+                                dim_aux=dim_aux,
+                                norm_eps=self.cf.norm_eps,
+                                attention_dtype=get_dtype(self.cf.attention_dtype),
+                                with_2d_rope=self.cf.get("rope_2D", False),
+                            )
                         )
-                    )
+                    else:
+                        self.fe_blocks.append(
+                            MultiSelfAttentionHeadLocal(
+                                self.cf.ae_global_dim_embed,
+                                num_heads=self.cf.fe_num_heads,
+                                qkv_len=self.num_healpix_cells * self.cf.ae_local_num_queries,
+                                block_factor=self.cf.ae_global_block_factor,
+                                dropout_rate=self.cf.fe_dropout_rate,
+                                with_qk_lnorm=self.cf.fe_with_qk_lnorm,
+                                with_flash=self.cf.with_flash_attention,
+                                norm_type=self.cf.norm_type,
+                                dim_aux=dim_aux,
+                                norm_eps=self.cf.norm_eps,
+                                attention_dtype=get_dtype(self.cf.attention_dtype),
+                                with_2d_rope=self.cf.get("rope_2D", False),
+                            )
+                        )
                 # Add MLP block
                 self.fe_blocks.append(
                     MLP(
