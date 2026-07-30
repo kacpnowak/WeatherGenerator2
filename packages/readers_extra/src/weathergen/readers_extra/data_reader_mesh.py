@@ -79,6 +79,9 @@ class DataReaderMesh(DataReaderTimestep):
 
         self._dask_arrays_src = {}
         self._dask_arrays_trg = {}
+        # (channel, "source"/"target") pairs already reported by _resolve_var, so that a
+        # broken col_map entry is logged once and not once per block read.
+        self._var_warned = set()
 
         self.sampling_mode = stream_info.get("sampling_mode", "patch")
         self.sampling_step = stream_info.get("sampling_step", 1)
@@ -300,16 +303,51 @@ class DataReaderMesh(DataReaderTimestep):
             self.ds_target = self.ds_source
 
         for ch in self.source_channels:
-            var = self.col_map[ch]["var"]
-            if var in self.ds_source:
+            var = self._resolve_var(self.ds_source, ch)
+            if var is not None:
                 self._dask_arrays_src[ch] = self.ds_source[var].data
 
         for ch in self.target_channels:
-            var = self.col_map[ch]["var"]
-            if var in self.ds_target:
+            var = self._resolve_var(self.ds_target, ch)
+            if var is not None:
                 self._dask_arrays_trg[ch] = self.ds_target[var].data
 
         self._initialized = True
+
+    def _resolve_var(self, ds, ch_name: str) -> str | None:
+        """
+        Name of the dataset variable holding a channel, or None if it is not in the dataset.
+
+        Some files carry a `weathergen_col_map` whose `var` entries do not match the variables
+        actually stored (e.g. the IFS forcing files map '2t' -> 'sotemair' while the stored
+        variable is named '2t'). Fall back to the channel name in that case, so the channel is
+        read instead of being silently zero-filled.
+        """
+        var = self.col_map[ch_name]["var"]
+        if var in ds:
+            return var
+
+        tag = "source" if ds is self.ds_source else "target"
+        key = (ch_name, tag)
+        report = key not in self._var_warned
+        self._var_warned.add(key)
+        stream = self._stream_info.get("name")
+
+        if ch_name in ds.data_vars:
+            if report:
+                _logger.warning(
+                    f"[Stream {stream}] channel '{ch_name}': col_map variable '{var}' is not in "
+                    f"the {tag} dataset; falling back to the variable named '{ch_name}'."
+                )
+            return ch_name
+
+        if report:
+            _logger.error(
+                f"[Stream {stream}] channel '{ch_name}': neither the col_map variable '{var}' nor "
+                f"a variable named '{ch_name}' is in the {tag} dataset; the channel will be "
+                "zero-filled."
+            )
+        return None
 
     def _get_persistent_time_idxs(self, idx: TIndex) -> tuple[NDArray, DTRange]:
         dtr = self.time_window_handler.window(idx)
@@ -534,16 +572,15 @@ class DataReaderMesh(DataReaderTimestep):
         with dask.config.set(scheduler="single-threaded"):
             for i, idx in enumerate(indices):
                 ch_name = self.available_channels[idx]
+                var = self._resolve_var(ds, ch_name)
+                if var is None:
+                    continue
                 if ch_name not in arr_cache:
-                    info = self.col_map[ch_name]
-                    if info["var"] in ds:
-                        arr_cache[ch_name] = ds[info["var"]].data
-                    else:
-                        continue
+                    arr_cache[ch_name] = ds[var].data
 
                 info = self.col_map[ch_name]
                 base_arr = arr_cache[ch_name]
-                dims = ds[info["var"]].dims
+                dims = ds[var].dims
                 # 1. Apply Vertical Level Selection
                 sliced = base_arr
                 if info["sel"]:

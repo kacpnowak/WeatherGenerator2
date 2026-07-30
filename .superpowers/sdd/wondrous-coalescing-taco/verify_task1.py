@@ -145,15 +145,114 @@ def main() -> int:
         if atmo.col_map[ch]["var"] not in atmo.ds_source
     ]
     print(
-        f"ATMO channels whose col_map 'var' is absent from {atmo.filename_source.name}: "
+        f"ATMO channels whose col_map 'var' is absent from {atmo.filename_source.name} "
+        f"(Task 1b falls these back to the channel name): "
         f"{atmo_missing if atmo_missing else 'none'}"
     )
-    if atmo_missing:
-        rd = atmo.get_source(np.int64(2))
-        print(
-            f"  -> ATMO source block {rd.data.shape}: per-channel nanmean="
-            f"{np.nanmean(rd.data, axis=0)} (silently zero-filled)"
+
+    # ------------------------------------------------- Task 1b: real data reads
+    print("\n--- Task 1b: ATMO forcing must no longer be zero-filled ---")
+    # The first source time steps of the nowcast file have gaps (see DATA DEFECTS below),
+    # so read a mid-year window rather than the 2024-01 one used for the checks above.
+    tw_mid = TimeWindowHandler(
+        np.datetime64("2024-06-01T00:00", "ns"),
+        np.datetime64("2024-07-01T00:00", "ns"),
+        np.timedelta64(24, "h"),
+        np.timedelta64(24, "h"),
+    )
+    atmo_r = DataReaderMesh(tw_mid, Path(streams["ATMO"]["filenames"][0]), streams["ATMO"])
+    rd_a = atmo_r.get_source(np.int64(12))
+    print(f"ATMO source block {rd_a.data.shape} at {rd_a.datetimes[0]}")
+    stats = {}
+    for i, ch in enumerate(atmo_r.source_channels):
+        col = rd_a.data[:, i]
+        finite = np.isfinite(col)
+        stats[ch] = (
+            bool(np.all(col == 0.0)),
+            float(finite.mean()),
+            float(np.nanstd(col)) if finite.any() else 0.0,
+            (float(np.nanmin(col)), float(np.nanmax(col))) if finite.any() else (np.nan, np.nan),
         )
+        zf, ff, sd, (lo, hi) = stats[ch]
+        print(
+            f"  {ch:4s} all_zero={zf!s:5s} finite_frac={ff:.3f} std={sd:12.5f} "
+            f"range=[{lo:.4g}, {hi:.4g}]"
+        )
+
+    zero_filled = [c for c, v in stats.items() if v[0]]
+    check("4. no ATMO channel is zero-filled", not zero_filled, f"zero-filled: {zero_filled}")
+
+    identical = [
+        (a_, b_)
+        for i, a_ in enumerate(atmo_r.source_channels)
+        for b_ in atmo_r.source_channels[i + 1 :]
+        if np.array_equal(
+            rd_a.data[:, atmo_r.source_channels.index(a_)],
+            rd_a.data[:, atmo_r.source_channels.index(b_)],
+            equal_nan=True,
+        )
+    ]
+    check("5. the 6 ATMO channels are mutually distinct", not identical, f"identical: {identical}")
+
+    varying = [c for c, v in stats.items() if v[2] > 0.0]
+    check(
+        "6. ATMO channels carry varying data",
+        len(varying) >= 5,
+        f"{len(varying)}/6 vary: {varying}; flat/empty: {sorted(set(stats) - set(varying))}",
+    )
+
+    ranges = {
+        "2t": (180.0, 340.0),
+        "2d": (180.0, 340.0),
+        "10u": (-120.0, 120.0),
+        "10v": (-120.0, 120.0),
+        "cp": (0.0, 1.0),
+        "msl": (8e4, 1.1e5),
+    }
+    implausible = [
+        c
+        for c, (lo, hi) in ranges.items()
+        if stats[c][1] > 0.0 and not (lo <= stats[c][3][0] and stats[c][3][1] <= hi)
+    ]
+    check(
+        "7. ATMO channels that carry data are in a plausible physical range",
+        not implausible,
+        f"out of range: {implausible}",
+    )
+
+    # GLORYS must be untouched by the fallback: its col_map 'var' entries all exist.
+    glorys_r = DataReaderMesh(tw_mid, Path(streams["GLORYS"]["filenames"][0]), streams["GLORYS"])
+    rd_g = glorys_r.get_source(np.int64(12))
+    check(
+        "8. GLORYS read takes no col_map fallback (identical code path to before Task 1b)",
+        not glorys_r._var_warned,
+        f"fallbacks/errors: {sorted(glorys_r._var_warned)}",
+    )
+    g_stats = {}
+    for i, ch in enumerate(glorys_r.source_channels):
+        col = rd_g.data[:, i]
+        g_stats[ch] = (bool(np.all(col == 0.0)), float(np.isfinite(col).mean()))
+    g_zero = [c for c, v in g_stats.items() if v[0]]
+    g_empty = sorted(c for c, v in g_stats.items() if v[1] == 0.0)
+    check("9. no GLORYS channel is zero-filled", not g_zero, f"zero-filled: {g_zero}")
+    uo0 = rd_g.data[:, glorys_r.source_channels.index("uo_0.494025m")]
+    check(
+        "10. GLORYS uo_0.494025m has real ocean values",
+        np.isfinite(uo0).any() and np.nanstd(uo0) > 0 and np.nanmax(np.abs(uo0)) < 20.0,
+        f"finite_frac={np.isfinite(uo0).mean():.3f} std={np.nanstd(uo0):.4f} "
+        f"absmax={np.nanmax(np.abs(uo0)):.4f}",
+    )
+
+    print("\n--- DATA DEFECTS in the eval source files (file-level, not reader bugs) ---")
+    a_empty = sorted(c for c, v in stats.items() if v[1] == 0.0)
+    print(
+        f"ATMO  {atmo_r.filename_source.name}: channels with no finite data at all: "
+        f"{a_empty if a_empty else 'none'}"
+    )
+    print(
+        f"GLORYS {glorys_r.filename_source.name}: channels with no finite data at all "
+        f"({len(g_empty)}/41): {g_empty if g_empty else 'none'}"
+    )
 
     print()
     if failures:
