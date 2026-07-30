@@ -1,0 +1,155 @@
+GLORYS:  
+  type: mesh
+  stream_id: 2137
+  loss_weight: 1.0
+  filenames:
+  - /e/data1/climateai/hclimrep/data/glorys_forcings/glo_nowcast_025_fixed.parq
+  # training file: supplies the normalization statistics the checkpoint was trained with
+  target_file: /e/data1/climateai/hclimrep/data/glorys_025/glorys_025_mesh_fixed.parq
+  channels_order:  # channel order the checkpoint glorys_cont3_c1 was trained with
+  - zos
+  - thetao_0.494025m
+  - thetao_15.8101m
+  - thetao_34.4342m
+  - thetao_55.7643m
+  - thetao_77.8539m
+  - thetao_109.729m
+  - thetao_155.851m
+  - thetao_222.475m
+  - thetao_318.127m
+  - thetao_541.089m
+  - so_0.494025m
+  - so_15.8101m
+  - so_34.4342m
+  - so_55.7643m
+  - so_77.8539m
+  - so_109.729m
+  - so_155.851m
+  - so_222.475m
+  - so_318.127m
+  - so_541.089m
+  - uo_0.494025m
+  - uo_15.8101m
+  - uo_34.4342m
+  - uo_55.7643m
+  - uo_77.8539m
+  - uo_109.729m
+  - uo_155.851m
+  - uo_222.475m
+  - uo_318.127m
+  - uo_541.089m
+  - vo_0.494025m
+  - vo_15.8101m
+  - vo_34.4342m
+  - vo_55.7643m
+  - vo_77.8539m
+  - vo_109.729m
+  - vo_155.851m
+  - vo_222.475m
+  - vo_318.127m
+  - vo_541.089m
+  source:
+  - zos
+  - thetao_0.494025m
+  - thetao_15.8101m
+  - thetao_34.4342m
+  - thetao_55.7643m
+  - thetao_77.8539m
+  - thetao_109.729m
+  - thetao_155.851m
+  - thetao_222.475m
+  - thetao_318.127m
+  - thetao_541.089m
+  - so_0.494025m
+  - so_15.8101m
+  - so_34.4342m
+  - so_55.7643m
+  - so_77.8539m
+  - so_109.729m
+  - so_155.851m
+  - so_222.475m
+  - so_318.127m
+  - so_541.089m
+  - uo_0.494025m
+  - uo_15.8101m
+  - uo_34.4342m
+  - uo_55.7643m
+  - uo_77.8539m
+  - uo_109.729m
+  - uo_155.851m
+  - uo_222.475m
+  - uo_318.127m
+  - uo_541.089m
+  - vo_0.494025m
+  - vo_15.8101m
+  - vo_34.4342m
+  - vo_55.7643m
+  - vo_77.8539m
+  - vo_109.729m
+  - vo_155.851m
+  - vo_222.475m
+  - vo_318.127m
+  - vo_541.089m
+  target: 
+  - zos
+  - thetao_0.494025m
+  - thetao_15.8101m
+  - thetao_34.4342m
+  - thetao_55.7643m
+  - thetao_77.8539m
+  - thetao_109.729m
+  - thetao_155.851m
+  - thetao_222.475m
+  - thetao_318.127m
+  - thetao_541.089m
+  - so_0.494025m
+  - so_15.8101m
+  - so_34.4342m
+  - so_55.7643m
+  - so_77.8539m
+  - so_109.729m
+  - so_155.851m
+  - so_222.475m
+  - so_318.127m
+  - so_541.089m
+  - uo_0.494025m
+  - uo_15.8101m
+  - uo_34.4342m
+  - uo_55.7643m
+  - uo_77.8539m
+  - uo_109.729m
+  - uo_155.851m
+  - uo_222.475m
+  - uo_318.127m
+  - uo_541.089m
+  - vo_0.494025m
+  - vo_15.8101m
+  - vo_34.4342m
+  - vo_55.7643m
+  - vo_77.8539m
+  - vo_109.729m
+  - vo_155.851m
+  - vo_222.475m
+  - vo_318.127m
+  - vo_541.089m
+  location_weight : cosine_latitude
+  masking_rate : 0.6
+  masking_rate_none : 0.05
+  token_size : 32
+  tokenize_spacetime : True
+  max_num_targets: -1 
+  embed : 
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 256
+    num_blocks : 2
+  embed_target_coords :
+    net : mlp
+    dim_embed : 256
+  target_readout :
+    num_layers : 2
+    num_heads : 4
+  pred_head :
+    ens_size : 1
+    num_layers : 1

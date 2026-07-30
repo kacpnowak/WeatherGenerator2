@@ -28,6 +28,26 @@ t_epsilon = np.timedelta64(1, "ms")
 MIN_PATCH_POINTS = 512
 
 
+def _open_dataset_fixed(mapper, **kwargs):
+    kwargs["decode_cf"] = False
+    ds = xr.open_dataset(mapper, **kwargs)
+    for var in ds.variables.values():
+        for attr in ["_FillValue", "missing_value"]:
+            if attr in var.attrs:
+                val = var.attrs[attr]
+                if isinstance(val, (list, tuple, np.ndarray)):
+                    new_val = [v for v in val if v != 0.0]
+                    if not new_val:
+                        del var.attrs[attr]
+                    elif len(new_val) == 1:
+                        var.attrs[attr] = new_val[0]
+                    else:
+                        var.attrs[attr] = new_val
+                elif val == 0.0:
+                    del var.attrs[attr]
+    return xr.decode_cf(ds, decode_times=True)
+
+
 class DataReaderMesh(DataReaderTimestep):
     """
     A data reader for unstructured mesh data accessed via Virtual Zarr.
@@ -152,6 +172,21 @@ class DataReaderMesh(DataReaderTimestep):
                 90.0,
             )
 
+        # Optional explicit channel ordering (e.g. to match a trained checkpoint).
+        # Listed channels are moved to the front, in the given order; the rest follow.
+        channels_order = stream_info.get("channels_order")
+        if channels_order:
+            channels_order = list(channels_order)
+            missing = [ch for ch in channels_order if ch not in self.col_map]
+            if missing:
+                raise ValueError(
+                    f"[Stream {stream_info.get('name')}] channels_order lists channels that are "
+                    f"not available in {self.filename_source} / {self.filename_target}: {missing}"
+                )
+            ordered = {ch: self.col_map[ch] for ch in channels_order}
+            ordered.update({ch: v for ch, v in self.col_map.items() if ch not in ordered})
+            self.col_map = ordered
+
         self.available_channels = list(self.col_map.keys())
 
         super().__init__(tw_handler, stream_info, data_start_time, data_end_time, period)
@@ -169,7 +204,7 @@ class DataReaderMesh(DataReaderTimestep):
     def _probe_file(self, filepath, is_source=True):
         mapper = fsspec.get_mapper("reference://", fo=str(filepath), remote_protocol="file")
         try:
-            with xr.open_dataset(mapper, engine="zarr", chunks={}, consolidated=False) as ds:
+            with _open_dataset_fixed(mapper, engine="zarr", chunks={}, consolidated=False) as ds:
                 if "time" not in ds.coords:
                     all_vars = list(ds.coords) + list(ds.data_vars)
                     time_candidates = [v for v in all_vars if "time" in v.lower()]
@@ -248,7 +283,7 @@ class DataReaderMesh(DataReaderTimestep):
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*separate the stored chunks.*")
-            self.ds_source = xr.open_dataset(
+            self.ds_source = _open_dataset_fixed(
                 self.mapper_src, engine="zarr", chunks={}, decode_times=True, consolidated=False
             )
 
@@ -258,7 +293,7 @@ class DataReaderMesh(DataReaderTimestep):
             )
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=".*separate the stored chunks.*")
-                self.ds_target = xr.open_dataset(
+                self.ds_target = _open_dataset_fixed(
                     self.mapper_trg, engine="zarr", chunks={}, decode_times=True, consolidated=False
                 )
         else:
@@ -457,12 +492,12 @@ class DataReaderMesh(DataReaderTimestep):
         dt_flat = np.repeat(dt_values, patch_coords_base.shape[0])
 
         if data_block.size > 0:
-            # Check for NaNs across any channel
-            valid_mask = ~np.isnan(data_block).any(axis=1)
+            # Check for NaNs across all channels (only drop if NaN in ALL channels)
+            valid_mask = ~np.isnan(data_block).all(axis=1)
 
-            # Check for filler values across any channel
+            # Check for filler values across all channels
             if self.filler_values:
-                valid_mask &= ~np.isin(data_block, self.filler_values).any(axis=1)
+                valid_mask &= ~np.isin(data_block, self.filler_values).all(axis=1)
 
             data_block = data_block[valid_mask]
             coords_flat = coords_flat[valid_mask]
@@ -612,11 +647,13 @@ class DataReaderMesh(DataReaderTimestep):
     @override
     def normalize_source_channels(self, source: np.typing.NDArray) -> np.typing.NDArray:
         norm = (source - self.mean[self.source_idx]) / self.stdev[self.source_idx]
+        # print(f"channel name: {self.available_channels[self.source_idx]}, mean: {self.mean[self.source_idx]}, stdev: {self.stdev[self.source_idx]} post normalization: {np.nanmean(norm)} {np.nanstd(norm)}")
         return np.nan_to_num(norm, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
     @override
     def normalize_target_channels(self, target: np.typing.NDArray) -> np.typing.NDArray:
         norm = (target - self.mean[self.target_idx]) / self.stdev[self.target_idx]
+        # print(f"channel name: {self.available_channels[self.target_idx]}, mean: {self.mean[self.target_idx]}, stdev: {self.stdev[self.target_idx]}")
         return np.nan_to_num(norm, nan=np.nan, posinf=np.nan, neginf=np.nan).astype(np.float32)
 
     @override

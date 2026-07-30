@@ -1,0 +1,36 @@
+ATMO:   
+  type : mesh
+  stream_id : 2139
+  filenames : ['/e/data1/climateai/hclimrep/data/glorys_forcings/ifs_025_fixed.parq']
+  loss_weight : 0.0
+  # channel order the checkpoint glorys_cont3_c1 was trained with
+  channels_order : ['10u', '10v', '2d', '2t', 'cp', 'msl']
+  source :
+  - 2t
+  - 2d
+  - 10u
+  - 10v
+  - msl
+  - cp
+  target: []
+  masking_rate : 0.6
+  masking_rate_none : 0.05
+  token_size : 64
+  location_weight : cosine_latitude
+  tokenize_spacetime : True
+  embed : 
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 256
+    num_blocks : 2
+  embed_target_coords :
+    net : mlp
+    dim_embed : 256
+  target_readout :
+    num_layers : 0
+    num_heads : 0
+    # sampling_rate : 0.2
+  pred_head :
+    ens_size : 1
+    num_layers : 0
