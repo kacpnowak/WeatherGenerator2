@@ -3,7 +3,7 @@ GLORYS:
   stream_id: 2137
   loss_weight: 1.0
   filenames:
-  - /e/data1/climateai/hclimrep/data/glorys_forcings/glo_nowcast_025_v2_fixed.parq
+  - /e/data1/climateai/hclimrep/data/glorys_forcings/glo_nowcast_025_v2b_fixed.parq
   # training file: supplies the normalization statistics the checkpoint was trained with
   target_file: /e/data1/climateai/hclimrep/data/glorys_025/glorys_025_mesh_fixed.parq
   channels_order:  # channel order the checkpoint glorys_cont3_c1 was trained with
