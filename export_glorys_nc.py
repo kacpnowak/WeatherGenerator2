@@ -48,11 +48,17 @@ Longitudes coincide exactly and are only reordered to a monotonic
 Restartability
 --------------
 The store is grown by *appending* along ``first_day_datetime`` in ascending
-date order (``to_zarr(mode="a", append_dim=...)``).  Dates already present in
-the store's ``first_day_datetime`` coordinate are skipped, so the exporter can
-be re-run after an interruption.  Because appending cannot insert, a date that
-is older than the newest date already in the store is refused (rebuild the
-store, or export into a fresh --output, if you need to backfill).
+date order (``to_zarr(mode="a", append_dim=...)``).  ``plan_export`` decides
+what to write: it de-duplicates the requested dates, sorts them, drops those
+already present in the store's ``first_day_datetime`` coordinate, and refuses
+any remaining date older than the newest stored one (appending cannot insert;
+rebuild the store, or use a fresh --output, to backfill).  The exporter can
+therefore be re-run after an interruption.
+
+Before anything is appended, ``check_store_integrity`` verifies that every
+variable is as long as the ``first_day_datetime`` coordinate, so a store left
+half-written by a run that died mid-append is rejected instead of silently
+treating the incomplete date as done.
 
 Usage
 -----
@@ -385,7 +391,6 @@ def export_one_date(
     expected_day: dt.date | None,
     sample: str = "0",
     n_lead: int = N_LEAD_DAYS,
-    strict_dates: bool = True,
 ) -> xr.Dataset:
     """Read one inference zip and return the challenger dataset for that forecast."""
     root, store = _open_store(zip_path)
@@ -398,6 +403,9 @@ def export_one_date(
             rec = read_prediction(root, sample, fstep)
             if grids is None:
                 channels = rec["channels"]
+                # validate up front: a mislabelled store must fail in seconds,
+                # not after reading and regridding all ten forecast steps
+                channel_index_map(channels)
                 grids = np.full(
                     (n_lead, len(channels), TARGET_LAT.size, TARGET_LON.size),
                     _FILL,
@@ -418,16 +426,15 @@ def export_one_date(
             raise ValueError(msg)
 
         day = first_day.astype("datetime64[D]").astype(dt.date)
-        if strict_dates:
-            if day.weekday() != 2:
-                msg = f"{zip_path}: derived first day {day} is not a Wednesday"
-                raise ValueError(msg)
-            if expected_day is not None and day != expected_day:
-                msg = (
-                    f"{zip_path}: derived first day {day} does not match run "
-                    f"directory date {expected_day}"
-                )
-                raise ValueError(msg)
+        if day.weekday() != 2:
+            msg = f"{zip_path}: derived first day {day} is not a Wednesday"
+            raise ValueError(msg)
+        if expected_day is not None and day != expected_day:
+            msg = (
+                f"{zip_path}: derived first day {day} does not match run "
+                f"directory date {expected_day}"
+            )
+            raise ValueError(msg)
 
         return build_forecast_dataset(grids, channels, first_day)
     finally:
@@ -439,11 +446,52 @@ def export_one_date(
 # --------------------------------------------------------------------------
 
 
+def check_store_integrity(output: pathlib.Path) -> None:
+    """Fail loudly on a store left half-written by an interrupted append.
+
+    ``to_zarr(append_dim=...)`` extends one array at a time, so a run killed
+    mid-append can leave some variables one forecast longer than others.  The
+    ``first_day_datetime`` coordinate alone cannot detect that: the date would
+    look "already done" forever while its data is missing.  Compare the raw
+    zarr array lengths instead of going through xarray, which refuses to open
+    such a store at all.
+
+    ``use_consolidated=False`` is essential: consolidated metadata is written
+    only at the *end* of a successful append, so a crashed run leaves it
+    describing the old, self-consistent shapes and the corruption stays
+    invisible.  Each array's own metadata is the ground truth.
+    """
+    root = zarr.open_group(str(output), mode="r", use_consolidated=False)
+    if "first_day_datetime" not in root:
+        msg = f"{output} has no first_day_datetime coordinate; it is not a challenger store"
+        raise ValueError(msg)
+    n_dates = root["first_day_datetime"].shape[0]
+
+    bad = {}
+    for name in ("zos", *DEPTH_VARS):
+        if name not in root:
+            bad[name] = "missing"
+        elif root[name].shape[0] != n_dates:
+            bad[name] = root[name].shape[0]
+    if bad:
+        details = ", ".join(f"{k}={v}" for k, v in bad.items())
+        msg = (
+            f"{output} is inconsistent: first_day_datetime has {n_dates} entries "
+            f"but {details}. This means an append was interrupted. Fix it by "
+            f"deleting the store and re-running the export, or by truncating the "
+            f"trailing incomplete date from every array; do not append to it as is."
+        )
+        raise ValueError(msg)
+
+
 def existing_first_days(output: pathlib.Path) -> np.ndarray:
     """Dates already present in the output store (empty array if it does not exist)."""
     if not output.exists():
         return np.array([], dtype="datetime64[D]")
-    with xr.open_zarr(output, consolidated=None) as ds:
+    check_store_integrity(output)
+    # consolidated=False for the same reason as in check_store_integrity: after
+    # an interrupted run the consolidated copy can be stale.
+    with xr.open_zarr(output, consolidated=False) as ds:
         return ds["first_day_datetime"].values.astype("datetime64[D]")
 
 
@@ -474,6 +522,34 @@ def summarize(ds: xr.Dataset) -> str:
     return f"finite={finite:.3f} " + " ".join(parts)
 
 
+def plan_export(
+    requested: list[dt.date], already_present: list[dt.date]
+) -> tuple[list[dt.date], list[dt.date]]:
+    """Decide which dates to export, in append order.
+
+    De-duplicates the request (so ``--dates X,X`` cannot append X twice),
+    sorts ascending (the order appends must happen in), drops dates already in
+    the store, and refuses a remaining date older than the newest stored one.
+
+    Returns:
+        (to_write, skipped) -- disjoint, both sorted ascending.
+    """
+    done = set(already_present)
+    ordered = sorted(set(requested))  # de-dup is what makes double-append impossible
+    skipped = [day for day in ordered if day in done]
+    to_write = [day for day in ordered if day not in done]
+
+    newest = max(done) if done else None
+    if newest is not None and to_write and to_write[0] < newest:
+        msg = (
+            f"{to_write[0]} is older than the newest date already in the store "
+            f"({newest}); appending cannot insert. Rebuild the store or use "
+            f"a fresh --output."
+        )
+        raise ValueError(msg)
+    return to_write, skipped
+
+
 def run_export(
     dates: list[dt.date],
     source_dir: pathlib.Path,
@@ -481,22 +557,13 @@ def run_export(
     sample: str,
     n_lead: int,
 ) -> int:
-    done = set(existing_first_days(output).tolist())
-    newest = max(done) if done else None
+    to_write, skipped = plan_export(dates, existing_first_days(output).tolist())
+
+    for day in skipped:
+        print(f"[skip] {day} already in {output.name}")
 
     n_written = 0
-    for day in sorted(dates):
-        if day in done:
-            print(f"[skip] {day} already in {output.name}")
-            continue
-        if newest is not None and day < newest:
-            msg = (
-                f"{day} is older than the newest date already in the store "
-                f"({newest}); appending cannot insert. Rebuild the store or use "
-                f"a fresh --output."
-            )
-            raise ValueError(msg)
-
+    for day in to_write:
         zip_path = source_dir / f"{RUN_DIR_PREFIX}{day:%Y%m%d}" / ZIP_NAME
         if not zip_path.exists():
             print(f"[miss] {day}: {zip_path} not found -- skipping")
@@ -507,7 +574,6 @@ def run_export(
         print(f"[stat] {day}: {summarize(ds)}")
         append_forecast(ds, output)
         ds.close()
-        newest = day
         n_written += 1
         print(f"[done] {day} written")
 
@@ -693,12 +759,14 @@ def self_test() -> None:
             expect_val = 0.5 * (code(0, name) + code(1, name))
             got_val = float(ds[var].values[0, 0, k, i_78, lon10])
             assert abs(got_val - expect_val) < 1e-3, (name, got_val, expect_val)
-            assert c != canonical.index(name) or True  # order really is scrambled
-    zc = scrambled.index("zos")
-    assert zc >= 0
     expect_val = 0.5 * (code(0, "zos") + code(1, "zos"))
     assert abs(float(ds["zos"].values[0, 0, i_78, lon10]) - expect_val) < 1e-3
-    print("[ok] channel unpacking honours the store's channel attribute order")
+    # the checks above are only meaningful if the declared order really differs
+    # from the canonical one -- otherwise positional unpacking would pass too
+    displaced = sum(1 for n in canonical if scrambled.index(n) != canonical.index(n))
+    assert displaced >= 30, f"only {displaced}/41 channels displaced; test is too weak"
+    print(f"[ok] channel unpacking honours the store's channel attribute order "
+          f"({displaced}/41 channels declared out of canonical position)")
 
     # lead_day_index mapping: axis 0 of target_grids is lead 0 == forecast step 1
     assert ds["lead_day_index"].values.tolist() == list(range(n_lead))
@@ -738,6 +806,42 @@ def self_test() -> None:
     assert all(d.weekday() == 2 for d in weds)
     print("[ok] source_interval start + 1 day gives the forecast Wednesday; "
           "52 Wednesdays in 2024")
+
+    # --- export planning / restartability --------------------------------
+    d3, d10, d17, d24 = weds[0], weds[1], weds[2], weds[3]
+
+    # a date requested twice must be exported once, not appended twice
+    to_write, skipped = plan_export([d3, d3, d10, d3], [])
+    assert to_write == [d3, d10], to_write
+    assert skipped == [], skipped
+    print("[ok] a date requested twice is planned once (no double append)")
+
+    # dates already in the store are skipped, even if requested again
+    to_write, skipped = plan_export([d3, d10, d10, d17], [d3, d10])
+    assert to_write == [d17], to_write
+    assert skipped == [d3, d10], skipped
+    print("[ok] dates already present in the store are skipped on re-run")
+
+    # a fully satisfied request writes nothing
+    to_write, skipped = plan_export([d10, d3], [d3, d10])
+    assert to_write == [] and skipped == [d3, d10]
+    print("[ok] re-running a completed export is a no-op")
+
+    # planning always yields ascending order, whatever order was requested
+    to_write, skipped = plan_export([d24, d3, d17, d10], [d3])
+    assert to_write == [d10, d17, d24], to_write
+    assert skipped == [d3], skipped
+    assert set(to_write).isdisjoint(skipped), "a date was both written and skipped"
+    print("[ok] export order is ascending so appends stay monotonic")
+
+    # backfilling behind the newest stored date is refused
+    try:
+        plan_export([d3], [d17])
+    except ValueError as exc:
+        assert "older than the newest date" in str(exc), exc
+    else:
+        raise AssertionError("backfill was not refused")
+    print("[ok] a date older than the newest stored one is refused")
 
     print("\nself-test: all checks passed")
 
