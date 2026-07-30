@@ -5,8 +5,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=08:00:00
 #SBATCH --job-name=obench-inference
-#SBATCH --output=logs/oceanbench/%j.out
-#SBATCH --error=logs/oceanbench/%j.err
+#SBATCH --output=/e/scratch/hclimrep/nowak2/WeatherGenerator2/logs/oceanbench/%j.out
+#SBATCH --error=/e/scratch/hclimrep/nowak2/WeatherGenerator2/logs/oceanbench/%j.err
 #
 # run_oceanbench_inference.sh
 #
@@ -27,6 +27,11 @@
 #              the default of all 52 Wednesdays of 2024.
 #   --dry-run  print the RUN_ID / MON / END / full command for each requested
 #              date and exit; nothing is submitted or run.
+#
+# NOTE: --dates is passed through to `date -d` and eval'd as part of the
+# inference command with no sanitization. This is an internal operator
+# launcher, not a user-facing service, so untrusted input is out of scope;
+# only pass trusted YYYY-MM-DD values.
 #
 # Without --dry-run, this script submits exactly ONE sbatch job (itself) that
 # then loops over all requested dates sequentially on one GPU.
