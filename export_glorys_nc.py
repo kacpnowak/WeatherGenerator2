@@ -55,6 +55,10 @@ any remaining date older than the newest stored one (appending cannot insert;
 rebuild the store, or use a fresh --output, to backfill).  The exporter can
 therefore be re-run after an interruption.
 
+The store is written in **zarr format 2**, because the OceanBench environment
+that consumes it pins zarr-python 2.18.4 and cannot open a v3 store.  See
+``append_forecast`` for that and for the related empty-chunk pitfall.
+
 Before anything is appended, ``check_store_integrity`` verifies that every
 variable is as long as the ``first_day_datetime`` coordinate, so a store left
 half-written by a run that died mid-append is rejected instead of silently
@@ -72,8 +76,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import pathlib
+import shutil
 import sys
+import tempfile
 
 import numpy as np
 import xarray as xr
@@ -92,6 +99,10 @@ RUN_DIR_PREFIX = "obench_"
 
 STREAM = "GLORYS"
 N_LEAD_DAYS = 10  # forecast steps 1..10 -> lead_day_index 0..9
+
+# OceanBench's environment pins zarr-python 2.18.4, which cannot read a zarr
+# format 3 store. This venv has zarr-python 3.x and would default to v3.
+ZARR_FORMAT = 2
 
 # depth labels exactly as they appear in the channel names of the GLORYS stream
 DEPTH_LABELS = (
@@ -329,8 +340,22 @@ def build_forecast_dataset(
 
 
 def zarr_encoding(ds: xr.Dataset) -> dict[str, dict]:
-    """One chunk per (forecast, variable): 1 x n_lead x [depth] x 672 x 1440."""
-    encoding = {}
+    """One chunk per (forecast, variable): 1 x n_lead x [depth] x 672 x 1440.
+
+    ``first_day_datetime`` gets an explicit 1970 epoch.  Left to itself xarray
+    uses the *first* value as the reference, so the first date encodes to 0 --
+    which is the fill value, so zarr skips writing that chunk entirely and a
+    zarr-python 2 reader (which does not zero-fill a missing chunk when
+    ``fill_value`` is null) returns uninitialised garbage for it.  See
+    ``append_forecast`` for the second half of this fix.
+    """
+    encoding: dict[str, dict] = {
+        "first_day_datetime": {
+            "units": "days since 1970-01-01",
+            "calendar": "proleptic_gregorian",
+            "dtype": "int64",
+        }
+    }
     for name, da in ds.data_vars.items():
         chunks = tuple(1 if dim == "first_day_datetime" else da.sizes[dim] for dim in da.dims)
         encoding[name] = {"chunks": chunks}
@@ -496,12 +521,39 @@ def existing_first_days(output: pathlib.Path) -> np.ndarray:
 
 
 def append_forecast(ds: xr.Dataset, output: pathlib.Path) -> None:
-    """Create the store (first call) or append one forecast along first_day_datetime."""
-    if output.exists():
-        ds.to_zarr(output, mode="a", append_dim="first_day_datetime", consolidated=True)
-    else:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        ds.to_zarr(output, mode="w", encoding=zarr_encoding(ds), consolidated=True)
+    """Create the store (first call) or append one forecast along first_day_datetime.
+
+    The store MUST be zarr format 2: OceanBench's environment pins
+    zarr-python 2.18.4, which cannot read a v3 store at all (it reports a bare
+    FileNotFoundError because none of the v2 metadata objects exist).  This
+    venv has zarr-python 3.x, whose default output is v3, so the format is
+    pinned explicitly on both the create and the append path.
+
+    ``write_empty_chunks`` must also be forced on.  zarr-python 3 omits any
+    chunk whose contents all equal the fill value; zarr-python 2 then reads
+    that missing chunk as uninitialised memory whenever ``fill_value`` is null
+    (as it is for the integer/float coordinates xarray writes).  Writing every
+    chunk removes the whole failure mode rather than relying on no chunk ever
+    being uniformly zero.
+    """
+    with zarr.config.set({"array.write_empty_chunks": True}):
+        if output.exists():
+            ds.to_zarr(
+                output,
+                mode="a",
+                append_dim="first_day_datetime",
+                consolidated=True,
+                zarr_format=ZARR_FORMAT,
+            )
+        else:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            ds.to_zarr(
+                output,
+                mode="w",
+                encoding=zarr_encoding(ds),
+                consolidated=True,
+                zarr_format=ZARR_FORMAT,
+            )
 
 
 def summarize(ds: xr.Dataset) -> str:
@@ -635,6 +687,11 @@ def legacy_probe(zip_path: pathlib.Path, sample: str = "0", fstep: int = 1) -> N
 
 def self_test() -> None:
     """Offline structural checks on a small synthetic sample."""
+    # the on-disk-format section at the end shrinks the reference grid so it can
+    # write a real store cheaply; declared here because Python requires the
+    # global statement to precede every use of the name in the function
+    global TARGET_LAT, TARGET_LON
+
     rng = np.random.default_rng(0)
     canonical = expected_channel_names()
 
@@ -842,6 +899,55 @@ def self_test() -> None:
     else:
         raise AssertionError("backfill was not refused")
     print("[ok] a date older than the newest stored one is refused")
+
+    # --- on-disk format --------------------------------------------------
+    # OceanBench pins zarr-python 2.18.4 and cannot read a zarr v3 store, so
+    # write a real (tiny) store through the production code path and inspect
+    # the bytes. The reference grid is shrunk for the duration so this stays
+    # cheap; build_forecast_dataset / append_forecast are otherwise untouched.
+    saved_grid = (TARGET_LAT, TARGET_LON)
+    tmpdir = pathlib.Path(tempfile.mkdtemp(prefix="wg_export_selftest_"))
+    try:
+        TARGET_LAT = np.arange(-312, -308, dtype=np.float64) * GRID_STEP
+        TARGET_LON = np.arange(0, 4, dtype=np.float64) * GRID_STEP
+        shape = (2, len(scrambled), TARGET_LAT.size, TARGET_LON.size)
+        store = tmpdir / "fmt.zarr"
+        append_forecast(
+            build_forecast_dataset(np.zeros(shape, np.float32), scrambled, np.datetime64(d3, "ns")),
+            store,
+        )
+
+        meta = json.loads((store / ".zgroup").read_text())
+        assert meta["zarr_format"] == 2, meta
+        assert not (store / "zarr.json").exists(), "zarr v3 metadata present"
+        assert (store / ".zmetadata").exists(), "consolidated metadata missing"
+        for name in ("zos", *DEPTH_VARS, "first_day_datetime", "latitude", "depth"):
+            assert (store / name / ".zarray").exists(), f"{name} is not a v2 array"
+        print("[ok] store is written in zarr format 2 (OceanBench pins zarr 2.18.4)")
+
+        # every chunk must exist on disk: zarr 3 skips all-fill chunks and
+        # zarr 2 reads a missing chunk as garbage when fill_value is null
+        for name in ("first_day_datetime", "lead_day_index", "latitude", "longitude", "depth"):
+            chunks = [p.name for p in (store / name).iterdir() if not p.name.startswith(".")]
+            assert chunks, f"{name} has no chunk written at all"
+        assert json.loads((store / "first_day_datetime" / ".zattrs").read_text())["units"] == (
+            "days since 1970-01-01"
+        )
+        print("[ok] coordinate chunks are all materialised, epoch pinned to 1970")
+
+        # append a second date and read both back through the normal helpers
+        append_forecast(
+            build_forecast_dataset(
+                np.zeros(shape, np.float32), scrambled, np.datetime64(d10, "ns")
+            ),
+            store,
+        )
+        check_store_integrity(store)
+        assert existing_first_days(store).tolist() == [d3, d10], existing_first_days(store)
+        print("[ok] v2 store round-trips through check_store_integrity/existing_first_days")
+    finally:
+        TARGET_LAT, TARGET_LON = saved_grid
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     print("\nself-test: all checks passed")
 
