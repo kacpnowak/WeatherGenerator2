@@ -74,6 +74,13 @@ def main() -> int:
         got_atmo == expected_atmo,
         f"got {got_atmo}",
     )
+    # ATMO is forcing-only: the checkpoint has no ATMO pred head. A non-empty target
+    # selection makes the validation loss reshape blow up (Task 4, job 1105809).
+    check(
+        "2b. ATMO target_channels == [] (checkpoint train_target_channels)",
+        list(atmo.target_channels) == list(ckpt["ATMO"]["train_target_channels"]) == [],
+        f"got {list(atmo.target_channels)}, target_idx={list(atmo.target_idx)}",
+    )
 
     # ------------------------------------------------- training stats restored
     zos_mean = float(glorys.mean[glorys.source_idx[0]])

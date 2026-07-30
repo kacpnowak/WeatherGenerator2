@@ -12,7 +12,12 @@ ATMO:
   - 10v
   - msl
   - cp
+  # ATMO is forcing-only: the checkpoint has no ATMO pred head and was trained with
+  # train_target_channels == []. An empty `target` list is NOT enough - _select_channels
+  # treats a falsy `select` as "no filter" and would select all 8 parquet channels.
+  # The empty string is a substring of every channel name, so this excludes all of them.
   target: []
+  target_exclude: ['']
   masking_rate : 0.6
   masking_rate_none : 0.05
   token_size : 64

@@ -170,6 +170,9 @@ export OMP_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1
 export MKL_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Neutralize breakpoint() in batch mode. NOTE: this does NOT disable the explicit
+# pdb.post_mortem in run_train.py - the OUT_ZIP existence check below is the real guard.
+export PYTHONBREAKPOINT=0
 
 cd "$REPO_DIR"
 source .venv/bin/activate
@@ -194,8 +197,15 @@ for W in "${WEDNESDAYS[@]}"; do
 
     eval "$CMD"
     rc=$?
+    # A zero exit code is NOT sufficient evidence of success: run_train.py wraps
+    # inference in pdb.post_mortem, so a crash in batch mode (no tty) drops into pdb,
+    # gets EOF, and the process still exits 0 with no output written. Require the
+    # result zip to actually exist.
     if [[ $rc -ne 0 ]]; then
         echo "[FAIL] ${W} (RUN_ID=${RUN_ID}) exited with code ${rc}"
+        FAILED+=("$W")
+    elif [[ ! -f "$OUT_ZIP" ]]; then
+        echo "[FAIL] ${W} (RUN_ID=${RUN_ID}) exited 0 but produced no ${OUT_ZIP}"
         FAILED+=("$W")
     else
         echo "[OK] ${W} (RUN_ID=${RUN_ID})"
