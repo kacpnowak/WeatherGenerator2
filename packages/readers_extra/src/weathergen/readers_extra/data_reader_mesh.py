@@ -29,13 +29,25 @@ MIN_PATCH_POINTS = 512
 
 
 def _open_dataset_fixed(mapper, **kwargs):
+    """Open a dataset with CF decoding, ignoring a zero-valued missing-data sentinel.
+
+    Semantics: the dataset is opened with ``decode_cf=False`` so that ``_FillValue`` and
+    ``missing_value`` attributes equal to 0.0 can be stripped (and 0.0 removed from list-
+    valued sentinels) before CF decoding runs. Without this, xarray masks every exact-zero
+    sample to NaN, which for geophysical fields silently deletes valid data (e.g. a 0
+    m/s current or a 0-valued anomaly) and, combined with the NaN point filter below,
+    can drop whole points.
+
+    This applies to EVERY stream with ``type: mesh``, including the eerie/FESOM configs,
+    not only the GLORYS OceanBench streams -- it is a reader-wide behaviour.
+    """
     kwargs["decode_cf"] = False
     ds = xr.open_dataset(mapper, **kwargs)
     for var in ds.variables.values():
         for attr in ["_FillValue", "missing_value"]:
             if attr in var.attrs:
                 val = var.attrs[attr]
-                if isinstance(val, (list, tuple, np.ndarray)):
+                if isinstance(val, list | tuple | np.ndarray):  # noqa: TID251
                     new_val = [v for v in val if v != 0.0]
                     if not new_val:
                         del var.attrs[attr]
@@ -530,7 +542,16 @@ class DataReaderMesh(DataReaderTimestep):
         dt_flat = np.repeat(dt_values, patch_coords_base.shape[0])
 
         if data_block.size > 0:
-            # Check for NaNs across all channels (only drop if NaN in ALL channels)
+            # Point-filter semantics: a point is dropped only when ALL of its channels are
+            # invalid (`.all(axis=1)`), not when any single channel is. A point with a
+            # partially-observed channel set is therefore KEPT, with NaNs left in the
+            # individual channels for the normalizer/loss to mask out downstream. The
+            # earlier "any" semantics discarded every point that had a gap in any one
+            # channel, which for multi-variable ocean streams removed most of the mesh.
+            #
+            # This applies to EVERY stream with `type: mesh`, including the eerie/FESOM
+            # configs, not only the GLORYS OceanBench streams -- it is a reader-wide
+            # behaviour and the same rule is used for the filler-value test below.
             valid_mask = ~np.isnan(data_block).all(axis=1)
 
             # Check for filler values across all channels
@@ -684,13 +705,11 @@ class DataReaderMesh(DataReaderTimestep):
     @override
     def normalize_source_channels(self, source: np.typing.NDArray) -> np.typing.NDArray:
         norm = (source - self.mean[self.source_idx]) / self.stdev[self.source_idx]
-        # print(f"channel name: {self.available_channels[self.source_idx]}, mean: {self.mean[self.source_idx]}, stdev: {self.stdev[self.source_idx]} post normalization: {np.nanmean(norm)} {np.nanstd(norm)}")
         return np.nan_to_num(norm, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
     @override
     def normalize_target_channels(self, target: np.typing.NDArray) -> np.typing.NDArray:
         norm = (target - self.mean[self.target_idx]) / self.stdev[self.target_idx]
-        # print(f"channel name: {self.available_channels[self.target_idx]}, mean: {self.mean[self.target_idx]}, stdev: {self.stdev[self.target_idx]}")
         return np.nan_to_num(norm, nan=np.nan, posinf=np.nan, neginf=np.nan).astype(np.float32)
 
     @override
