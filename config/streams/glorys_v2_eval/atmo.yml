@@ -1,7 +1,7 @@
 ATMO:   
   type : mesh
   stream_id : 2139
-  filenames : ['/e/data1/climateai/hclimrep/data/glorys_forcings/ifs_025_fixed.parq']
+  filenames : ['/e/data1/climateai/hclimrep/data/glorys_forcings/ifs_025_v2_fixed.parq']
   loss_weight : 0.0
   # channel order the checkpoint glorys_cont3_c1 was trained with
   channels_order : ['10u', '10v', '2d', '2t', 'cp', 'msl']

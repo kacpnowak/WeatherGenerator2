@@ -382,7 +382,24 @@ def read_prediction(root: zarr.Group, sample: str, fstep: int) -> dict:
         raise KeyError(msg) from exc
 
     data = group["data"]
-    values = data[:] if data.ndim == 2 else data[:, :, 0]
+    # Structural guard on the forecast step. A prediction block is always
+    # (npoints, n_channels, ens). Anything else - in particular a group that is
+    # present but empty (npoints == 0) - would scatter nothing onto the native
+    # grid, leaving the entire lead day at the fill value. That exports as a
+    # plausible-looking all-NaN lead instead of failing, so refuse it here.
+    if data.ndim != 3:
+        msg = (
+            f"{path!r}: expected a 3-D (npoints, n_channels, ens) prediction "
+            f"block, got shape {tuple(data.shape)}"
+        )
+        raise ValueError(msg)
+    if data.shape[0] == 0:
+        msg = (
+            f"{path!r}: prediction group holds 0 points, so this forecast step "
+            f"would export as an all-NaN lead day; refusing to export it"
+        )
+        raise ValueError(msg)
+    values = data[:, :, 0]
     coords = group["coords"][:]
     channels = list(group.attrs["channels"])
     return {
