@@ -20,6 +20,11 @@
 # exactly one sample makes the source window land on the Tuesday - the day
 # the nowcast IC parquet actually has data for.
 #
+# The run config is config/config_forecasting_glorys_obench.yml, a frozen
+# snapshot of what the submitted evaluation used. Do NOT repoint this at
+# config/config_forecasting_glorys.yml: that file tracks the current training
+# experiment and moves independently of this evaluation.
+#
 # Usage:
 #   ./run_oceanbench_inference.sh [--dates "YYYY-MM-DD ..."] [--dry-run]
 #
@@ -104,7 +109,7 @@ build_command() {
     # heredoc: `$(cat <<EOF ... \<newline> ... EOF)` silently swallows
     # backslash-newline pairs (verified empirically), corrupting the
     # captured command. A single line is semantically identical and safe.
-    CMD="python -u src/weathergen/run_train.py inference --from-run-id glorys_cont3_c1 --run-id ${RUN_ID} --mini-epoch -1 --config config/config_forecasting_glorys.yml --options streams_directory=./config/streams/glorys_eval/ test_config.start_date=${MON}T00:00 test_config.end_date=${END}T00:00 test_config.samples_per_mini_epoch=1 test_config.output.num_samples=1 test_config.forecast.num_steps=10 \"test_config.output.streams=[GLORYS]\""
+    CMD="python -u src/weathergen/run_train.py inference --from-run-id glorys_cont3_c1 --run-id ${RUN_ID} --mini-epoch -1 --config config/config_forecasting_glorys_obench.yml --options streams_directory=./config/streams/glorys_eval/ test_config.start_date=${MON}T00:00 test_config.end_date=${END}T00:00 test_config.samples_per_mini_epoch=1 test_config.output.num_samples=1 test_config.forecast.num_steps=10 \"test_config.output.streams=[GLORYS]\""
 }
 
 if [[ "$DRY_RUN" -eq 1 ]]; then

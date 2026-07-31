@@ -1,0 +1,39 @@
+# Frozen copy of the run config used for the 2024 OceanBench evaluation of
+# glorys_cont3_c1; do not repoint.
+#
+# `run_oceanbench_inference.sh` passes this file as `--config`. It is a snapshot,
+# not a live config: `config/config_forecasting_glorys.yml` keeps moving with the
+# next training experiment, so pointing the OceanBench driver at that file made the
+# submitted 52-forecast evaluation impossible to reproduce. Editing this file to
+# follow a newer experiment defeats its only purpose - add a new frozen file
+# instead.
+#
+# Reconstructed from the saved run configs
+# `<shared_work>/models/obench_<YYYYMMDD>/model_obench_<YYYYMMDD>_chkpt00000.json`,
+# by diffing them against the base checkpoint config
+# (`models/glorys_cont3_c1/model_glorys_cont3_c1_latest.json`) and subtracting the
+# keys the driver supplies via `--options` (streams_directory, test_config.*) and
+# the keys the runtime derives (general.run_id, general.run_history, from_run_id,
+# world_size, with_ddp). All 52 saved run configs agree on the keys below.
+#
+# Note: the last two forecast dates (obench_20241218, obench_20241225) were re-run
+# after the IC/forcing parquet boundary fixes, so their saved configs additionally
+# carry the freeze_modules regex and the GLORYS2 stream that the live training
+# config had grown by then. Neither affects inference (nothing is trained and the
+# extra stream is not read), and the other 50 dates were produced without them, so
+# they are deliberately NOT reproduced here.
+
+# The driver also passes this via --options, with the same value; kept here so the
+# file is runnable on its own.
+streams_directory: "./config/streams/glorys_eval/"
+
+general:
+  istep: 0
+
+training_config:
+  # training_mode: "masking", "student_teacher", "latent_loss"
+  training_mode: ["masking"]
+
+  num_mini_epochs: 64
+  samples_per_mini_epoch: 4096
+  shuffle: True
