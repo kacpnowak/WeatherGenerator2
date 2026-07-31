@@ -20,18 +20,34 @@
 # exactly one sample makes the source window land on the Tuesday - the day
 # the nowcast IC parquet actually has data for.
 #
-# The run config is config/config_forecasting_glorys_obench.yml, a frozen
-# snapshot of what the submitted evaluation used. Do NOT repoint this at
+# The default run config is config/config_forecasting_glorys_obench.yml, a
+# frozen snapshot of what the submitted evaluation used. Do NOT repoint this at
 # config/config_forecasting_glorys.yml: that file tracks the current training
-# experiment and moves independently of this evaluation.
+# experiment and moves independently of this evaluation. A different model
+# checkpoint may need its own frozen config; pass it via --eval-config instead
+# of editing this default.
 #
 # Usage:
 #   ./run_oceanbench_inference.sh [--dates "YYYY-MM-DD ..."] [--dry-run]
+#                                 [--model <run_id>] [--run-prefix <prefix>]
+#                                 [--eval-config <path>]
 #
-#   --dates    space-separated list of Wednesday dates to process, overriding
-#              the default of all 52 Wednesdays of 2024.
-#   --dry-run  print the RUN_ID / MON / END / full command for each requested
-#              date and exit; nothing is submitted or run.
+#   --dates        space-separated list of Wednesday dates to process,
+#                  overriding the default of all 52 Wednesdays of 2024.
+#   --dry-run      print the RUN_ID / MON / END / full command for each
+#                  requested date and exit; nothing is submitted or run.
+#   --model        checkpoint run-id to evaluate (passed as --from-run-id to
+#                  inference). Default: glorys_cont3_c1.
+#   --run-prefix   prefix used to build each per-date RUN_ID (RUN_ID =
+#                  <prefix><YYYYMMDD>) and, correspondingly, the per-date
+#                  results directory checked for the skip-if-exists guard.
+#                  Default: "obench_" when --model is left at its default
+#                  (preserves today's existing run-ids exactly), otherwise
+#                  "obench_<model>_".
+#   --eval-config  frozen run config passed as --config to inference. Default:
+#                  config/config_forecasting_glorys_obench.yml. Use this for a
+#                  model that needs a different frozen config (e.g. a
+#                  different channel set) instead of repointing the default.
 #
 # NOTE: --dates is passed through to `date -d` and eval'd as part of the
 # inference command with no sanitization. This is an internal operator
@@ -40,6 +56,41 @@
 #
 # Without --dry-run, this script submits exactly ONE sbatch job (itself) that
 # then loops over all requested dates sequentially on one GPU.
+#
+# ---------------------------------------------------------------------------
+# RUNBOOK: evaluating a NEW model checkpoint end to end
+# ---------------------------------------------------------------------------
+# 0. Prerequisites -- channel set must match the checkpoint. Verify with the
+#    verify_task1.py pattern (.superpowers/sdd/wondrous-coalescing-taco/
+#    verify_task1.py): instantiate DataReaderMesh on the intended
+#    config/streams/<eval-dir>/ and diff source_channels/target_channels
+#    against the checkpoint's model_<run_id>_latest.json "streams" block.
+#    - A model trained on the current 41-channel glorys config matches
+#      config/streams/glorys_eval (what glorys_cont3_c1 uses today).
+#    - A model trained on the v2 133-channel config
+#      (config/streams/glorys_v2/glorys.yml) needs config/streams/glorys_v2_eval
+#      -- but that eval stream currently points at a v3 IC parquet
+#      (glo_nowcast_025_v3_fixed.parq) that has NOT been built yet (see the
+#      loud warning in config/streams/glorys_v2_eval/glorys.yml). That
+#      parquet must be built (Task 1c pipeline: add ice channels + full
+#      <=541.089m depth axis) before glorys_v2_eval can be used for real.
+# 1. Driver: ./run_oceanbench_inference.sh --model <run_id> \
+#      [--run-prefix <prefix>] [--eval-config <path>] [--dates "..."]
+#    Dry-run first (--dry-run) to sanity-check RUN_ID/MON/END/CMD.
+# 2. Export: python export_glorys_nc.py --run-prefix <same prefix as above> \
+#      --output <a NEW zarr path, e.g. .../eval_output/wg_<run_id>_challenger.zarr>
+#    (--output is required whenever --run-prefix is non-default; see that
+#    script's own docstring/CLI help.)
+# 3. Point the challenger at the new store, then run OceanBench in-kernel:
+#      export WG_CHALLENGER_STORE=<the --output path from step 2>
+#      (challenger.py / challenger_smoke.py read this env var, falling back
+#      to the historical glorys_cont3_c1 store if it is unset)
+# 4. sbatch run_oceanbench_eval.sh <challenger.py-or-challenger_smoke.py> [STAGE_DIR]
+#    Run from /e/scratch/hclimrep/nowak2/eval_output (that is where
+#    run_oceanbench_eval.sh and the challenger*.py files that OceanBench
+#    executes in-kernel live). Compute nodes are offline (no egress), so pass
+#    the pre-populated stage dir /e/scratch/hclimrep/nowak2/oceanbench_stage
+#    as STAGE_DIR to run in offline mode.
 
 # Note: deliberately no `-u` (nounset). weathergen_slurm_local.sh's env setup
 # (.bashrc, lmod init) is not nounset-safe, and this script already guards
@@ -51,11 +102,17 @@ RESULTS_DIR="/e/scratch/weatherai/shared_work/results"
 PRIVATE_REPO_PATH="/e/scratch/hclimrep/nowak2/WeatherGenerator-private"
 
 usage() {
-    echo "Usage: $0 [--dates \"YYYY-MM-DD ...\"] [--dry-run]" >&2
+    echo "Usage: $0 [--dates \"YYYY-MM-DD ...\"] [--dry-run] [--model <run_id>]" >&2
+    echo "          [--run-prefix <prefix>] [--eval-config <path>]" >&2
 }
 
 DRY_RUN=0
 DATES_ARG=""
+MODEL="glorys_cont3_c1"
+MODEL_SET=0
+RUN_PREFIX=""
+RUN_PREFIX_SET=0
+EVAL_CONFIG="config/config_forecasting_glorys_obench.yml"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -71,6 +128,32 @@ while [[ $# -gt 0 ]]; do
             DATES_ARG="$2"
             shift 2
             ;;
+        --model)
+            if [[ $# -lt 2 ]]; then
+                echo "--model requires an argument" >&2
+                exit 1
+            fi
+            MODEL="$2"
+            MODEL_SET=1
+            shift 2
+            ;;
+        --run-prefix)
+            if [[ $# -lt 2 ]]; then
+                echo "--run-prefix requires an argument" >&2
+                exit 1
+            fi
+            RUN_PREFIX="$2"
+            RUN_PREFIX_SET=1
+            shift 2
+            ;;
+        --eval-config)
+            if [[ $# -lt 2 ]]; then
+                echo "--eval-config requires an argument" >&2
+                exit 1
+            fi
+            EVAL_CONFIG="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -82,6 +165,18 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Resolve the default run-prefix now that --model/--run-prefix have been
+# parsed: preserves today's existing run-ids exactly ("obench_<YYYYMMDD>")
+# when --model is left at its default, and disambiguates per-model runs
+# ("obench_<model>_<YYYYMMDD>") when --model is given explicitly.
+if [[ "$RUN_PREFIX_SET" -eq 0 ]]; then
+    if [[ "$MODEL_SET" -eq 1 ]]; then
+        RUN_PREFIX="obench_${MODEL}_"
+    else
+        RUN_PREFIX="obench_"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Build the list of forecast-start Wednesdays.
@@ -104,12 +199,12 @@ build_command() {
     local W="$1"
     MON=$(date -u -d "${W} -2 days" +%Y-%m-%d)
     END=$(date -u -d "${MON} +15 days" +%Y-%m-%d)
-    RUN_ID="obench_${W//-/}"
+    RUN_ID="${RUN_PREFIX}${W//-/}"
     # NOTE: built as a single-line string rather than via a `\`-continued
     # heredoc: `$(cat <<EOF ... \<newline> ... EOF)` silently swallows
     # backslash-newline pairs (verified empirically), corrupting the
     # captured command. A single line is semantically identical and safe.
-    CMD="python -u src/weathergen/run_train.py inference --from-run-id glorys_cont3_c1 --run-id ${RUN_ID} --mini-epoch -1 --config config/config_forecasting_glorys_obench.yml --options streams_directory=./config/streams/glorys_eval/ test_config.start_date=${MON}T00:00 test_config.end_date=${END}T00:00 test_config.samples_per_mini_epoch=1 test_config.output.num_samples=1 test_config.forecast.num_steps=10 \"test_config.output.streams=[GLORYS]\""
+    CMD="python -u src/weathergen/run_train.py inference --from-run-id ${MODEL} --run-id ${RUN_ID} --mini-epoch -1 --config ${EVAL_CONFIG} --options streams_directory=./config/streams/glorys_eval/ test_config.start_date=${MON}T00:00 test_config.end_date=${END}T00:00 test_config.samples_per_mini_epoch=1 test_config.output.num_samples=1 test_config.forecast.num_steps=10 \"test_config.output.streams=[GLORYS]\""
 }
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -135,11 +230,20 @@ fi
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     mkdir -p "${REPO_DIR}/logs/oceanbench"
     echo "Submitting sbatch job for ${#WEDNESDAYS[@]} date(s)..."
+    SBATCH_ARGS=()
     if [[ -n "$DATES_ARG" ]]; then
-        sbatch "${REPO_DIR}/run_oceanbench_inference.sh" --dates "$DATES_ARG"
-    else
-        sbatch "${REPO_DIR}/run_oceanbench_inference.sh"
+        SBATCH_ARGS+=(--dates "$DATES_ARG")
     fi
+    if [[ "$MODEL_SET" -eq 1 ]]; then
+        SBATCH_ARGS+=(--model "$MODEL")
+    fi
+    if [[ "$RUN_PREFIX_SET" -eq 1 ]]; then
+        SBATCH_ARGS+=(--run-prefix "$RUN_PREFIX")
+    fi
+    if [[ "$EVAL_CONFIG" != "config/config_forecasting_glorys_obench.yml" ]]; then
+        SBATCH_ARGS+=(--eval-config "$EVAL_CONFIG")
+    fi
+    sbatch "${REPO_DIR}/run_oceanbench_inference.sh" "${SBATCH_ARGS[@]}"
     exit $?
 fi
 

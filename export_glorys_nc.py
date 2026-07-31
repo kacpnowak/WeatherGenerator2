@@ -625,6 +625,7 @@ def run_export(
     output: pathlib.Path,
     sample: str,
     n_lead: int,
+    run_prefix: str = RUN_DIR_PREFIX,
 ) -> int:
     to_write, skipped = plan_export(dates, existing_first_days(output).tolist())
 
@@ -633,7 +634,7 @@ def run_export(
 
     n_written = 0
     for day in to_write:
-        zip_path = source_dir / f"{RUN_DIR_PREFIX}{day:%Y%m%d}" / ZIP_NAME
+        zip_path = source_dir / f"{run_prefix}{day:%Y%m%d}" / ZIP_NAME
         if not zip_path.exists():
             print(f"[miss] {day}: {zip_path} not found -- skipping")
             continue
@@ -994,8 +995,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=DEFAULT_OUTPUT,
-        help="output challenger zarr store",
+        default=None,
+        help=(
+            "output challenger zarr store. Defaults to "
+            f"{DEFAULT_OUTPUT} when --run-prefix is left at its default "
+            f"({RUN_DIR_PREFIX!r}); required (no default) otherwise, so a "
+            "different model's export never silently overwrites the default "
+            "checkpoint's store."
+        ),
+    )
+    parser.add_argument(
+        "--run-prefix",
+        default=RUN_DIR_PREFIX,
+        help=(
+            "prefix of the per-date run directories under --source-dir "
+            f"(<run-prefix><YYYYMMDD>). Default: {RUN_DIR_PREFIX!r}."
+        ),
     )
     parser.add_argument(
         "--dates",
@@ -1026,8 +1041,25 @@ def main(argv: list[str] | None = None) -> int:
         legacy_probe(args.legacy_probe, sample=args.sample, fstep=args.probe_fstep)
         return 0
 
+    output = args.output
+    if output is None:
+        if args.run_prefix == RUN_DIR_PREFIX:
+            output = DEFAULT_OUTPUT
+        else:
+            parser.error(
+                f"--run-prefix {args.run_prefix!r} differs from the default "
+                f"{RUN_DIR_PREFIX!r}, so --output must be given explicitly "
+                f"(refusing to guess a store path for a non-default model and "
+                f"silently write into {DEFAULT_OUTPUT})"
+            )
+
     run_export(
-        parse_dates(args.dates), args.source_dir, args.output, args.sample, args.n_lead
+        parse_dates(args.dates),
+        args.source_dir,
+        output,
+        args.sample,
+        args.n_lead,
+        run_prefix=args.run_prefix,
     )
     return 0
 
