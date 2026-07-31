@@ -52,7 +52,11 @@
 # NOTE: --dates is passed through to `date -d` and eval'd as part of the
 # inference command with no sanitization. This is an internal operator
 # launcher, not a user-facing service, so untrusted input is out of scope;
-# only pass trusted YYYY-MM-DD values.
+# only pass trusted YYYY-MM-DD values. --model/--run-prefix/--eval-config are
+# spliced into that same eval'd command too; unlike --dates they are quoted
+# with `printf %q` before being embedded (see build_command), so a value with
+# spaces or shell-special characters is preserved as one argument rather than
+# corrupting the eval'd command -- but still only pass trusted values.
 #
 # Without --dry-run, this script submits exactly ONE sbatch job (itself) that
 # then loops over all requested dates sequentially on one GPU.
@@ -85,12 +89,19 @@
 #      export WG_CHALLENGER_STORE=<the --output path from step 2>
 #      (challenger.py / challenger_smoke.py read this env var, falling back
 #      to the historical glorys_cont3_c1 store if it is unset)
-# 4. sbatch run_oceanbench_eval.sh <challenger.py-or-challenger_smoke.py> [STAGE_DIR]
-#    Run from /e/scratch/hclimrep/nowak2/eval_output (that is where
-#    run_oceanbench_eval.sh and the challenger*.py files that OceanBench
-#    executes in-kernel live). Compute nodes are offline (no egress), so pass
-#    the pre-populated stage dir /e/scratch/hclimrep/nowak2/oceanbench_stage
-#    as STAGE_DIR to run in offline mode.
+# 4. sbatch run_oceanbench_eval.sh <challenger.py> [STAGE_DIR]
+#    run_oceanbench_eval.sh itself lives in and is submitted from
+#    /e/scratch/hclimrep/nowak2/eval_output, but challenger.py /
+#    challenger_smoke.py live at THIS repo's root, not in eval_output.
+#    run_oceanbench_eval.sh cd's into eval_output before invoking `oceanbench
+#    evaluate`, so the challenger argument must be an absolute path -- a bare
+#    "challenger.py" would resolve against eval_output post-cd and fail right
+#    after the egress probe. Compute nodes are offline (no egress), so pass
+#    the pre-populated stage dir as STAGE_DIR to run in offline mode. Exact
+#    invocation (matches every historical successful job log):
+#      cd /e/scratch/hclimrep/nowak2/eval_output && sbatch run_oceanbench_eval.sh \
+#        /e/scratch/hclimrep/nowak2/WeatherGenerator2/challenger.py \
+#        /e/scratch/hclimrep/nowak2/oceanbench_stage
 
 # Note: deliberately no `-u` (nounset). weathergen_slurm_local.sh's env setup
 # (.bashrc, lmod init) is not nounset-safe, and this script already guards
@@ -113,6 +124,7 @@ MODEL_SET=0
 RUN_PREFIX=""
 RUN_PREFIX_SET=0
 EVAL_CONFIG="config/config_forecasting_glorys_obench.yml"
+EVAL_CONFIG_SET=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -152,6 +164,7 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             EVAL_CONFIG="$2"
+            EVAL_CONFIG_SET=1
             shift 2
             ;;
         -h|--help)
@@ -200,11 +213,24 @@ build_command() {
     MON=$(date -u -d "${W} -2 days" +%Y-%m-%d)
     END=$(date -u -d "${MON} +15 days" +%Y-%m-%d)
     RUN_ID="${RUN_PREFIX}${W//-/}"
+    # MODEL/RUN_ID/EVAL_CONFIG can carry user-supplied content (--model,
+    # --run-prefix, --eval-config), unlike the rest of this command whose
+    # variable pieces are either digits-only (${W//-/}) or literals. Quote
+    # them with `printf %q` before splicing into CMD, which is later eval'd:
+    # %q only adds quoting/escaping when the value actually needs it, so the
+    # default (safe) values expand to the exact same bare text as before --
+    # the dry-run output for default arguments is unchanged -- while a value
+    # containing spaces or shell-special characters survives eval as a
+    # single argument instead of silently corrupting the command.
+    local model_q run_id_q eval_config_q
+    printf -v model_q '%q' "${MODEL}"
+    printf -v run_id_q '%q' "${RUN_ID}"
+    printf -v eval_config_q '%q' "${EVAL_CONFIG}"
     # NOTE: built as a single-line string rather than via a `\`-continued
     # heredoc: `$(cat <<EOF ... \<newline> ... EOF)` silently swallows
     # backslash-newline pairs (verified empirically), corrupting the
     # captured command. A single line is semantically identical and safe.
-    CMD="python -u src/weathergen/run_train.py inference --from-run-id ${MODEL} --run-id ${RUN_ID} --mini-epoch -1 --config ${EVAL_CONFIG} --options streams_directory=./config/streams/glorys_eval/ test_config.start_date=${MON}T00:00 test_config.end_date=${END}T00:00 test_config.samples_per_mini_epoch=1 test_config.output.num_samples=1 test_config.forecast.num_steps=10 \"test_config.output.streams=[GLORYS]\""
+    CMD="python -u src/weathergen/run_train.py inference --from-run-id ${model_q} --run-id ${run_id_q} --mini-epoch -1 --config ${eval_config_q} --options streams_directory=./config/streams/glorys_eval/ test_config.start_date=${MON}T00:00 test_config.end_date=${END}T00:00 test_config.samples_per_mini_epoch=1 test_config.output.num_samples=1 test_config.forecast.num_steps=10 \"test_config.output.streams=[GLORYS]\""
 }
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -240,7 +266,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     if [[ "$RUN_PREFIX_SET" -eq 1 ]]; then
         SBATCH_ARGS+=(--run-prefix "$RUN_PREFIX")
     fi
-    if [[ "$EVAL_CONFIG" != "config/config_forecasting_glorys_obench.yml" ]]; then
+    if [[ "$EVAL_CONFIG_SET" -eq 1 ]]; then
         SBATCH_ARGS+=(--eval-config "$EVAL_CONFIG")
     fi
     sbatch "${REPO_DIR}/run_oceanbench_inference.sh" "${SBATCH_ARGS[@]}"
