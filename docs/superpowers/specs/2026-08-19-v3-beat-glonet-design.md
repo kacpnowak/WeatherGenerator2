@@ -119,11 +119,19 @@ specialization).
 
 ### Phase 2 — evaluate and publish
 
-Selection smokes on 2023-H2 → pick checkpoint → (optionally) ft0808-style
-frozen-core radiation finetune if the ATMO branch needs re-equilibration → full
-52-date eval → export → offline 0.4.0 eval → `build_scoreboard_data.py` →
-republish scoreboard artifact. Row-by-row comparison vs GLONET closes the loop
-against the success criteria.
+Selection smokes on 2023-H2 → pick checkpoint → **aggregation-engine finetune**:
+a short frozen-core finetune with
+
+    freeze_modules: ".*global.*|.*local.*|.*adapter.*|.*q_cells.*|.*forecast_engine.*|.*latent.*|.*GLORYS.*"
+
+i.e. the ATMO embedding and the aggregation engine stay trainable (Kacper:
+aggregation-engine finetuning has proven to help substantially on other models
+in this family). Same guardrails as everything else: LR-decayed, selected by
+2023-H2 smoke skill with the bias-drift watch — the ft0818 lesson (long grinds
+at flat LR reverse their gains) applies doubly here.
+Then: full 52-date eval → export → offline 0.4.0 eval →
+`build_scoreboard_data.py` → republish scoreboard artifact. Row-by-row
+comparison vs GLONET closes the loop against the success criteria.
 
 ## Error handling / operational rules
 
