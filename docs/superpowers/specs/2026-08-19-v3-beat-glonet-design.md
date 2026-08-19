@@ -122,11 +122,12 @@ specialization).
 Selection smokes on 2023-H2 → pick checkpoint → **aggregation-engine finetune**:
 a short frozen-core finetune with
 
-    freeze_modules: ".*global.*|.*local.*|.*adapter.*|.*q_cells.*|.*forecast_engine.*|.*latent.*|.*GLORYS.*"
+    freeze_modules: ".*global.*|.*local.*|.*adapter.*|.*q_cells.*|.*forecast_engine.*|.*latent.*|.*GLORYS.*|.*ATMO.*"
 
-i.e. the ATMO embedding and the aggregation engine stay trainable (Kacper:
-aggregation-engine finetuning has proven to help substantially on other models
-in this family). Same guardrails as everything else: LR-decayed, selected by
+i.e. ONLY the aggregation engine stays trainable — the ATMO embedding is frozen
+as well (Kacper 2026-08-19: leaving ATMO trainable in earlier finetunes was a
+mistake; aggregation-engine-only finetuning has proven to help substantially on
+other models in this family). Same guardrails as everything else: LR-decayed, selected by
 2023-H2 smoke skill with the bias-drift watch — the ft0818 lesson (long grinds
 at flat LR reverse their gains) applies doubly here.
 Then: full 52-date eval → export → offline 0.4.0 eval →
