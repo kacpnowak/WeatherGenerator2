@@ -69,7 +69,22 @@ Usage
     python export_glorys_nc.py                      # all 52 Wednesdays of 2024
     python export_glorys_nc.py --dates 20240103,20240110
     python export_glorys_nc.py --self-test          # offline unit-style checks
+    python export_glorys_nc.py --self-test --output <zarr> --dates ...
+                                                     # live smoke: real export
+                                                     # of the given date(s) plus
+                                                     # an explicit integrity check
     python export_glorys_nc.py --legacy-probe <zip> # dev smoke on an old store
+
+v2/v3 zips
+----------
+Newer inference zips may use a different stream group name (``--stream-group``,
+default ``GLORYS``) and/or a different, possibly-larger set of depth levels
+(``--levels``, comma-separated labels exactly as they appear in the store's
+``channels`` attribute, default the v1 10-level set).  A depth level requested
+via ``--levels`` that a given (var, level) channel does not have -- e.g. a
+future v3 model that only carries ``uo``/``vo`` at the surface and 15.8101 m --
+is NaN-filled for that plane rather than treated as an error; only the surface
+(0.494025 m) channel is required to exist for every variable.
 """
 
 from __future__ import annotations
@@ -121,6 +136,10 @@ DEPTHS = np.array([float(label) for label in DEPTH_LABELS], dtype=np.float64)
 DEPTH_VARS = ("thetao", "so", "uo", "vo")
 SURFACE_VARS = ("zos",)
 
+# every depth variable must carry this level; models may omit any other
+# requested level (that plane is NaN-filled), independent of --levels
+SURFACE_DEPTH_LABEL = "0.494025"
+
 VAR_ATTRS = {
     "zos": {"standard_name": "sea_surface_height_above_geoid", "units": "m"},
     "thetao": {"standard_name": "sea_water_potential_temperature", "units": "degrees_C"},
@@ -161,22 +180,35 @@ def expected_channel_names() -> list[str]:
     return names
 
 
-def channel_index_map(channels: list[str]) -> dict[str, int]:
+def build_channel_index(channels: list[str]) -> dict[str, int]:
     """Map channel name -> column index in the stored data array.
 
     The stored order is whatever the run wrote; it is *always* taken from the
     store's ``channels`` attribute and never assumed.
+
+    Unlike the fixed 41-channel v1 layout, a caller-requested depth level
+    (from ``--levels``) need not exist for every variable --
+    e.g. a future v3 model that only carries ``uo``/``vo`` at the surface and
+    15.8101 m. Missing (var, level) channels are not an error here; the
+    caller NaN-fills that plane instead (see ``build_forecast_dataset``).
+    This function only rejects structurally broken input: duplicate channel
+    names, a missing ``zos``, or a missing surface-level channel for one of
+    the depth variables (which would otherwise silently NaN-fill that
+    variable across every requested level without any signal).
     """
-    expected = expected_channel_names()
-    if len(channels) != len(expected):
-        msg = f"expected {len(expected)} channels, store declares {len(channels)}"
-        raise ValueError(msg)
     index = {name: i for i, name in enumerate(channels)}
     if len(index) != len(channels):
         raise ValueError("duplicate channel names in store attribute")
-    missing = [name for name in expected if name not in index]
-    if missing:
-        msg = f"channels missing from store: {missing}"
+    if "zos" not in index:
+        raise ValueError("channels missing from store: ['zos']")
+    missing_surface = [
+        var for var in DEPTH_VARS if f"{var}_{SURFACE_DEPTH_LABEL}m" not in index
+    ]
+    if missing_surface:
+        msg = (
+            f"surface level ({SURFACE_DEPTH_LABEL}m) channel missing from store "
+            f"for variable(s): {missing_surface}"
+        )
         raise ValueError(msg)
     return index
 
@@ -262,7 +294,10 @@ def interp_latitude(native_grid: np.ndarray) -> np.ndarray:
 
 
 def build_forecast_dataset(
-    target_grids: np.ndarray, channels: list[str], first_day: np.datetime64
+    target_grids: np.ndarray,
+    channels: list[str],
+    first_day: np.datetime64,
+    level_labels: tuple[str, ...] = DEPTH_LABELS,
 ) -> xr.Dataset:
     """Assemble one forecast into an OceanBench-shaped dataset.
 
@@ -271,6 +306,10 @@ def build_forecast_dataset(
             OceanBench reference grid; axis 0 is lead_day_index 0..n_lead-1.
         channels: channel names in the order of axis 1 (from the store attr).
         first_day: forecast start day (the Wednesday).
+        level_labels: depth level labels (exact channel-name tokens, e.g.
+            ``"0.494025"``), in the order the ``depth`` axis will take. A
+            channel ``f"{var}_{label}m"`` absent from ``channels`` is
+            NaN-filled for that (var, level) plane rather than raising.
     """
     target_grids = np.asarray(target_grids)
     n_lead = target_grids.shape[0]
@@ -278,7 +317,8 @@ def build_forecast_dataset(
         msg = f"unexpected grid shape {target_grids.shape}"
         raise ValueError(msg)
 
-    index = channel_index_map(channels)
+    index = build_channel_index(channels)
+    depths = np.array([float(label) for label in level_labels], dtype=np.float64)
     lead = np.arange(n_lead, dtype=np.int32)
     fdd = np.array([first_day], dtype="datetime64[ns]")
 
@@ -293,9 +333,19 @@ def build_forecast_dataset(
         )
 
     for var in DEPTH_VARS:
-        cols = [index[f"{var}_{label}m"] for label in DEPTH_LABELS]
+        planes = []
+        for label in level_labels:
+            col = index.get(f"{var}_{label}m")
+            if col is None:
+                planes.append(
+                    np.full(
+                        (n_lead, TARGET_LAT.size, TARGET_LON.size), _FILL, dtype=np.float32
+                    )
+                )
+            else:
+                planes.append(target_grids[:, col, :, :])
         # (n_lead, depth, lat, lon) -> add leading first_day_datetime
-        arr = target_grids[:, cols, :, :][np.newaxis, ...]
+        arr = np.stack(planes, axis=1)[np.newaxis, ...]
         data_vars[var] = xr.DataArray(
             arr,
             dims=(
@@ -313,7 +363,7 @@ def build_forecast_dataset(
         coords={
             "first_day_datetime": fdd,
             "lead_day_index": lead,
-            "depth": DEPTHS,
+            "depth": depths,
             "latitude": TARGET_LAT,
             "longitude": TARGET_LON,
         },
@@ -331,7 +381,7 @@ def build_forecast_dataset(
             "title": "WeatherGenerator GLORYS forecast (OceanBench challenger)",
             "source": "WeatherGenerator inference, stream GLORYS",
             "oceanbench_reference_target_depths_m": [
-                round(float(d), 3) for d in DEPTHS
+                round(float(d), 3) for d in depths
             ],
             "oceanbench_reference_depth_grid_rounding_decimals": 3,
         }
@@ -372,9 +422,9 @@ def _open_store(zip_path: pathlib.Path) -> tuple[zarr.Group, zarr.storage.ZipSto
     return zarr.open_group(store=store, mode="r"), store
 
 
-def read_prediction(root: zarr.Group, sample: str, fstep: int) -> dict:
+def read_prediction(root: zarr.Group, sample: str, fstep: int, stream: str = STREAM) -> dict:
     """Read one prediction group; returns values, lat, lon, channels, source_interval."""
-    path = f"{sample}/{STREAM}/{fstep}/prediction"
+    path = f"{sample}/{stream}/{fstep}/prediction"
     try:
         group = root[path]
     except KeyError as exc:
@@ -433,6 +483,8 @@ def export_one_date(
     expected_day: dt.date | None,
     sample: str = "0",
     n_lead: int = N_LEAD_DAYS,
+    stream: str = STREAM,
+    level_labels: tuple[str, ...] = DEPTH_LABELS,
 ) -> xr.Dataset:
     """Read one inference zip and return the challenger dataset for that forecast."""
     root, store = _open_store(zip_path)
@@ -442,12 +494,12 @@ def export_one_date(
         first_day: np.datetime64 | None = None
 
         for fstep in range(1, n_lead + 1):
-            rec = read_prediction(root, sample, fstep)
+            rec = read_prediction(root, sample, fstep, stream=stream)
             if grids is None:
                 channels = rec["channels"]
                 # validate up front: a mislabelled store must fail in seconds,
                 # not after reading and regridding all ten forecast steps
-                channel_index_map(channels)
+                build_channel_index(channels)
                 grids = np.full(
                     (n_lead, len(channels), TARGET_LAT.size, TARGET_LON.size),
                     _FILL,
@@ -478,7 +530,7 @@ def export_one_date(
             )
             raise ValueError(msg)
 
-        return build_forecast_dataset(grids, channels, first_day)
+        return build_forecast_dataset(grids, channels, first_day, level_labels=level_labels)
     finally:
         store.close()
 
@@ -626,6 +678,8 @@ def run_export(
     sample: str,
     n_lead: int,
     run_prefix: str = RUN_DIR_PREFIX,
+    stream: str = STREAM,
+    level_labels: tuple[str, ...] = DEPTH_LABELS,
 ) -> int:
     to_write, skipped = plan_export(dates, existing_first_days(output).tolist())
 
@@ -640,7 +694,14 @@ def run_export(
             continue
 
         print(f"[read] {day}: {zip_path}")
-        ds = export_one_date(zip_path, expected_day=day, sample=sample, n_lead=n_lead)
+        ds = export_one_date(
+            zip_path,
+            expected_day=day,
+            sample=sample,
+            n_lead=n_lead,
+            stream=stream,
+            level_labels=level_labels,
+        )
         print(f"[stat] {day}: {summarize(ds)}")
         append_forecast(ds, output)
         ds.close()
@@ -980,8 +1041,29 @@ def parse_dates(spec: str | None) -> list[dt.date]:
         return wednesdays_2024()
     out = []
     for token in spec.replace(",", " ").split():
-        out.append(dt.datetime.strptime(token.strip(), "%Y%m%d").date())
+        token = token.strip()
+        try:
+            out.append(dt.datetime.strptime(token, "%Y%m%d").date())
+        except ValueError:
+            out.append(dt.datetime.strptime(token, "%Y-%m-%d").date())
     return out
+
+
+def parse_levels(spec: str) -> list[str]:
+    """Parse ``--levels`` into the ordered list of depth labels.
+
+    Labels are kept as the exact strings the caller provided -- they are used
+    verbatim to compose channel names like ``f"{var}_{label}m"`` -- so e.g.
+    ``"0.494025"`` is never reformatted to ``"0.49402499999..."``. Each token
+    is validated to parse as a float so a typo in ``--levels`` fails fast at
+    CLI-parse time rather than silently NaN-filling every plane.
+    """
+    labels = [tok.strip() for tok in spec.replace(",", " ").split() if tok.strip()]
+    if not labels:
+        raise ValueError("--levels must contain at least one depth level")
+    for label in labels:
+        float(label)  # validate only; the string itself is what is kept
+    return labels
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1015,13 +1097,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dates",
         default="all",
-        help="comma-separated YYYYMMDD dates, or 'all' for the 52 Wednesdays of 2024",
+        help=(
+            "comma-separated YYYYMMDD (or YYYY-MM-DD) dates, or 'all' for the "
+            "52 Wednesdays of 2024"
+        ),
     )
     parser.add_argument("--sample", default="0", help="sample index inside the store")
     parser.add_argument(
         "--n-lead", type=int, default=N_LEAD_DAYS, help="number of forecast days to export"
     )
-    parser.add_argument("--self-test", action="store_true", help="run offline structural checks")
+    parser.add_argument(
+        "--stream-group",
+        default=STREAM,
+        help=f"zarr group name for the ocean stream inside the inference zip (default: {STREAM!r})",
+    )
+    parser.add_argument(
+        "--levels",
+        default=",".join(DEPTH_LABELS),
+        help=(
+            "comma-separated depth level labels, exact tokens as they appear "
+            "in the store's channel names (e.g. 'thetao_<label>m'). A level "
+            "absent from a given variable's channels is NaN-filled for that "
+            f"(var, level) plane rather than raising. Default (v1 10-level "
+            f"set): {','.join(DEPTH_LABELS)}"
+        ),
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help=(
+            "run offline structural checks; if --output is also given, "
+            "instead runs a live export of --dates through --output using "
+            "--stream-group/--levels and then re-verifies store integrity"
+        ),
+    )
     parser.add_argument(
         "--legacy-probe",
         type=pathlib.Path,
@@ -1033,13 +1142,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.self_test:
+    if args.self_test and args.output is None:
+        # no --output given: run the original offline synthetic checks only
         self_test()
         return 0
 
     if args.legacy_probe is not None:
         legacy_probe(args.legacy_probe, sample=args.sample, fstep=args.probe_fstep)
         return 0
+
+    level_labels = parse_levels(args.levels)
 
     output = args.output
     if output is None:
@@ -1060,7 +1172,17 @@ def main(argv: list[str] | None = None) -> int:
         args.sample,
         args.n_lead,
         run_prefix=args.run_prefix,
+        stream=args.stream_group,
+        level_labels=level_labels,
     )
+
+    if args.self_test:
+        # --self-test + --output: a live smoke test against real zips rather
+        # than the offline synthetic checks above; re-verify explicitly so a
+        # failure here is attributed to the store, not just "run_export exited 0"
+        check_store_integrity(output)
+        print(f"[self-test] live export to {output} passed integrity checks")
+
     return 0
 
 
