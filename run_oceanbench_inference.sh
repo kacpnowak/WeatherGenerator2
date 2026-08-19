@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account=hclimrep
+#SBATCH --account=e-ext-2025e01-128
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
@@ -30,7 +30,7 @@
 # Usage:
 #   ./run_oceanbench_inference.sh [--dates "YYYY-MM-DD ..."] [--dry-run]
 #                                 [--model <run_id>] [--run-prefix <prefix>]
-#                                 [--eval-config <path>]
+#                                 [--eval-config <path>] [--output-stream <name>]
 #
 #   --dates        space-separated list of Wednesday dates to process,
 #                  overriding the default of all 52 Wednesdays of 2024.
@@ -48,6 +48,18 @@
 #                  config/config_forecasting_glorys_obench.yml. Use this for a
 #                  model that needs a different frozen config (e.g. a
 #                  different channel set) instead of repointing the default.
+#                  The config file (or its own --options) must carry its own
+#                  streams_directory: this driver no longer sets one via
+#                  --options, since UNION merge semantics between the config
+#                  file and --options would silently pull in streams from both
+#                  when they name different streams directories (see
+#                  config/config_forecasting_glorys_obench_v2.yml header).
+#   --output-stream  name of the output stream passed as
+#                  test_config.output.streams=[<name>]. Default: GLORYS
+#                  (v1). Use GLORYS2/GLORYS3 for the v2/v3 stacks.
+#
+# sbatch account: e-ext-2025e01-128 (all OceanBench driver jobs use this
+# project account).
 #
 # NOTE: --dates is passed through to `date -d` and eval'd as part of the
 # inference command with no sanitization. This is an internal operator
@@ -114,7 +126,7 @@ PRIVATE_REPO_PATH="/e/scratch/hclimrep/nowak2/WeatherGenerator-private"
 
 usage() {
     echo "Usage: $0 [--dates \"YYYY-MM-DD ...\"] [--dry-run] [--model <run_id>]" >&2
-    echo "          [--run-prefix <prefix>] [--eval-config <path>]" >&2
+    echo "          [--run-prefix <prefix>] [--eval-config <path>] [--output-stream <name>]" >&2
 }
 
 DRY_RUN=0
@@ -125,6 +137,8 @@ RUN_PREFIX=""
 RUN_PREFIX_SET=0
 EVAL_CONFIG="config/config_forecasting_glorys_obench.yml"
 EVAL_CONFIG_SET=0
+OUTPUT_STREAM="GLORYS"
+OUTPUT_STREAM_SET=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -165,6 +179,15 @@ while [[ $# -gt 0 ]]; do
             fi
             EVAL_CONFIG="$2"
             EVAL_CONFIG_SET=1
+            shift 2
+            ;;
+        --output-stream)
+            if [[ $# -lt 2 ]]; then
+                echo "--output-stream requires an argument" >&2
+                exit 1
+            fi
+            OUTPUT_STREAM="$2"
+            OUTPUT_STREAM_SET=1
             shift 2
             ;;
         -h|--help)
@@ -213,24 +236,31 @@ build_command() {
     MON=$(date -u -d "${W} -2 days" +%Y-%m-%d)
     END=$(date -u -d "${MON} +15 days" +%Y-%m-%d)
     RUN_ID="${RUN_PREFIX}${W//-/}"
-    # MODEL/RUN_ID/EVAL_CONFIG can carry user-supplied content (--model,
-    # --run-prefix, --eval-config), unlike the rest of this command whose
-    # variable pieces are either digits-only (${W//-/}) or literals. Quote
-    # them with `printf %q` before splicing into CMD, which is later eval'd:
-    # %q only adds quoting/escaping when the value actually needs it, so the
-    # default (safe) values expand to the exact same bare text as before --
-    # the dry-run output for default arguments is unchanged -- while a value
-    # containing spaces or shell-special characters survives eval as a
-    # single argument instead of silently corrupting the command.
-    local model_q run_id_q eval_config_q
+    # MODEL/RUN_ID/EVAL_CONFIG/OUTPUT_STREAM can carry user-supplied content
+    # (--model, --run-prefix, --eval-config, --output-stream), unlike the
+    # rest of this command whose variable pieces are either digits-only
+    # (${W//-/}) or literals. Quote them with `printf %q` before splicing
+    # into CMD, which is later eval'd: %q only adds quoting/escaping when
+    # the value actually needs it, so the default (safe) values expand to
+    # the exact same bare text as before -- the dry-run output for default
+    # arguments is unchanged -- while a value containing spaces or
+    # shell-special characters survives eval as a single argument instead
+    # of silently corrupting the command.
+    local model_q run_id_q eval_config_q output_stream_q
     printf -v model_q '%q' "${MODEL}"
     printf -v run_id_q '%q' "${RUN_ID}"
     printf -v eval_config_q '%q' "${EVAL_CONFIG}"
+    printf -v output_stream_q '%q' "${OUTPUT_STREAM}"
     # NOTE: built as a single-line string rather than via a `\`-continued
     # heredoc: `$(cat <<EOF ... \<newline> ... EOF)` silently swallows
     # backslash-newline pairs (verified empirically), corrupting the
     # captured command. A single line is semantically identical and safe.
-    CMD="python -u src/weathergen/run_train.py inference --from-run-id ${model_q} --run-id ${run_id_q} --mini-epoch -1 --config ${eval_config_q} --options streams_directory=./config/streams/glorys_eval/ test_config.start_date=${MON}T00:00 test_config.end_date=${END}T00:00 test_config.samples_per_mini_epoch=1 test_config.output.num_samples=1 test_config.forecast.num_steps=10 \"test_config.output.streams=[GLORYS]\""
+    # No `--options streams_directory=...` term: config-source merge
+    # semantics UNION the stream sets when the config file and --options
+    # name different streams directories, so streams_directory must come
+    # from the eval config itself (or its own --options), never from here
+    # (see config/config_forecasting_glorys_obench_v2.yml header).
+    CMD="python -u src/weathergen/run_train.py inference --from-run-id ${model_q} --run-id ${run_id_q} --mini-epoch -1 --config ${eval_config_q} --options test_config.start_date=${MON}T00:00 test_config.end_date=${END}T00:00 test_config.samples_per_mini_epoch=1 test_config.output.num_samples=1 test_config.forecast.num_steps=10 \"test_config.output.streams=[${output_stream_q}]\""
 }
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -268,6 +298,9 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     fi
     if [[ "$EVAL_CONFIG_SET" -eq 1 ]]; then
         SBATCH_ARGS+=(--eval-config "$EVAL_CONFIG")
+    fi
+    if [[ "$OUTPUT_STREAM_SET" -eq 1 ]]; then
+        SBATCH_ARGS+=(--output-stream "$OUTPUT_STREAM")
     fi
     sbatch "${REPO_DIR}/run_oceanbench_inference.sh" "${SBATCH_ARGS[@]}"
     exit $?
