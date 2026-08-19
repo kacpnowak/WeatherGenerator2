@@ -1,0 +1,59 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+#
+# v3 GLORYS curriculum, phase A: fresh `train` run over the full 1993-2023-H1
+# record with a 4-step forecast. Phases B and C (config_glorys_v3_phaseB.yml,
+# config_glorys_v3_phaseC.yml) continue from this run via `train_continue
+# --from-run-id <v3 run> --reuse-run-id` so the epoch counter and LR schedule
+# carry over.
+streams_directory: "./config/streams/glorys_v3/"
+freeze_modules: ""
+
+train_logging:
+  terminal: 10
+  metrics: 20
+  checkpoint: 64
+
+data_loading :
+  num_workers: 8
+
+general:
+  istep: 0
+  run_id: ???
+
+training_config:
+  training_mode: ["masking"]
+  num_mini_epochs: 48
+  samples_per_mini_epoch: 4096
+  # 2023-H2 held out for checkpoint selection (spec); 2024 (benchmark year) never trained.
+  start_date: 1993-01-01T00:00
+  end_date: 2023-06-30T00:00
+  learning_rate_scheduling :
+    lr_start: 1e-6
+    lr_max: 5e-5
+    lr_final_decay: 1e-6
+    lr_final: 0.0
+    num_steps_warmup: 256
+    num_steps_cooldown: 512
+    policy_warmup: "cosine"
+    policy_decay: "cosine"     # NOT constant - the constant-LR drift mode is the #1 diagnosed failure
+    policy_cooldown: "linear"
+    parallel_scaling_policy: "sqrt"
+  forecast :
+      time_step: 24:00:00
+      offset: 1
+      num_steps: 4
+      policy: "fixed"
+      pushforward: False
+
+validation_config:
+  samples_per_mini_epoch: 64
+  # inside ATMO coverage, disjoint from training, benchmark year untouched
+  start_date: 2022-01-01T00:00
+  end_date: 2022-12-31T00:00
