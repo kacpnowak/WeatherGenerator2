@@ -94,6 +94,18 @@ training_config:
   training_mode: ["masking"]
   num_mini_epochs: 8
   samples_per_mini_epoch: 4096
+  # Carried from the v2 recipe (run-json lineage, in no config file — same trap
+  # as the architecture block): daily windows and the Samudra-2 dynamic loss.
+  time_window_step: 24:00:00
+  time_window_len: 24:00:00
+  losses:
+    physical:
+      type: LossPhysical
+      loss_fcts:
+        mse: {}
+        dynamic_loss:
+          window: 128
+          L: 20.0
   # 2023-H2 held out for checkpoint selection (spec); 2024 (benchmark year) never trained.
   start_date: 2010-01-01T00:00
   end_date: 2023-06-30T00:00
