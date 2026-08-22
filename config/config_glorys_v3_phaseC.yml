@@ -105,7 +105,7 @@ training_config:
         mse: {}
         dynamic_loss:
           window: 128
-          L: 20.0
+          L: 5.0   # 2026-08-21: lowered from 20 (Kacper) - cap weight spread 5:1 so high-error T channels keep gradient
   # 2023-H2 held out for checkpoint selection (spec); 2024 (benchmark year) never trained.
   start_date: 2010-01-01T00:00
   end_date: 2023-06-30T00:00
