@@ -88,7 +88,9 @@ data_loading :
   num_workers: 8
 
 general:
-  istep: 0
+  # istep deliberately NOT set (same trap as phase C: --resume-config is
+  # re-applied every link and a hard istep would reset the epoch counter).
+  # istep: 0
   run_id: ???
 
 training_config:
