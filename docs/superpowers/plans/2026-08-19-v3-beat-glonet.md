@@ -536,3 +536,8 @@ Record `<AGGFT_RUN_ID>`. Verify freeze blocks in the first log: `Freeze block ..
 - Spec coverage: phase 0 = Tasks 1-4; channel design = Task 5; schedule = Task 6; selection metric + drift gates = Tasks 7, 8, 10; aggregation finetune = Task 11; phase 2 = Task 12. Recency+rollout curriculum = Task 6/9. Account constraint = global + every sbatch shown.
 - The 2023-H2 selection subtlety (no nowcast ICs) is resolved concretely in Task 10 (training-stream ICs, parquet reference, relative comparison only).
 - Types/names consistent: `GLORYS3`, 33-target list defined once in Task 5 and referenced; smoke script signature defined in Task 7 and used in 8-11.
+
+> **2026-09-01 amendment (verified, commit dfce5f61):** every evaluation — smokes, Task 10 selection, Task 12 full
+> eval — uses the training ERA5 zarr for the ATMO stream (IC window only; the model consumes no forcing after the
+> IC window). The OceanBench IFS parquets are retired: the benchmark forcing product is daily by construction and
+> cost 20–45% RMSE. Task 10 may additionally use the official 2023 GLO12 nowcasts as ICs (dataset covers 2023–2025).
