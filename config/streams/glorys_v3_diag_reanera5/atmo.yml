@@ -1,9 +1,3 @@
-# EVAL ATMO = the training ERA5 zarr (6-hourly), NOT the OceanBench IFS parquet.
-# 2026-09-01 diagnostic (eval_output/compare_diag_e38e45.txt): the IFS parquet holds one
-# stamp per IC day (the benchmark package is daily by construction) vs 4 six-hourly
-# stamps in training, costing 20-45% RMSE and growing with training. The model consumes
-# no forcing after the IC window (sampler sources = input steps only; latent rollout),
-# so ERA5 here is past data at init time. Declare as "GLO12 / ERA5 (IC window only)".
 ATMO:
   # v2 mid-cycle ATMO swap (2026-08-03): msl/cp replaced by surface radiation.
   # SST diagnosis showed the v1-forcing models effectively ignore the atmosphere

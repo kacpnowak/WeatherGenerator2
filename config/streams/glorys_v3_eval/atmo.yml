@@ -1,51 +1,44 @@
-ATMO:   
-  type : mesh
+# EVAL ATMO = the training ERA5 zarr (6-hourly), NOT the OceanBench IFS parquet.
+# 2026-09-01 diagnostic (eval_output/compare_diag_e38e45.txt): the IFS parquet holds one
+# stamp per IC day (the benchmark package is daily by construction) vs 4 six-hourly
+# stamps in training, costing 20-45% RMSE and growing with training. The model consumes
+# no forcing after the IC window (sampler sources = input steps only; latent rollout),
+# so ERA5 here is past data at init time. Declare as "GLO12 / ERA5 (IC window only)".
+ATMO:
+  # v2 mid-cycle ATMO swap (2026-08-03): msl/cp replaced by surface radiation.
+  # SST diagnosis showed the v1-forcing models effectively ignore the atmosphere
+  # (no heat-budget information: msl data all-NaN at eval, cp weak/incomplete) and
+  # produce spurious surface variability (0.6 C/day vs true 0.18 C/day).
+  # ssrd/strd are the actual surface downward short/longwave fluxes; the OceanBench
+  # IFS forcings carry them natively as sosudosw/sosudolw (NEMO names), so the eval
+  # side needs no proxy. skt was considered instead but is NOT in the OceanBench
+  # forcings (would be a dead channel at eval, like msl was).
+  # Channel count stays 6 so this is a drop-in replacement for checkpoints of the
+  # in-flight v2 run (glorys_20260730_223127): the anemoi reader orders channels by
+  # the zarr's variable order, giving [10u, 10v, 2d, 2t, ssrd, strd] - positions 0-3
+  # identical to the old [10u, 10v, 2d, 2t, cp, msl], so only the two replaced slots
+  # must relearn their embedding.
+  type : anemoi
   stream_id : 2139
-  # v3 forcing store: the v2 8 channels plus ssrd/strd/tp (radiation + precip in
-  # the ERA5 6-hour accumulation convention). Built by glorys_ic_rebuild/
-  # build_ifs_v3.py + build_parquet_ifs_v3.py; see REPORT_v3_rebuild.md.
-  filenames : ['/e/data1/climateai/hclimrep/data/glorys_forcings/ifs_025_v3_fixed.parq']
-  loss_weight : 0.0
-  # Channel order of the finetuned v2 checkpoint after the mid-cycle ATMO swap
-  # (config/streams/glorys_v2/atmo.yml): positions 0-3 are unchanged from the
-  # trained [10u, 10v, 2d, 2t, cp, msl] embedding; ssrd/strd take the two
-  # replaced slots. The anemoi reader on the training side orders channels by
-  # the zarr's variable order, which is exactly this list.
-  channels_order : ['10u', '10v', '2d', '2t', 'ssrd', 'strd']
+  # 1979-2024 (6h) sibling of the previous 1979-2023 v8 zarr; adds ssrd/strd
+  # (also skt/tcw/tp if ever wanted). Same ERA5 family, N320 grid.
+  filenames : ['/e/data1/slmet/ml_training/aifs-ea-an-oper-0001-mars-n320-1979-2024-6h-v1-for-single-v2.zarr']
+  loss_weight : 1.0
   source :
-  - '10u'
-  - '10v'
-  - '2d'
-  - '2t'
+  - 2t
+  - 2d
+  - 10u
+  - 10v
   - ssrd
   - strd
-  # Normalize with the ERA5 statistics the checkpoint is being finetuned with
-  # (aifs-ea-an-oper-0001-mars-n320-1979-2024-6h-v1-for-single-v2.zarr, var =
-  # stdev**2), not the IFS parquet's own stats: the parquet stats are computed
-  # on the unweighted regular grid (pole-oversampled) and over ocean-masked
-  # points only. The parquet's stats are the fallback if this block is removed.
-  # Caveat: the OceanBench forcings are instantaneous fluxes scaled to the 6 h
-  # accumulation, so ssrd/strd match ERA5 in magnitude (ratio ~0.85 / ~0.99)
-  # but not in sub-daily phase.
-  stats_override :
-    '10u': {mean: -0.34252408773948584, var: 30.44314092798113}
-    '10v': {mean: 0.1752988209892864, var: 21.008952317143077}
-    '2d': {mean: 282.21433178854187, var: 232.9450330140389}
-    '2t': {mean: 287.2126086081677, var: 241.72125221184976}
-    ssrd: {mean: 4045999.767813382, var: 26609289200278.594}
-    strd: {mean: 7306508.502808288, var: 2671959891163.961}
-  # ATMO is forcing-only: the checkpoint has no ATMO pred head and was trained with
-  # train_target_channels == []. An empty `target` list is NOT enough - _select_channels
-  # treats a falsy `select` as "no filter" and would select all 8 parquet channels.
-  # The empty string is a substring of every channel name, so this excludes all of them.
-  target: []
-  target_exclude: ['']
+  target : [""]
+  target_exclude: ['msl', 'z']
   masking_rate : 0.6
   masking_rate_none : 0.05
   token_size : 64
   location_weight : cosine_latitude
   tokenize_spacetime : True
-  embed : 
+  embed :
     net : transformer
     num_tokens : 1
     num_heads : 8
