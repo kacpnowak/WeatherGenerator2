@@ -54,6 +54,9 @@
 #                  file and --options would silently pull in streams from both
 #                  when they name different streams directories (see
 #                  config/config_forecasting_glorys_obench_v2.yml header).
+#   --mini-epoch   checkpoint (mini-epoch) to evaluate, passed as --mini-epoch to
+#                  inference. Default: -1 (= <run>_latest.chkpt). Use an explicit
+#                  epoch for a run whose _latest moved past the chosen checkpoint.
 #   --output-stream  name of the output stream passed as
 #                  test_config.output.streams=[<name>]. Default: GLORYS
 #                  (v1). Use GLORYS2/GLORYS3 for the v2/v3 stacks.
@@ -139,6 +142,8 @@ EVAL_CONFIG="config/config_forecasting_glorys_obench.yml"
 EVAL_CONFIG_SET=0
 OUTPUT_STREAM="GLORYS"
 OUTPUT_STREAM_SET=0
+MINI_EPOCH="-1"
+MINI_EPOCH_SET=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -188,6 +193,19 @@ while [[ $# -gt 0 ]]; do
             fi
             OUTPUT_STREAM="$2"
             OUTPUT_STREAM_SET=1
+            shift 2
+            ;;
+        --mini-epoch)
+            if [[ $# -lt 2 ]]; then
+                echo "--mini-epoch requires an argument" >&2
+                exit 1
+            fi
+            if ! [[ "$2" =~ ^-?[0-9]+$ ]]; then
+                echo "--mini-epoch must be an integer (got '$2')" >&2
+                exit 1
+            fi
+            MINI_EPOCH="$2"
+            MINI_EPOCH_SET=1
             shift 2
             ;;
         -h|--help)
@@ -260,7 +278,7 @@ build_command() {
     # name different streams directories, so streams_directory must come
     # from the eval config itself (or its own --options), never from here
     # (see config/config_forecasting_glorys_obench_v2.yml header).
-    CMD="python -u src/weathergen/run_train.py inference --from-run-id ${model_q} --run-id ${run_id_q} --mini-epoch -1 --config ${eval_config_q} --options test_config.start_date=${MON}T00:00 test_config.end_date=${END}T00:00 test_config.samples_per_mini_epoch=1 test_config.output.num_samples=1 test_config.forecast.num_steps=10 \"test_config.output.streams=[${output_stream_q}]\""
+    CMD="python -u src/weathergen/run_train.py inference --from-run-id ${model_q} --run-id ${run_id_q} --mini-epoch ${MINI_EPOCH} --config ${eval_config_q} --options test_config.start_date=${MON}T00:00 test_config.end_date=${END}T00:00 test_config.samples_per_mini_epoch=1 test_config.output.num_samples=1 test_config.forecast.num_steps=10 \"test_config.output.streams=[${output_stream_q}]\""
 }
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -301,6 +319,9 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     fi
     if [[ "$OUTPUT_STREAM_SET" -eq 1 ]]; then
         SBATCH_ARGS+=(--output-stream "$OUTPUT_STREAM")
+    fi
+    if [[ "$MINI_EPOCH_SET" -eq 1 ]]; then
+        SBATCH_ARGS+=(--mini-epoch "$MINI_EPOCH")
     fi
     sbatch "${REPO_DIR}/run_oceanbench_inference.sh" "${SBATCH_ARGS[@]}"
     exit $?
