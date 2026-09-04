@@ -84,18 +84,18 @@ def test_rest_exactly_at_threshold_passes(tmp_path):
 
 
 def test_rest_just_past_threshold_fails(tmp_path):
-    # rest_ratio=1.0101 should fail (exceeds <=1.01 threshold)
-    p = _file(tmp_path, {"20240103": _rows_with_exact_rest(0.9, 1.0101, -0.20), "20240703": _rows_with_exact_rest(0.9, 1.0, -0.20)})
+    # rest_ratio=1.02 should fail (exceeds <=1.01 threshold)
+    p = _file(tmp_path, {"20240103": _rows_with_exact_rest(0.9, 1.02, -0.20), "20240703": _rows_with_exact_rest(0.9, 1.0, -0.20)})
     assert seaft_score.overall(seaft_score.score(p, "candA", "base")) is False
 
 
 def test_bias_exactly_at_threshold_passes(tmp_path):
-    # sst_bias_delta = -0.25 - (-0.20) = -0.05 exactly should pass (rule is >=-0.05)
-    p = _file(tmp_path, {"20240103": _rows(0.9, 1.0, -0.25), "20240703": _rows(0.9, 1.0, -0.25)})
+    # sst_bias_delta = -0.05 - 0.0 = -0.05 exactly (bit-identical to SST_BIAS_MIN_DELTA) should pass (rule is >=-0.05)
+    p = _file(tmp_path, {"20240103": _rows(0.9, 1.0, -0.05, sst_bias_base=0.0), "20240703": _rows(0.9, 1.0, -0.05, sst_bias_base=0.0)})
     assert seaft_score.overall(seaft_score.score(p, "candA", "base")) is True
 
 
 def test_bias_just_past_threshold_fails(tmp_path):
-    # sst_bias_delta = -0.2501 - (-0.20) = -0.0501 should fail (exceeds >=-0.05 threshold)
-    p = _file(tmp_path, {"20240103": _rows(0.9, 1.0, -0.2501), "20240703": _rows(0.9, 1.0, -0.20)})
+    # sst_bias_delta = -0.0501 - 0.0 = -0.0501 should fail (exceeds >=-0.05 threshold)
+    p = _file(tmp_path, {"20240103": _rows(0.9, 1.0, -0.0501, sst_bias_base=0.0), "20240703": _rows(0.9, 1.0, -0.0, sst_bias_base=0.0)})
     assert seaft_score.overall(seaft_score.score(p, "candA", "base")) is False
