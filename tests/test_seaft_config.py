@@ -16,13 +16,14 @@ ARCH_KEYS = [
 
 # representative named_modules() names; the regex is applied with re.fullmatch
 MODULES_FROZEN = [
-    "encoder.ae_local_engine", "encoder.ae_local_global_engine", "encoder.ae_global_engine",
-    "encoder.q_cells", "forecast_engine", "latent_heads",
-    "encoder.embed_engine.GLORYS3", "encoder.embed_engine.ATMO",
+    "encoder.ae_local_engine", "encoder.ae_local_global_engine", "encoder.ae_local_global_engine.ae_adapter",
+    "encoder.ae_global_engine", "encoder.q_cells", "forecast_engine", "latent_heads", "latent_pre_norm",
+    "StreamEmbedder_GLORYS3", "StreamEmbedder_ATMO",
 ]
 MODULES_TRAINABLE = [
-    "encoder.ae_aggregation_engine", "embed_target_coords.GLORYS3",
-    "target_token_engines.GLORYS3", "pred_heads.GLORYS3",
+    "encoder.ae_aggregation_engine", "embed_target_coords_GLORYS3", "TargetPredictionEngine_GLORYS3",
+    "EnsPredictionHead_GLORYS3", "target_token_engines.GLORYS3.latent_in_norm",
+    "embed_target_coords", "target_token_engines", "pred_heads",
 ]
 
 
@@ -43,11 +44,13 @@ def test_run_mechanics_and_schedule():
     assert c["streams_directory"] == "./config/streams/glorys_v3_seaft/"
     assert c["general"]["istep"] == 0
     t = c["training_config"]
-    assert t["num_mini_epochs"] == 4
+    assert t["num_mini_epochs"] == 11
     assert t["samples_per_mini_epoch"] == 4096
     assert str(t["start_date"]) == "2020-01-01T00:00" and str(t["end_date"]) == "2023-12-31T00:00"
     assert t["forecast"]["num_steps"] == 10 and t["forecast"]["pushforward"] is False
-    assert list(t["losses"]["physical"]["loss_fcts"]) == ["mse"]
+    lf = t["losses"]["physical"]["loss_fcts"]
+    assert lf["dynamic_loss"] is None
+    assert [k for k, v in lf.items() if v is not None] == ["mse"]
     lr = t["learning_rate_scheduling"]
     assert float(lr["lr_max"]) == 2e-5 and lr["num_steps_warmup"] == 128 and lr["num_steps_cooldown"] == 512
     assert lr["policy_decay"] == "cosine"

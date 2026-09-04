@@ -16,7 +16,11 @@
 # counter and LR schedule carry over. Same 2010+ recency window as phase B,
 # with the forecast horizon extended to 10 steps.
 streams_directory: "./config/streams/glorys_v3_seaft/"
-freeze_modules: ".*global.*|.*local.*|.*adapter.*|.*q_cells.*|.*forecast_engine.*|.*latent.*|encoder\\..*GLORYS.*|.*ATMO.*"
+# names are matched with re.fullmatch against `module.name` when a module defines one
+# (StreamEmbedder_<stream>, embed_target_coords_<stream>, TargetPredictionEngine_<stream>, EnsPredictionHead_<stream>)
+# and against the dotted named_modules() path otherwise; `latent_heads.*|latent_pre_norm` is anchored so the decoder's
+# `target_token_engines.GLORYS3.latent_in_norm` stays trainable; `StreamEmbedder_.*` freezes BOTH source embedders.
+freeze_modules: ".*global.*|.*local.*|.*adapter.*|.*q_cells.*|.*forecast_engine.*|latent_heads.*|latent_pre_norm|StreamEmbedder_.*"
 
 # Architecture copied from the v2 run json (glorys_20260730_223127) because it
 # was inherited via run lineage and exists in no config file; fresh `train`
@@ -106,7 +110,7 @@ training_config:
   # 96 continues the phase-A stretched cosine (restarted from e32 on
   # 2026-08-28 after the 4-step rollout collapse at e42-e50); epochs 33-96
   # now train the 10-step horizon directly.
-  num_mini_epochs: 4   # short finetune (ft0818 lesson: long grinds reverse their gains)
+  num_mini_epochs: 11   # 2020-2023 window = ~1450 daily windows = 180 steps/epoch on 8 ranks; 11 epochs ~ 16k samples ~ 1980 steps = the spec's 4x4096 budget
   samples_per_mini_epoch: 4096
   # Carried from the v2 recipe (run-json lineage, in no config file — same trap
   # as the architecture block): daily windows and the Samudra-2 dynamic loss.
@@ -118,6 +122,7 @@ training_config:
       loss_fcts:
         mse: {}
         # dynamic_loss OFF: static target_channel_weights (stream config) apply on the plain-MSE path
+        dynamic_loss: null   # explicit null: the forked run json carries dynamic_loss and OmegaConf merge is a union
   # 2023-H2 held out for checkpoint selection (spec); 2024 (benchmark year) never trained.
   start_date: 2020-01-01T00:00
   end_date: 2023-12-31T00:00   # recency window incl. the warm 2023-H2 regime (Kacper ruling)
