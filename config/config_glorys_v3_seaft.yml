@@ -1,0 +1,154 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+#
+# v3 sea-level finetune (seaft), spec docs/superpowers/specs/2026-09-03-v3-sealevel-finetune-design.md.
+# Forks glorys_v3_20260819 at epoch 45 (train_continue --mini-epoch 45 into a NEW run id).
+# Trainable: aggregation engine + GLORYS3 decoder stack; everything else frozen.
+# (Original phase C header follows for provenance.)
+# v3 GLORYS curriculum, phase C: continues phase B (config_glorys_v3_phaseB.yml)
+# via `train_continue --from-run-id <v3 run> --reuse-run-id` so the epoch
+# counter and LR schedule carry over. Same 2010+ recency window as phase B,
+# with the forecast horizon extended to 10 steps.
+streams_directory: "./config/streams/glorys_v3_seaft/"
+freeze_modules: ".*global.*|.*local.*|.*adapter.*|.*q_cells.*|.*forecast_engine.*|.*latent.*|encoder\\..*GLORYS.*|.*ATMO.*"
+
+# Architecture copied from the v2 run json (glorys_20260730_223127) because it
+# was inherited via run lineage and exists in no config file; fresh `train`
+# runs MUST carry it explicitly (spec: "v2 sizing"), or they silently fall
+# back to config/default_config.yml sizing (ae_local_dim_embed 1024, 2/2
+# blocks, ae_aggregation_num_blocks 0, no ae_local_max_tokens_per_cell) and
+# crash with "max number of tokens per cell for positional encoding exceeded".
+embed_orientation: "channels"
+embed_unembed_mode: "block"
+embed_dropout_rate: 0.1
+
+ae_local_dim_embed: 2048
+ae_local_num_blocks: 4
+ae_local_num_heads: 16
+ae_local_dropout_rate: 0.1
+ae_local_with_qk_lnorm: True
+ae_local_max_tokens_per_cell: 256
+
+ae_local_num_queries: 1
+ae_local_queries_per_cell: False
+ae_adapter_num_heads: 16
+ae_adapter_embed: 128
+ae_adapter_with_qk_lnorm: True
+ae_adapter_with_residual: True
+ae_adapter_dropout_rate: 0.1
+
+ae_global_dim_embed: 2048
+ae_global_num_blocks: 4
+ae_global_num_heads: 32
+ae_global_dropout_rate: 0.1
+ae_global_with_qk_lnorm: True
+ae_global_att_dense_rate: 1.0
+ae_global_block_factor: 64
+ae_global_mlp_hidden_factor: 2
+ae_global_trailing_layer_norm: False
+
+ae_aggregation_num_blocks: 8
+ae_aggregation_num_heads: 32
+ae_aggregation_dropout_rate: 0.1
+ae_aggregation_with_qk_lnorm: True
+ae_aggregation_att_dense_rate: 1.0
+ae_aggregation_block_factor: 64
+ae_aggregation_mlp_hidden_factor: 2
+
+decoder_type: PerceiverIOCoordConditioning
+pred_adapter_kv: False
+pred_self_attention: True
+pred_dyadic_dims: False
+pred_mlp_adaln: True
+
+fe_num_blocks: 16
+fe_num_heads: 32
+fe_dropout_rate: 0.1
+fe_with_qk_lnorm: True
+fe_layer_norm_after_blocks: [7]
+fe_impute_latent_noise_std: 0.0001
+forecast_att_dense_rate: 1.0
+
+num_class_tokens: 0
+num_register_tokens: 0
+
+healpix_level: 5
+
+rope_2D: False
+
+train_logging:
+  terminal: 10
+  metrics: 20
+  checkpoint: 64
+
+data_loading :
+  num_workers: 8
+
+general:
+  # istep deliberately NOT set: this config is re-applied on every resume link
+  # (--resume-config), and a hard istep would reset the epoch counter / LR
+  # position each link. The 2026-08-28 e32 restart rewound istep via the run
+  # json (model_*_latest.json = copy of chkpt00032 json, istep 16896).
+  # seaft: fresh epoch counter for the forked run. The trainer derives the epoch from
+  # istep in the run json; the inherited v3 value (~23k) would put it at 45 > 4 and the
+  # loop would never run. Pass this config on the FIRST link only; later links pure-resume.
+  istep: 0
+  run_id: ???
+
+training_config:
+  training_mode: ["masking"]
+  # 96 continues the phase-A stretched cosine (restarted from e32 on
+  # 2026-08-28 after the 4-step rollout collapse at e42-e50); epochs 33-96
+  # now train the 10-step horizon directly.
+  num_mini_epochs: 4   # short finetune (ft0818 lesson: long grinds reverse their gains)
+  samples_per_mini_epoch: 4096
+  # Carried from the v2 recipe (run-json lineage, in no config file — same trap
+  # as the architecture block): daily windows and the Samudra-2 dynamic loss.
+  time_window_step: 24:00:00
+  time_window_len: 24:00:00
+  losses:
+    physical:
+      type: LossPhysical
+      loss_fcts:
+        mse: {}
+        # dynamic_loss OFF: static target_channel_weights (stream config) apply on the plain-MSE path
+  # 2023-H2 held out for checkpoint selection (spec); 2024 (benchmark year) never trained.
+  start_date: 2020-01-01T00:00
+  end_date: 2023-12-31T00:00   # recency window incl. the warm 2023-H2 regime (Kacper ruling)
+  learning_rate_scheduling :
+    lr_start: 1e-6
+    lr_max: 2e-5   # finetune from a converged state
+    lr_final_decay: 1e-6
+    lr_final: 0.0
+    num_steps_warmup: 128
+    num_steps_cooldown: 512
+    policy_warmup: "cosine"
+    policy_decay: "cosine"     # NOT constant - the constant-LR drift mode is the #1 diagnosed failure
+    policy_cooldown: "linear"
+    parallel_scaling_policy: "sqrt"
+  forecast :
+      time_step: 24:00:00
+      offset: 1
+      num_steps: 10
+      policy: "fixed"
+      pushforward: False
+
+validation_config:
+  samples_per_mini_epoch: 64
+  # Real EMA weight-averaging for saved checkpoints (trainer saves ema_model
+  # when enabled; default halflife 1e-3 samples = effectively raw weights).
+  # 4000 samples ~ 1 mini-epoch: smooths step-to-step noise -> lower output
+  # variance in evaluated checkpoints.
+  validate_with_ema:
+    enabled: True
+    ema_halflife_in_thousands: 4000
+    ema_ramp_up_ratio: 0.09
+  # inside ATMO coverage, disjoint from training, benchmark year untouched
+  start_date: 2019-01-01T00:00
+  end_date: 2019-12-31T00:00   # 2022 is inside the finetune window
