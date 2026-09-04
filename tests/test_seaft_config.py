@@ -49,8 +49,9 @@ def test_run_mechanics_and_schedule():
     assert str(t["start_date"]) == "2020-01-01T00:00" and str(t["end_date"]) == "2023-12-31T00:00"
     assert t["forecast"]["num_steps"] == 10 and t["forecast"]["pushforward"] is False
     lf = t["losses"]["physical"]["loss_fcts"]
-    assert lf["dynamic_loss"] is None
-    assert [k for k, v in lf.items() if v is not None] == ["mse"]
+    assert list(lf) == ["mse", "dynamic_loss"]
+    assert lf["mse"] == {}
+    assert lf["dynamic_loss"] == {"window": 128, "L": 1.0}
     lr = t["learning_rate_scheduling"]
     assert float(lr["lr_max"]) == 2e-5 and lr["num_steps_warmup"] == 128 and lr["num_steps_cooldown"] == 512
     assert lr["policy_decay"] == "cosine"

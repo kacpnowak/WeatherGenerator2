@@ -122,7 +122,11 @@ training_config:
       loss_fcts:
         mse: {}
         # dynamic_loss OFF: static target_channel_weights (stream config) apply on the plain-MSE path
-        dynamic_loss: null   # explicit null: the forked run json carries dynamic_loss and OmegaConf merge is a union
+        dynamic_loss:
+          window: 128
+          L: 1.0   # L=1 collapses the inverse-MSE weights to a constant (clamp to min, then mean-normalise -> exactly 1.0
+                   # per channel), so only the static target_channel_weights act. `null` is NOT usable here: the merged
+                   # mapping is iterated in masking.py:251 / train/utils.py:158 and a None value crashes the dataloader.
   # 2023-H2 held out for checkpoint selection (spec); 2024 (benchmark year) never trained.
   start_date: 2020-01-01T00:00
   end_date: 2023-12-31T00:00   # recency window incl. the warm 2023-H2 regime (Kacper ruling)
