@@ -67,6 +67,11 @@ def init_model_and_shard(
     if "q_cells" in cf.freeze_modules:
         model.encoder.q_cells.requires_grad = False
 
+    if is_root():
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in model.parameters())
+        logger.info(f"Trainable parameters after freeze: {n_train:,} of {n_total:,}")
+
     if with_ddp and not with_fsdp:
         # create DDP model if running without FSDP
         model = torch.nn.parallel.DistributedDataParallel(
