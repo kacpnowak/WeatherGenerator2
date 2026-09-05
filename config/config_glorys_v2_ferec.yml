@@ -1,0 +1,81 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# v2 forecast-engine recency finetune ("ferec"), spec
+# docs/superpowers/specs/2026-09-05-v2-lineage-improvement-design.md §4.
+# Forks glory_finetuning_20260818_105654 (ft0818 = ft0808 + aggregation finetune) via
+# `train_continue --mini-epoch -1` into a NEW run id. Architecture and streams come from the
+# forked run json; this file only overrides the finetune recipe. Pass it on the FIRST link
+# only (it pins istep: 0); later links are pure resumes.
+# glorys_v2 minus the leftover surface target_channel_weights: ft0808/ft0818 trained unweighted
+streams_directory: "./config/streams/glorys_v2_ferec/"
+
+# Trainable = forecast engine only. ft0808's set (global/local/adapter/q_cells/aggregation/
+# latent/GLORYS) plus ATMO (Kacper: the atmosphere embedding must be frozen too). Names are
+# matched with re.fullmatch against module.name when a module defines one
+# (StreamEmbedder_<stream>, embed_target_coords_<stream>, TargetPredictionEngine_<stream>,
+# EnsPredictionHead_<stream>) and against the dotted named_modules() path otherwise.
+freeze_modules: ".*global.*|.*local.*|.*adapter.*|.*q_cells.*|.*aggregation.*|.*latent.*|.*GLORYS.*|.*ATMO.*"
+
+train_logging:
+  terminal: 10
+  metrics: 20
+  checkpoint: 64
+
+data_loading :
+  num_workers: 8
+
+general:
+  # fresh epoch counter for the forked run (the trainer derives the epoch from istep in
+  # the run json; the inherited value would put it past num_mini_epochs). FIRST LINK ONLY.
+  istep: 0
+  run_id: ???
+
+training_config:
+  training_mode: ["masking"]
+  # 2020-2023 window = ~1450 daily windows = 180 steps/epoch on 8 ranks; 8 epochs ~ 11.5k samples
+  num_mini_epochs: 8
+  samples_per_mini_epoch: 4096
+  time_window_step: 24:00:00
+  time_window_len: 24:00:00
+  losses:
+    physical:
+      type: LossPhysical
+      loss_fcts:
+        mse: {}
+        dynamic_loss:
+          window: 128
+          L: 5.0   # ft0808/ft0818 used 20; cap the inverse-MSE spread at 5:1 so high-error T channels keep gradient
+  # recency window incl. the warm 2023-H2 regime (cold SST bias lever)
+  start_date: 2020-01-01T00:00
+  end_date: 2023-12-31T00:00
+  learning_rate_scheduling :
+    lr_start: 1e-6
+    lr_max: 2e-5      # x sqrt(8) parallel scaling at runtime (~5.7e-5 effective)
+    lr_final_decay: 1e-6
+    lr_final: 0.0
+    num_steps_warmup: 128
+    num_steps_cooldown: 256
+    policy_warmup: "cosine"
+    policy_decay: "cosine"
+    policy_cooldown: "linear"
+    parallel_scaling_policy: "sqrt"
+  forecast :
+      time_step: 24:00:00
+      offset: 1
+      num_steps: 10
+      policy: "fixed"
+      pushforward: False
+
+validation_config:
+  samples_per_mini_epoch: 64
+  # short EMA (~half a 1450-sample epoch) so per-epoch checkpoints track the finetuned weights
+  validate_with_ema:
+    enabled: True
+    ema_halflife_in_thousands: 700
+    ema_ramp_up_ratio: 0.09
+  # outside the training window, inside ERA5 coverage; the benchmark year is never used
+  start_date: 2019-01-01T00:00
+  end_date: 2019-12-31T00:00
