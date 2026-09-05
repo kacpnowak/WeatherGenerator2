@@ -12,12 +12,12 @@ CPU nodes; no output corrections; `rm -rf` of a run's model/results dirs before 
 ### Task B — export-axis experiment (ft0808 forecasts, no inference)
 - [x] B1 export (9 reference levels) → eval: jobs 1672537 → 1672539; challenger `challenger_ft0808_B1.py`, store `wg_ft0808_B1.zarr`
 - [x] B2 export (13 levels) → `nan_ts_levels.py` (T/S NaN at 9.573/15.8101/25.2114/34.4342) → eval: 1672540 → 1672541 → 1672542
-- [ ] Readout: `build_scoreboard_data.py` on both reports (named `challenger_ft0808_B1_global_report.ipynb` / `_B2_`), rows vs GLONET, mld, class4 rows → **policy** (B1 on tie). Ledger.
+- [x] Readout (2026-09-05): mld 70.2->48.5/48.0/56.6 m (B1=B2), class4 u/v better in B1, B2's class4_sst is a NaN-plane artefact -> **policy B1**. `build_scoreboard_data.py` on both reports (named `challenger_ft0808_B1_global_report.ipynb` / `_B2_`), rows vs GLONET, mld, class4 rows → **policy** (B1 on tie). Ledger.
 
 ### Task A — ft0818 honest evaluation
 - [x] Inference 2×26 dates: jobs 1672543, 1672544 (`obench_ft0818era_`, obench_v2 config, GLORYS2, `--mini-epoch -1`)
 - [x] Export on the B1 axis → eval: 1672545 → 1672546 (`challenger_ft0818.py`, `wg_ft0818_B1.zarr`)
-- [ ] If the policy is B2: re-export with the B2 levels + `nan_ts_levels.py`, re-eval. Readout + scoreboard row `ft0818`.
+- [x] Policy is B1: no re-export needed. If the policy is B2: re-export with the B2 levels + `nan_ts_levels.py`, re-eval. Readout + scoreboard row `ft0818`.
 
 ### Task C — ferec finetune
 - [x] `config/config_glorys_v2_ferec.yml`, `config/streams/glorys_v2_ferec/` (weight-free), `scripts/ferec_score.py` + `tests/test_ferec_score.py`, `eval_output/ferec_epoch_smoke.sh`, `eval_output/ferec_sequencer.sh`
