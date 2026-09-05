@@ -138,3 +138,16 @@ fix config, resubmit (no chain until clean).
 - **Weight scale**: a 6.9× zos weight with MSE in normalized units changes the gradient
   balance substantially; if epoch 0 regresses the rest beyond the gate, halve the gain
   (40 → 20) and rerun — one retry, then stop.
+
+## Result (2026-09-05): negative — approach closed
+
+Run `glorys_v3_seaft_20260904` (aggregation + GLORYS3 decoder trainable, gap-derived weights with zos 6.91, 2020–2023,
+10-step, 11 mini-epochs of 180 steps) was stopped at epoch 6. Selection smokes at epochs 1, 3 and 5 failed every gate,
+with near-identical numbers (family 0.996–1.018, rest 1.017–1.036, SST bias −0.08 to −0.15 °C). Diagnosis: v3's zos gap to
+ft0808 is already present at lead day 1 (0.060 vs 0.052) with smaller growth thereafter, i.e. it lives in the frozen
+encoder/dynamics, not in the readout; retraining the aggregation shifted the latent the frozen forecast engine expects, and
+the temperature channels paid for it. Mechanics learned: `freeze_modules` matches `module.name` when defined (else the
+dotted path); OmegaConf merges configs as a union (disable the dynamic loss with `L: 1.0`, `null` crashes the dataloader);
+a 2020–2023 window gives 180-step epochs; an EMA halflife of 4000 samples lags such epochs by ~3 epochs.
+Code kept: `config/streams/glorys_v3_seaft/`, `config/config_glorys_v3_seaft.yml`, `scripts/seaft_score.py`, freeze/param
+logging, and the tests. Run artifacts deleted.
