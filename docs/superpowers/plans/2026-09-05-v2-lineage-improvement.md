@@ -17,7 +17,7 @@ CPU nodes; no output corrections; `rm -rf` of a run's model/results dirs before 
 ### Task A — ft0818 honest evaluation
 - [x] Inference 2×26 dates: jobs 1672543, 1672544 (`obench_ft0818era_`, obench_v2 config, GLORYS2, `--mini-epoch -1`)
 - [x] Export on the B1 axis → eval: 1672545 → 1672546 (`challenger_ft0818.py`, `wg_ft0818_B1.zarr`)
-- [x] Policy is B1: no re-export needed. If the policy is B2: re-export with the B2 levels + `nan_ts_levels.py`, re-eval. Readout + scoreboard row `ft0818`.
+- [x] Readout (2026-09-05 evening): ft0818 18/20 vs GLONET incl. mld (2/3); scoreboard row `WG ft0818`. Policy is B1: no re-export needed. If the policy is B2: re-export with the B2 levels + `nan_ts_levels.py`, re-eval. Readout + scoreboard row `ft0818`.
 
 ### Task C — ferec finetune
 - [x] `config/config_glorys_v2_ferec.yml`, `config/streams/glorys_v2_ferec/` (weight-free), `scripts/ferec_score.py` + `tests/test_ferec_score.py`, `eval_output/ferec_epoch_smoke.sh`, `eval_output/ferec_sequencer.sh`
