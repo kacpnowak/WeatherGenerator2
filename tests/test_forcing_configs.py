@@ -26,6 +26,8 @@ def _check_ifs_forcing(ifs, mode):
     assert ifs["injection"]["time_reduce"] == "mean"
     assert list(ifs["source"]) == IFS_CHANNELS
     assert parse_timedelta(ifs["frequency"]) == np.timedelta64(6, "h")
+    # IFS stamps 06/12/18/00 describe the day that starts at 00
+    assert parse_timedelta(ifs["window_shift"]) == np.timedelta64(6, "h")
     assert is_stream_fe_only(ifs)
 
 

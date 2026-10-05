@@ -7,6 +7,7 @@ import pytest
 
 from weathergen.common.config import load_streams
 from weathergen.datasets.data_reader_base import TimeWindowHandler
+from weathergen.datasets.multi_stream_data_sampler import forcing_time_window_handler
 from weathergen.model.forcing import count_snapshots, forcing_field_from_window
 from weathergen.readers_extra.registry import get_extra_reader
 
@@ -24,12 +25,13 @@ def reader_and_windows():
     info = load_streams(STREAMS)["IFS_ATMO"]
     if "name" not in info:
         info["name"] = "IFS_ATMO"
-    windows = TimeWindowHandler(
+    days = TimeWindowHandler(
         np.datetime64("2001-01-01T00:00"),
         np.datetime64("2001-01-31T00:00"),
         np.timedelta64(1, "D"),
         np.timedelta64(1, "D"),
     )
+    windows = forcing_time_window_handler(days, info)
     reader = get_extra_reader(info["reader"])(
         tw_handler=windows, filename=DATA_ROOT / "atmos_all", stream_info=info, stage="train"
     )
@@ -44,14 +46,15 @@ def test_selected_channels(reader_and_windows):
 
 
 @pytest.mark.parametrize("idx", [0, 3])
-def test_daily_window_holds_four_snapshots_inside_the_window(reader_and_windows, idx):
-    reader, windows = reader_and_windows
+def test_ocean_day_is_forced_by_ifs_at_06_12_18_and_00(reader_and_windows, idx):
+    reader, _ = reader_and_windows
     rdata = reader.get_source(idx)
     assert count_snapshots(rdata.datetimes) == 4
     assert rdata.data.shape == (4 * NUM_POINTS, 9)
-    window = windows.window(idx)
-    times = np.asarray(rdata.datetimes)
-    assert (times >= window.start).all() and (times < window.end).all()
+    day = np.datetime64("2001-01-01T00:00") + np.timedelta64(idx, "D")
+    expected = day + np.array([6, 12, 18, 24], dtype="timedelta64[h]")
+    stamps = np.unique(np.asarray(rdata.datetimes).astype("datetime64[m]"))
+    np.testing.assert_array_equal(stamps, expected.astype("datetime64[m]"))
 
 
 def test_field_covers_every_latent_cell(reader_and_windows):

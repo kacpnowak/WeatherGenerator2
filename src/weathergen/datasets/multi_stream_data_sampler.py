@@ -106,6 +106,30 @@ def collect_forecast_queries(stream_datasets: list, when) -> IOReaderData:
     return IOReaderData.combine(rdatas)
 
 
+def forcing_time_window_handler(
+    tw_handler: TimeWindowHandler, stream_info: dict
+) -> TimeWindowHandler:
+    """
+    Time window handler a forcing stream is read with.
+
+    `window_shift` in the stream config moves every window by that time delta, so the forcing
+    for the window [t, t + len) is read over [t + shift, t + len + shift). With the IFS stamped
+    at the end of each 6 h interval, a shift of 06:00:00 gives the daily window that starts at
+    00 the stamps 06, 12, 18 and 00 of the next day. Without the key the sampler's own handler
+    is used.
+    """
+    shift = stream_info.get("window_shift")
+    if shift is None:
+        return tw_handler
+    shift = parse_timedelta(shift)
+    return TimeWindowHandler(
+        tw_handler.t_start + shift,
+        tw_handler.t_end + shift,
+        tw_handler.t_window_len,
+        tw_handler.t_window_step,
+    )
+
+
 @dataclasses.dataclass
 class _Stream:
     info: Config
@@ -399,6 +423,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             dataset = self._get_dataset_class(
                 stream_info if reader_type is None else {"type": reader_type}, stream_name
             )
+            forcing_tw_handler = forcing_time_window_handler(self.time_window_handler, stream_info)
             for fname in stream_info["filenames"]:
                 fname = pathlib.Path(fname)
                 if fname.exists():
@@ -413,7 +438,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     filename = filenames[0]
 
                 ds = dataset(
-                    tw_handler=self.time_window_handler,
+                    tw_handler=forcing_tw_handler,
                     stream_info=stream_info,
                     stage=self._stage,
                     filename=filename,
@@ -428,12 +453,14 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 ds.forcing_stream_name = stream_name
                 ds.forcing_time_reduce = time_reduce
                 ds.forcing_expected_snapshots = expected_snapshots
+                ds.forcing_tw_handler = forcing_tw_handler
                 stream.readers += [ds]
                 if is_root():
                     logger.info(
                         f"Opening forcing dataset '{stream_name}' from {filename} "
                         f"(scatter onto {self.num_healpix_cells} cells, "
-                        f"time_reduce={time_reduce})."
+                        f"time_reduce={time_reduce}, "
+                        f"window_shift={stream_info.get('window_shift', 0)})."
                     )
 
             # width of the per-cell forcing field, consumed by the model's ForcingInjection
@@ -454,7 +481,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         Collect the per-step forcing field for the requested forecast steps.
 
         Mirrors `_build_condition_data`, but the forcing is spatial: for each step the reader
-        is read at that step's valid window (the same window the step's targets use),
+        is read at that step's valid window (the same window the step's targets use, moved by
+        the stream's `window_shift`),
         normalised with the reader stats, reduced over the snapshots in the window and
         scatter-averaged onto the HEALPix latent cells. Each step stores a
         (num_cells, 2*num_vars) array of [cell_values | cell_valid].
@@ -469,7 +497,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         for i in range(start, end):
             idx = base_idx + (self.time_step * i) // self.step_timedelta
             rdata = forcing_ds.get_source(idx)
-            where = f"forcing stream '{name}', {self.time_window_handler.window(idx)}, step {i}"
+            window = forcing_ds.forcing_tw_handler.window(idx)
+            where = f"forcing stream '{name}', {window}, step {i}"
             if len(rdata.data) == 0:
                 raise ForcingUnavailableError(f"{where}: no data")
             values = np.asarray(forcing_ds.normalize_source_channels(rdata.data))

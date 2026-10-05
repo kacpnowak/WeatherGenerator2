@@ -29,6 +29,8 @@ streams :
     filenames : ['atmos_all']
     entry_point : "forecast_engine"
     frequency : "06:00:00"
+    # IFS stamps 06, 12, 18 and 00 (next day) force the ocean day that starts at 00
+    window_shift : "06:00:00"
     source : ['10u', '10v', '2d', '2t', 'cp', 'lsp', 'msl', 'tsr', 'tsrc']
     source_exclude : []
     train_target_channels : []

@@ -6,8 +6,11 @@ import numpy as np
 import pytest
 
 from weathergen.datasets.batch import ModelBatch
-from weathergen.datasets.data_reader_base import ReaderData
-from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
+from weathergen.datasets.data_reader_base import ReaderData, TimeWindowHandler
+from weathergen.datasets.multi_stream_data_sampler import (
+    MultiStreamDataSampler,
+    forcing_time_window_handler,
+)
 from weathergen.model.forcing import ForcingUnavailableError
 
 
@@ -53,6 +56,7 @@ class _FakeReader:
     source_channels = ["a", "b"]
 
     def __init__(self, tw_handler=None, stream_info=None, stage=None, filename=None):
+        self.tw_handler = tw_handler
         self.snapshots = 4
         self.empty_windows = set()
         self.short_windows = set()
@@ -61,6 +65,7 @@ class _FakeReader:
         self.forcing_stream_name = "F"
         self.forcing_time_reduce = "mean"
         self.forcing_expected_snapshots = None
+        self.forcing_tw_handler = types.SimpleNamespace(window=lambda idx: f"window {idx}")
 
     def get_source(self, idx):
         idx = int(idx)
@@ -90,7 +95,7 @@ def _sampler(time_step="1D", step="1D", window="1D"):
         len_timedelta=np.timedelta64(pd_td(window)),
         healpix_level=0,
         num_healpix_cells=12,
-        time_window_handler=types.SimpleNamespace(window=lambda idx: f"window {idx}"),
+        time_window_handler=types.SimpleNamespace(window=lambda idx: f"sampler window {idx}"),
         _stage="train",
     )
     stub._forcing_snapshots_per_window = lambda name, info: (
@@ -145,7 +150,8 @@ def test_forcing_step_range_builds_only_that_chunk():
 def test_missing_forcing_raises_with_stream_and_window():
     reader, batch = _FakeReader(), _Batch(3)
     reader.empty_windows = {11}
-    with pytest.raises(ForcingUnavailableError, match="'F'.*window 11.*step 1"):
+    # the message names the window the forcing was read over, not the sampler's window
+    with pytest.raises(ForcingUnavailableError, match="'F', window 11.*step 1"):
         MultiStreamDataSampler._build_forcing_data(_sampler(), batch, reader, 10, 3)
 
 
@@ -177,8 +183,10 @@ def test_snapshots_per_window_rejects_non_divisible_frequency():
         f(stub, "F", {})
 
 
-def _init_forcing(streams, tmp_path):
+def _init_forcing(streams, tmp_path, tw_handler=None):
     stub = _sampler()
+    if tw_handler is not None:
+        stub.time_window_handler = tw_handler
     seen = []
 
     def get_dataset_class(info, name):
@@ -360,3 +368,42 @@ def test_iter_forcing_skip_count_resets_after_a_batch():
     batches = list(MultiStreamDataSampler.__iter__(stub))
     assert tried == [0, 1, 2, 0, 1]
     assert batches == [good, good]
+
+
+_DAILY = TimeWindowHandler(
+    np.datetime64("2001-01-01T00:00"),
+    np.datetime64("2001-02-01T00:00"),
+    np.timedelta64(1, "D"),
+    np.timedelta64(1, "D"),
+)
+
+
+def test_forcing_window_is_the_samplers_without_window_shift():
+    assert forcing_time_window_handler(_DAILY, {}) is _DAILY
+
+
+@pytest.mark.parametrize("shift", ["06:00:00", np.timedelta64(6, "h")])
+def test_window_shift_moves_every_forcing_window(shift):
+    shifted = forcing_time_window_handler(_DAILY, {"window_shift": shift})
+    # ocean day 2001-01-04 is forced by IFS at 06, 12, 18 and 00 of the next day
+    window = shifted.window(3)
+    assert window.start == np.datetime64("2001-01-04T06:00")
+    assert window.end == np.datetime64("2001-01-05T06:00")
+    assert shifted.t_window_len == _DAILY.t_window_len
+    assert shifted.t_window_step == _DAILY.t_window_step
+    assert _DAILY.window(3).start == np.datetime64("2001-01-04T00:00")  # sampler unchanged
+
+
+def test_forcing_reader_is_built_with_the_shifted_window(tmp_path):
+    streams = {"IFS_ATMO": {"type": "forcing", "reader": "fesom", "window_shift": "06:00:00"}}
+    out, _ = _init_forcing(streams, tmp_path, tw_handler=_DAILY)
+    reader = out["IFS_ATMO"].readers[0]
+    assert reader.tw_handler is reader.forcing_tw_handler
+    assert reader.tw_handler.window(0).start == np.datetime64("2001-01-01T06:00")
+
+
+def test_forcing_reader_uses_the_samplers_window_without_shift(tmp_path):
+    streams = {"IFS_ATMO": {"type": "forcing", "reader": "fesom"}}
+    out, _ = _init_forcing(streams, tmp_path, tw_handler=_DAILY)
+    reader = out["IFS_ATMO"].readers[0]
+    assert reader.tw_handler is _DAILY and reader.forcing_tw_handler is _DAILY
