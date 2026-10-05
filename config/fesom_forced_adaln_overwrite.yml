@@ -1,0 +1,9 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+
+# Overwrite that switches a FESOM run to the IFS-forced stream set with a condition
+# stream (adaln_local injection). The forecasting engine is built with AdaLN norms, so
+# checkpoints trained without a condition stream only load partially.
+streams_directory: "./config/streams/fesom_forced_adaln/"

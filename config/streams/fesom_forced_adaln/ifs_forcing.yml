@@ -1,0 +1,48 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# IFS atmosphere as a per-step forcing for the FESOM ocean streams.
+#
+# The atmosphere is NOT predicted and has no encoder: it is prescribed, re-read at
+# every forecast step's valid window and injected into the forecasting engine.
+#
+#   type : forcing    -> routed through the per-step forcing path
+#   reader : fesom    -> the data is in the FESOM-format zarr, read by DataReaderFesom
+#   frequency         -> IFS is 6-hourly; a daily window holds four snapshots
+#
+# injection.time_reduce: how the snapshots of one window become one field
+#   mean  : mean over the window (default)
+#   stack : all snapshots as separate channels (needs `frequency`)
+#   last  : final snapshot only
+# injection.mode: none | additive | cross_attn | global | adaln_local
+#   global and adaln_local use the condition stream in forecast.yml as their base
+IFS_ATMO :
+  type : forcing
+  reader : fesom
+  stream_id : 2139
+  filenames : ['atmos_all']
+  entry_point : "forecast_engine"
+  frequency : 06:00:00
+  source : ['10u', '10v', '2d', '2t', 'cp', 'lsp', 'msl', 'tsr', 'tsrc']
+  train_target_channels : []
+  val_target_channels : []
+  geoinfo_channels : []
+  loss_weight : 0.
+  location_weight : cosine_latitude
+  token_size : 8
+  tokenize_spacetime : True
+  injection :
+    mode : adaln_local
+    time_reduce : mean
+  embed :
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 256
+    num_blocks : 2
