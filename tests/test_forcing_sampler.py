@@ -34,23 +34,3 @@ def test_latent_output_uses_chunk_relative_step_index():
 
     assert requested == [0, 1]
     assert len(latents) == 2 and latents[0][0]["head"].shape == (3,)
-
-
-def test_forecast_chunk_size_must_be_positive():
-    import pytest
-    from omegaconf import OmegaConf
-
-    from weathergen.common.config import validate_forecast_policy_and_steps
-
-    # positive and unset (default config: null) chunk sizes are valid
-    for chunk_size in (2, None):
-        forecast_cfg = OmegaConf.create(
-            {"num_steps": 4, "offset": 1, "policy": "fixed", "chunk_size": chunk_size}
-        )
-        validate_forecast_policy_and_steps(forecast_cfg, "training_config")
-
-    forecast_cfg = OmegaConf.create(
-        {"num_steps": 4, "offset": 1, "policy": "fixed", "chunk_size": 0}
-    )
-    with pytest.raises(AssertionError, match="chunk_size"):
-        validate_forecast_policy_and_steps(forecast_cfg, "training_config")

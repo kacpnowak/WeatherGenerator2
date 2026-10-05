@@ -214,12 +214,18 @@ class Trainer(TrainerBase):
 
         return output_target_and_auxs
 
-    def _get_forecast_chunks(self, forecast_cfg):
-        n_full_chunks = forecast_cfg.num_steps // forecast_cfg.chunk_size
-        remainder_fsteps = forecast_cfg.num_steps % forecast_cfg.chunk_size
-        return [forecast_cfg.chunk_size] * n_full_chunks + (
-            [remainder_fsteps] if remainder_fsteps else []
-        )
+    def _get_forecast_chunks(self, forecast_cfg, batch):
+        """
+        Split the batch's output steps into chunks of `forecast.chunk_size` model steps; an unset
+        chunk_size runs them in one chunk. The steps are counted on the batch, as the unchunked
+        model did: one step for masking-only (offset 0, num_steps 0), and the per-batch draw
+        when num_steps is a list.
+        """
+        num_steps = len(batch.get_output_idxs())
+        chunk_size = forecast_cfg.get("chunk_size") or num_steps
+        n_full_chunks = num_steps // chunk_size
+        remainder_fsteps = num_steps % chunk_size
+        return [chunk_size] * n_full_chunks + ([remainder_fsteps] if remainder_fsteps else [])
 
     def _rollout_state_path(self):
         """File where the resumable rollout state (carried latent + progress) is stored."""
@@ -287,7 +293,7 @@ class Trainer(TrainerBase):
         preds_full,
     ):
         # chunks = self._get_fcst_chunks(mode_cfg)
-        chunks = self._get_forecast_chunks(mode_cfg.get("forecast", {}))
+        chunks = self._get_forecast_chunks(mode_cfg.get("forecast", {}), batch)
         source_samples = batch.get_source_samples()
         num_samples_write = mode_cfg.get("output", {}).get("num_samples", 0) * batch_size
         should_write_output = bidx < num_samples_write

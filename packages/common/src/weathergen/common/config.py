@@ -801,7 +801,8 @@ def validate_forecast_policy_and_steps(forecast_cfg: OmegaConf, mode: str):
         return
 
     forecast_cfg.num_steps = forecast_cfg.get("num_steps", 1)
-    forecast_cfg.chunk_size = forecast_cfg.get("chunk_size", forecast_cfg.num_steps)
+    # unset chunk_size (None) runs the whole rollout as one chunk
+    forecast_cfg.chunk_size = forecast_cfg.get("chunk_size", None)
     chunk_size = forecast_cfg.chunk_size
     assert chunk_size is None or (isinstance(chunk_size, int) and chunk_size > 0), (
         f"'{mode}.forecast.chunk_size' must be a positive integer or null."
