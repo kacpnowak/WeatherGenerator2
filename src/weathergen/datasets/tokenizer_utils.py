@@ -451,7 +451,11 @@ def get_target_coords_local(
             1 + target_geoinfos.shape[1] + target_times.shape[1] + 5 * (3 * 5) + 3 * 8,
         ]
     )
-    a[..., 0] = stream_id
+    # Experimental branch: keep the encoding the existing ocean checkpoints were trained with.
+    # develop 5502ed33 changed this to a[..., 0] = stream_id (stream id in column 0 of every
+    # target point); checkpoints from before 2026-10-02 (e.g. ykwx7bl2) then predict with an
+    # MSE ~10^4 times higher. Drop this when extracting the forcing work into a PR.
+    a[0] = stream_id
     geoinfo_offset = 1
     a[..., geoinfo_offset : geoinfo_offset + target_times.shape[1]] = target_times
     geoinfo_offset += target_times.shape[1]
