@@ -17,7 +17,7 @@ import pandas as pd
 import torch
 from omegaconf import OmegaConf
 
-from weathergen.common.config import Config
+from weathergen.common.config import Config, parse_timedelta
 from weathergen.common.io import IOReaderData
 from weathergen.datasets.batch import ModelBatch
 from weathergen.datasets.data_reader_anemoi import DataReaderAnemoi
@@ -341,24 +341,64 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             condition_datasets[stream_name].readers += [ds]
         return condition_datasets
 
+    def _forcing_snapshots_per_window(self, stream_name: str, stream_info: dict) -> int:
+        """Snapshots of a forcing stream in one time window (needed for time_reduce: stack)."""
+        frequency = stream_info.get("frequency")
+        if frequency is None:
+            raise ValueError(
+                f"Forcing stream '{stream_name}': time_reduce 'stack' needs 'frequency' in "
+                "the stream config."
+            )
+        frequency = parse_timedelta(frequency)
+        window = parse_timedelta(self.len_timedelta)
+        zero = np.timedelta64(0, "ms")
+        if frequency <= zero or window % frequency != zero:
+            raise ValueError(
+                f"Forcing stream '{stream_name}': frequency {frequency} does not divide the "
+                f"time window length {window}."
+            )
+        return int(window // frequency)
+
     def _init_forcing_streams(self, cf) -> dict[StreamName, _Stream]:
         """
-        Instantiate per-step forcing streams (type: forcing, e.g. SST).
+        Instantiate per-step forcing streams (type: forcing, e.g. SST or the IFS atmosphere).
 
         These are read at every forecast step's valid time and injected into the forecasting
         engine (they do not go through the assimilation/source path). The forcing grid is
-        fixed, so the scatter index onto the HEALPix latent cells is precomputed once per
-        reader and stored alongside it.
+        fixed, so the scatter index onto the HEALPix latent cells is computed once per reader:
+        up front when the reader exposes its grid, otherwise on the first read in the worker.
         """
-        from weathergen.model.forcing import build_forcing_cell_index
+        from weathergen.model.forcing import TIME_REDUCE_MODES, build_forcing_cell_index
 
         forcing_datasets: dict[StreamName, _Stream] = {}
         for stream_name, stream_info in cf.streams.items():
             if stream_info["type"] != "forcing":
                 continue
+            if len(forcing_datasets) > 0:
+                raise ValueError(
+                    f"Only one forcing stream is supported, found '{stream_name}' in addition "
+                    f"to '{next(iter(forcing_datasets))}'."
+                )
             stream = _Stream(stream_info, [])
 
-            dataset = self._get_dataset_class(stream_info, stream_name)
+            time_reduce = stream_info.get("injection", {}).get("time_reduce", "mean")
+            if time_reduce not in TIME_REDUCE_MODES:
+                raise ValueError(
+                    f"Forcing stream '{stream_name}': unknown time_reduce {time_reduce!r}, "
+                    f"expected one of {TIME_REDUCE_MODES}."
+                )
+            expected_snapshots = (
+                self._forcing_snapshots_per_window(stream_name, stream_info)
+                if time_reduce == "stack"
+                else None
+            )
+
+            # `reader: <stream type>` selects the reader backing the forcing (e.g. fesom);
+            # without it the stream's own type is used (anemoi-backed DataReaderForcing)
+            reader_type = stream_info.get("reader")
+            dataset = self._get_dataset_class(
+                stream_info if reader_type is None else {"type": reader_type}, stream_name
+            )
             for fname in stream_info["filenames"]:
                 fname = pathlib.Path(fname)
                 if fname.exists():
@@ -378,16 +418,27 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     stage=self._stage,
                     filename=filename,
                 )
-                # precompute the fixed forcing-grid -> HEALPix-cell scatter index
-                ds.forcing_cell_idx = build_forcing_cell_index(
-                    ds.latitudes, ds.longitudes, self.healpix_level
+                # readers that open their files lazily per worker (e.g. fesom) have no grid
+                # yet; their index is built from the first window read
+                ds.forcing_cell_idx = (
+                    build_forcing_cell_index(ds.latitudes, ds.longitudes, self.healpix_level)
+                    if hasattr(ds, "latitudes") and hasattr(ds, "longitudes")
+                    else None
                 )
+                ds.forcing_stream_name = stream_name
+                ds.forcing_time_reduce = time_reduce
+                ds.forcing_expected_snapshots = expected_snapshots
                 stream.readers += [ds]
                 if is_root():
                     logger.info(
                         f"Opening forcing dataset '{stream_name}' from {filename} "
-                        f"(scatter onto {self.num_healpix_cells} cells)."
+                        f"(scatter onto {self.num_healpix_cells} cells, "
+                        f"time_reduce={time_reduce})."
                     )
+
+            # width of the per-cell forcing field, consumed by the model's ForcingInjection
+            stream_info[str(self._stage) + "_source_channels"] = ds.source_channels
+            stream_info["forcing_num_vars"] = len(ds.source_channels) * (expected_snapshots or 1)
             forcing_datasets[stream_name] = stream
         return forcing_datasets
 
@@ -400,31 +451,42 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         step_range=None,
     ):
         """
-        Collect the per-step forcing field (e.g. SST) for the requested forecast steps.
+        Collect the per-step forcing field for the requested forecast steps.
 
         Mirrors `_build_condition_data`, but the forcing is spatial: for each step the reader
-        is read at that step's valid time (raw, full grid, normalised by the reader stats),
-        then scatter-averaged onto the HEALPix latent cells using the precomputed index. Each
-        step stores a (num_cells, 2*num_vars) array of [cell_values | cell_valid].
-        """
-        from weathergen.model.forcing import scatter_to_cells
+        is read at that step's valid window (the same window the step's targets use),
+        normalised with the reader stats, reduced over the snapshots in the window and
+        scatter-averaged onto the HEALPix latent cells. Each step stores a
+        (num_cells, 2*num_vars) array of [cell_values | cell_valid].
 
-        cell_idx = forcing_ds.forcing_cell_idx
-        num_grid_pts = len(cell_idx)
+        Raises ForcingUnavailableError when a step has no (or an incomplete) forcing window,
+        so a forced model never silently runs unforced.
+        """
+        from weathergen.model.forcing import ForcingUnavailableError, forcing_field_from_window
+
+        name = forcing_ds.forcing_stream_name
         start, end = (0, num_output_steps) if step_range is None else step_range
         for i in range(start, end):
             idx = base_idx + (self.time_step * i) // self.step_timedelta
             rdata = forcing_ds.get_source(idx)
-            # raw, full-grid values in fixed grid order (no coord/geoinfo drops for a
-            # full-grid forcing) -> normalise with the reader stats, then scatter. If the
-            # reader stacked multiple input steps, keep only the most recent grid (this step).
-            values = forcing_ds.normalize_source_channels(rdata.data)
-            values = np.asarray(values)[-num_grid_pts:]
-            values_t = torch.as_tensor(values, dtype=torch.float32)
-            cell_values, cell_valid = scatter_to_cells(
-                values_t.unsqueeze(0), cell_idx, self.num_healpix_cells
-            )
-            field = torch.cat([cell_values[0], cell_valid[0]], dim=-1).numpy()
+            where = f"forcing stream '{name}', {self.time_window_handler.window(idx)}, step {i}"
+            if len(rdata.data) == 0:
+                raise ForcingUnavailableError(f"{where}: no data")
+            values = np.asarray(forcing_ds.normalize_source_channels(rdata.data))
+            try:
+                field, cell_idx = forcing_field_from_window(
+                    values,
+                    rdata.datetimes,
+                    rdata.coords,
+                    forcing_ds.forcing_cell_idx,
+                    self.healpix_level,
+                    self.num_healpix_cells,
+                    forcing_ds.forcing_time_reduce,
+                    forcing_ds.forcing_expected_snapshots,
+                )
+            except ForcingUnavailableError as e:
+                raise ForcingUnavailableError(f"{where}: {e}") from e
+            forcing_ds.forcing_cell_idx = cell_idx
             batch.get_source_samples().forcing[i] = field
 
     def reset(self) -> tuple[Sequence[int], Sequence[int]]:
@@ -646,7 +708,13 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                         stream_data.add_target_query(timestep_idx, tt_c, tt_t)
                     else:
                         stream_data.add_target_values(
-                            self._stage, timestep_idx, tt_cells, tt_c, tt_t, idxs_inv, rdata.is_spoof
+                            self._stage,
+                            timestep_idx,
+                            tt_cells,
+                            tt_c,
+                            tt_t,
+                            idxs_inv,
+                            rdata.is_spoof,
                         )
 
         return stream_data
@@ -1185,7 +1253,11 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         # forcing (e.g. SST) is likewise indexed by the absolute forecast step
         for _, forcing_data in self.forcing_datasets.items():
             self._build_forcing_data(
-                batch, forcing_data.readers[0], idx, ctx["num_output_steps"], step_range=(start, end)
+                batch,
+                forcing_data.readers[0],
+                idx,
+                ctx["num_output_steps"],
+                step_range=(start, end),
             )
 
         return batch
@@ -1221,6 +1293,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         Return :
             batch of data
         """
+        from weathergen.model.forcing import ForcingUnavailableError
+
         iter_start, iter_end = self.worker_workset()
         logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
 
@@ -1249,7 +1323,11 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     batch = self._build_batch_skeleton(idx, num_forecast_steps)
                     not_valid = batch.sources_empty() or batch.sources_nan()
                 else:
-                    batch = self._get_batch(idx, num_forecast_steps)
+                    try:
+                        batch = self._get_batch(idx, num_forecast_steps)
+                    except ForcingUnavailableError as e:
+                        logger.warning(f"Skipping sample with idx={idx}: {e}")
+                        continue
 
                     # ensure the batch is valid, i.e. not completely empty and no NaN values
                     # student teacher has no classical targets
