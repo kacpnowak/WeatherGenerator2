@@ -222,6 +222,23 @@ def forcing_field_from_window(
     return field, cell_idx
 
 
+def forcing_num_vars_from_cfg(stream_cfg) -> int:
+    """
+    Width of the per-cell forcing field of a forcing stream.
+
+    The sampler writes ``forcing_num_vars`` into the stream config (channels, times the
+    snapshots per window for ``time_reduce: stack``). Configs without it list their source
+    channels explicitly, one forcing value per channel.
+    """
+    num_vars = stream_cfg.get("forcing_num_vars", None)
+    if num_vars is not None:
+        return int(num_vars)
+    source_channels = stream_cfg.get("train_source_channels") or stream_cfg.get(
+        "val_source_channels", []
+    )
+    return len(source_channels)
+
+
 class ForcingEmbed(nn.Module):
     """
     Per-cell forcing embedding shared by all injection modes.
@@ -314,7 +331,8 @@ class ForcingInjection(nn.Module):
                           FE AdaLN is untouched.
       * ``adaln_local`` : make the FE conditioning per-cell (daytime condition + projected
                           per-cell forcing); every FE block's AdaLN then modulates each cell
-                          token by its local forcing. Requires a condition stream (dim_aux > 0).
+                          token by its local forcing. Register/class tokens keep the global
+                          condition. Requires a condition stream (dim_aux > 0).
 
     ``forward`` returns ``(tokens, condition)``: token-nudge modes modify ``tokens``,
     conditioning modes modify ``condition``.
@@ -413,7 +431,15 @@ class ForcingInjection(nn.Module):
             condition = condition + self.gate * g
         elif self.mode == "adaln_local":
             # per-cell conditioning: broadcast the global daytime condition, add per-cell forcing
-            base = condition.reshape(1, -1) if condition.numel() > 0 else 0.0
-            condition = base + self.gate * self.cond_proj(cell_emb)  # (num_cells, dim_aux)
+            base = (
+                condition.reshape(1, -1)
+                if condition.numel() > 0
+                else torch.zeros(1, self.dim_aux, dtype=cell_emb.dtype, device=cell_emb.device)
+            )
+            per_cell = base + self.gate * self.cond_proj(cell_emb)  # (num_cells, dim_aux)
+            # register/class tokens carry no forcing: they keep the global condition, so the
+            # condition has one row per token and broadcasts in the FE's AdaLN
+            aux = base.expand(num_aux, -1).to(per_cell.dtype)
+            condition = torch.cat([aux, per_cell], dim=0)  # (num_aux + num_cells, dim_aux)
 
         return tokens, condition

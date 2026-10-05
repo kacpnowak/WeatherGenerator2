@@ -37,7 +37,7 @@ from weathergen.model.engines import (
     TargetPredictionEngine,
     TargetPredictionEngineClassic,
 )
-from weathergen.model.forcing import ForcingInjection
+from weathergen.model.forcing import ForcingInjection, forcing_num_vars_from_cfg
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.norms import AdaLayerNorm
 from weathergen.model.utils import get_num_parameters
@@ -449,13 +449,10 @@ class Model(torch.nn.Module):
             mode = inj.get("mode", "none")
             if mode == "none":
                 continue
-            source_channels = stream_cfg.get("train_source_channels") or stream_cfg.get(
-                "val_source_channels", []
-            )
             # dim_embed must equal the FE token dim so additive/cross_attn line up; the
             # global/adaln_local modes then project this down to the conditioning dim.
             self.forcing_module = ForcingInjection(
-                num_vars=len(source_channels),
+                num_vars=forcing_num_vars_from_cfg(stream_cfg),
                 dim_embed=cf.ae_global_dim_embed,
                 mode=mode,
                 dim_aux=self.forecast_aux_infos,
