@@ -7,16 +7,210 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-FESOM_ELEM :
+FESOM_ELEMS :
   type : fesom
   stream_id : 2137
-  filenames : ['ocean_elem']
+  filenames : ['/e/data1/climateai/hclimrep/data/ifs-fesom/ocean_elem']
   loss_weight : 1.
-  source : null
-  target : null
+  # Elements below the bathymetry are stored as 0.0, not as missing data (u_6125/v_6125
+  # are 100% fill). Turn them into NaN in the targets so the loss ignores them.
+  # Sources keep the fill as-is.
+  target_fill_value : 0.0
+  source :
+  - u_2
+  - u_7
+  - u_15
+  - u_25
+  - u_35
+  - u_45
+  - u_55
+  - u_65
+  - u_75
+  - u_85
+  - u_95
+  - u_107
+  - u_125
+  - u_147
+  - u_175
+  - u_210
+  - u_255
+  - u_310
+  - u_375
+  - u_450
+  - u_535
+  - u_630
+  - u_735
+  - u_850
+  - u_975
+  - u_1110
+  - u_1255
+  - u_1415
+  - u_1600
+  - u_1810
+  - u_2035
+  - u_2275
+  - u_2525
+  - u_2775
+  - u_3025
+  - u_3275
+  - u_3525
+  - u_3775
+  - u_4025
+  - u_4275
+  - u_4525
+  - u_4775
+  - u_5025
+  - u_5275
+  - u_5525
+  - u_5825
+  - u_6125
+  - v_2
+  - v_7
+  - v_15
+  - v_25
+  - v_35
+  - v_45
+  - v_55
+  - v_65
+  - v_75
+  - v_85
+  - v_95
+  - v_107
+  - v_125
+  - v_147
+  - v_175
+  - v_210
+  - v_255
+  - v_310
+  - v_375
+  - v_450
+  - v_535
+  - v_630
+  - v_735
+  - v_850
+  - v_975
+  - v_1110
+  - v_1255
+  - v_1415
+  - v_1600
+  - v_1810
+  - v_2035
+  - v_2275
+  - v_2525
+  - v_2775
+  - v_3025
+  - v_3275
+  - v_3525
+  - v_3775
+  - v_4025
+  - v_4275
+  - v_4525
+  - v_4775
+  - v_5025
+  - v_5275
+  - v_5525
+  - v_5825
+  - v_6125
+  target : 
+  - u_2
+  - u_7
+  - u_15
+  - u_25
+  - u_35
+  - u_45
+  - u_55
+  - u_65
+  - u_75
+  - u_85
+  - u_95
+  - u_107
+  - u_125
+  - u_147
+  - u_175
+  - u_210
+  - u_255
+  - u_310
+  - u_375
+  - u_450
+  - u_535
+  - u_630
+  - u_735
+  - u_850
+  - u_975
+  - u_1110
+  - u_1255
+  - u_1415
+  - u_1600
+  - u_1810
+  - u_2035
+  - u_2275
+  - u_2525
+  - u_2775
+  - u_3025
+  - u_3275
+  - u_3525
+  - u_3775
+  - u_4025
+  - u_4275
+  - u_4525
+  - u_4775
+  - u_5025
+  - u_5275
+  - u_5525
+  - u_5825
+  - u_6125
+  - v_2
+  - v_7
+  - v_15
+  - v_25
+  - v_35
+  - v_45
+  - v_55
+  - v_65
+  - v_75
+  - v_85
+  - v_95
+  - v_107
+  - v_125
+  - v_147
+  - v_175
+  - v_210
+  - v_255
+  - v_310
+  - v_375
+  - v_450
+  - v_535
+  - v_630
+  - v_735
+  - v_850
+  - v_975
+  - v_1110
+  - v_1255
+  - v_1415
+  - v_1600
+  - v_1810
+  - v_2035
+  - v_2275
+  - v_2525
+  - v_2775
+  - v_3025
+  - v_3275
+  - v_3525
+  - v_3775
+  - v_4025
+  - v_4275
+  - v_4525
+  - v_4775
+  - v_5025
+  - v_5275
+  - v_5525
+  - v_5825
+  - v_6125
   masking_rate : 0.6
   masking_rate_none : 0.05
-  token_size : 128
+  token_size : 64
+  location_weight : cosine_latitude
+  tokenize_spacetime : True
   embed : 
     net : transformer
     num_tokens : 1
@@ -24,7 +218,7 @@ FESOM_ELEM :
     dim_embed : 256
     num_blocks : 2
   embed_target_coords :
-    net : linear
+    net : mlp
     dim_embed : 256
   target_readout :
     num_layers : 2

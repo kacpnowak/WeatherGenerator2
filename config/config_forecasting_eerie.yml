@@ -82,15 +82,14 @@ latent_noise_saturate_encodings: 5
 latent_noise_use_additive_noise: False
 latent_noise_deterministic_latents: True 
 
-freeze_modules: ""
-load_chkpt: {}
+freeze_modules: "" #".*global.*|.*local.*|.*adapter.*|.*q_cells.*|.*latent.*|.*FESOM.*"
 
 norm_type: "LayerNorm"
 
 #####################################
 
-streams_directory: "./config/streams/eerie_native/"
-streams: ???
+streams_directory: "./config/streams/fesom/"
+# streams: ???
 
 # type of zarr_store
 zarr_store: "zip" # "zarr" for LocalStore, "zip" for ZipStore
@@ -98,7 +97,6 @@ zarr_store: "zip" # "zarr" for LocalStore, "zip" for ZipStore
 general:
 
   # mutable parameters
-  istep: 0
   rank: ???
   world_size: ???
 
@@ -113,7 +111,7 @@ general:
 
   desc: ""
   run_id: ???
-  run_history: []
+  # run_history: []
 
 # logging frequency in the training loop (in number of batches)
 train_logging:
@@ -124,7 +122,7 @@ train_logging:
 # parameters for data loading
 data_loading :
 
-  num_workers: 12
+  num_workers: 8
   rng_seed: ???
   repeat_data_in_mini_epoch : False
 
@@ -139,8 +137,8 @@ training_config:
   samples_per_mini_epoch: 4096
   shuffle: True
 
-  start_date: 1950-01-01T00:00
-  end_date: 2004-12-31T00:00
+  start_date: 2000-01-01T00:00
+  end_date: 2207-12-31T00:00
 
   time_window_step: 24:00:00
   time_window_len: 24:00:00
@@ -170,7 +168,13 @@ training_config:
   losses : {
     "physical": {
         type: LossPhysical,
-        loss_fcts: { "mse": { }, },
+        loss_fcts: { 
+          "mse": { }, 
+          "dynamic_loss": {
+                L: 20.0,
+                window: 128,
+            }
+          },
         },
     }
   
@@ -184,7 +188,7 @@ training_config:
   forecast :
       time_step: 24:00:00
       offset: 1
-      num_steps: 3
+      num_steps: 5
       policy: "fixed"
 
 
@@ -194,12 +198,12 @@ validation_config:
   samples_per_mini_epoch: 256
   shuffle: False
 
-  start_date: 2004-01-01T00:00
-  end_date: 2009-12-31T00:00
+  start_date: 2207-01-01T00:00
+  end_date: 2209-12-31T00:00
   
   # whether to track the exponential moving average of weights for validation
   validate_with_ema: 
-    enabled : True
+    enabled : False
     ema_ramp_up_ratio: 0.09
     ema_halflife_in_thousands: 1e-3
 

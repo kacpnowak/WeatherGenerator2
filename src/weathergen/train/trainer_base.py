@@ -9,6 +9,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import datetime
 import os
 
 import torch
@@ -20,6 +21,11 @@ from weathergen.train.utils import str_to_tensor, tensor_to_str
 from weathergen.utils.distributed import is_root
 
 PORT = 1345
+# Timeout for collectives on the default process group. The NCCL default of 10min
+# is too tight for long rollout steps (a training step can take several minutes):
+# a single slow data read on one rank leaves the other ranks blocked in the FSDP
+# all-gather and the watchdog then aborts the whole job.
+COLLECTIVE_TIMEOUT = datetime.timedelta(hours=1)
 
 
 class TrainerBase:
@@ -108,6 +114,7 @@ class TrainerBase:
                 device_id=device,
                 rank=rank,
                 init_method=f"tcp://{master_addr}:{master_port}",
+                timeout=COLLECTIVE_TIMEOUT,
             )
             print(f"Process group initialized ({backend}).")
 

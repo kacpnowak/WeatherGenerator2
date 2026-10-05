@@ -1,5 +1,3 @@
-# This file controls the conversion from Zarr format to CF-compliant NetCDF files in weathergen.evaluate.zarr_nc.zarr_to_netcdf.
-# It defines the mapping of variable and dimension names, their standard names, units, and level types.
 variables:
   q:
     var: q
@@ -36,7 +34,7 @@ variables:
     wg_unit: m**2 s**-2
     std_unit: m2 s-2
     level_type: pl
-    scale_factor: 1.0 #0.10197 #1/9.80665
+    scale_factor: 1.0
   10u:
     var: u10
     long: u_wind_at_10m
@@ -62,7 +60,6 @@ variables:
     var: t2m
     long: temperature_at_screen_level
     std: air_temperature
-    #near-surface (usually, 2 meter) : https://pcmdi.llnl.gov/mips/cmip3/variableList.html
     wg_unit: K
     std_unit: K
     level_type: sfc
@@ -75,8 +72,6 @@ variables:
     level_type: sfc
   skt:
     var: skt
-    # The standard name for skin temperature is sea_surface_skin_temperature, which is defined as "The temperature of the very thin layer at the surface of the sea that is in contact with the atmosphere".
-  # It is strongly recommended that a variable with this standard name should have a units_metadata attribute, with one of the values "on-scale" or "difference", whichever is appropriate for the data, because it is essential to know whether the temperature is on-scale (meaning relative to the origin of the scale indicated by the units) or refers to temperature differences (implying that the origin of the temperature scale is irrevelant)
     long: skin_temperature
     std: sea_surface_skin_temperature
     wg_unit: K

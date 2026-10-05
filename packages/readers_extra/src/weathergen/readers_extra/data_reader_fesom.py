@@ -624,6 +624,7 @@ class DataReaderFesom(DataReaderTimestep):
         -------
         Normalized data
         """
+        self._lazy_init()
         assert source.shape[-1] == len(self.source_idx), "incorrect number of source channels"
         for i, ch in enumerate(self.source_idx):
             source[..., i] = (source[..., i] - self.source_mean[ch]) / self.source_stdev[ch]
@@ -635,6 +636,12 @@ class DataReaderFesom(DataReaderTimestep):
         """
         Normalize target channels
 
+        Values equal to the stream's optional ``target_fill_value`` are turned into NaN
+        so that the loss masks them out. FESOM stores points below the bathymetry as a
+        fill value (0.0) rather than as missing data; without this, a deep channel that
+        is mostly or entirely fill would be trained on and scored against that constant.
+        Sources are deliberately left alone: the model still receives the fill as input.
+
         Parameters
         ----------
         data :
@@ -644,7 +651,14 @@ class DataReaderFesom(DataReaderTimestep):
         -------
         Normalized data
         """
+        self._lazy_init()
         assert target.shape[-1] == len(self.target_idx), "incorrect number of target channels"
+
+        fill_value = self._stream_info.get("target_fill_value")
+        if fill_value is not None:
+            target = target.astype(np.float32, copy=False)
+            target[target == fill_value] = np.nan
+
         for i, ch in enumerate(self.target_idx):
             target[..., i] = (target[..., i] - self.target_mean[ch]) / self.target_stdev[ch]
 
@@ -664,6 +678,7 @@ class DataReaderFesom(DataReaderTimestep):
         -------
         Denormalized data
         """
+        self._lazy_init()
         assert source.shape[-1] == len(self.source_idx), "incorrect number of source channels"
         for i, ch in enumerate(self.source_idx):
             source[..., i] = (source[..., i] * self.source_stdev[ch]) + self.source_mean[ch]
@@ -684,6 +699,7 @@ class DataReaderFesom(DataReaderTimestep):
         -------
         Denormalized data
         """
+        self._lazy_init()
         assert data.shape[-1] == len(self.target_idx), "incorrect number of target channels"
         for i, ch in enumerate(self.target_idx):
             data[..., i] = (data[..., i] * self.target_stdev[ch]) + self.target_mean[ch]

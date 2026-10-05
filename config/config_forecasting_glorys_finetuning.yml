@@ -1,0 +1,85 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+#
+# Finetuning config for the v2 GLORYS model (glorys_20260730_223127 lineage) with
+# the ATMO radiation swap: config/streams/glorys_v2/atmo.yml replaces the dead
+# msl/cp forcing slots with ssrd/strd (surface downward short/longwave radiation)
+# from the 1979-2024 ERA5 zarr. Channel count and positions 0-3 of the ATMO
+# embedding are unchanged, so a v2 checkpoint loads directly; the frozen-core
+# finetune below lets the ATMO branch relearn the two replaced slots.
+#
+# Usage (continue from a v2 checkpoint):
+#   python src/weathergen/run_train.py train --from-run-id glorys_20260730_223127 \
+#     --config config/config_forecasting_glorys_finetuning.yml
+#
+# NOTE: the ATMO zarr ends 2024-12-31T18. Training end_date is capped to 2023-12-31
+# here (unlike the v2 run's 2025-03-23) for two reasons: it keeps every sampled
+# window inside the ATMO forcing coverage, and it keeps the OceanBench benchmark
+# year (2024) out of training.
+# streams_directory: "./config/streams/glorys_v2/"
+# 2026-08-10: nothing frozen - continued base-style training whose only change
+# from the base recipe is the static surface channel weights in
+# glorys_v2/glorys.yml (zos 4.0, top-5 levels 2.0). The frozen-core +
+# surface-weights variant (glory_finetuning_20260810_115732) showed no surface
+# gain through epoch 4.
+freeze_modules: ".*global.*|.*local.*|.*adapter.*|.*q_cells.*|.*forecast_engine.*|.*latent.*|.*GLORYS.*"
+
+train_logging:
+  terminal: 10
+  metrics: 20
+  checkpoint: 64
+
+# parameters for data loading
+data_loading :
+  num_workers: 8
+
+general:
+
+  # mutable parameters
+  # istep: 0
+  run_id: ???
+
+# config for training
+training_config:
+
+  # training_mode: "masking", "student_teacher", "latent_loss"
+  training_mode: ["masking"]
+
+  num_mini_epochs: 8
+  samples_per_mini_epoch: 1024
+
+  # Full training range for the unfrozen run: with everything trainable, a
+  # single-year window risks forgetting the long-record climatology (we
+  # watched the unfrozen base drift on far more data). Set back to
+  # 2023-01-01 if single-year sampling is wanted anyway.
+  start_date: 2014-01-01T00:00
+  end_date: 2023-12-31T00:00
+
+  forecast :
+      time_step: 24:00:00
+      offset: 1
+      num_steps: 10
+      policy: "fixed"
+      pushforward: False
+
+
+validation_config:
+
+  samples_per_mini_epoch: 16
+
+  # The base run's validation window (2025-03-24 -> 2026-03-24) lies entirely
+  # OUTSIDE the ATMO forcing zarr (ends 2024-12-31), so validation there runs
+  # with no atmospheric forcing and its loss punishes exactly the forcing
+  # reliance we are training in. Validate on 2022 instead: fully inside ATMO
+  # coverage, disjoint from the 2023 training window above, and keeps the 2024
+  # benchmark year untouched. (2022 was seen by the frozen base during
+  # pretraining - unavoidable for any in-coverage year - but the trainable
+  # ATMO branch never trains on it in this run.)
+  start_date: 2024-01-01T00:00
+  end_date: 2024-12-31T00:00

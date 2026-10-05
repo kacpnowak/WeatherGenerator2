@@ -136,6 +136,9 @@ def lp_loss(
     This function computes the Lp-norm for any arbitrary integer p < inf.
     By default, the Lp-norm is normalized by the number of samples (i.e. with_mean=True).
     * For example: p=1 corresponds to MAE; p=2 corresponds to MSE.
+    NaN targets are masked out and, per channel, the mean is taken over that channel's
+    valid points only, so a channel is not penalised for being sparsely observed. A
+    channel without a single valid point evaluates to exactly 0.
     The samples are weighted by location if weights_points is not None.
     The norm can optionally be normalised by the pth root.
     * For example: p=2 and with_p_root=True corresponds to RMSE.
@@ -144,7 +147,7 @@ def lp_loss(
     The function implements:
 
     loss = Mean_{channels}  ( weight_channels *
-                                ( Mean_{data_pts}(|(target - pred)|**p * weights_points)
+                                ( Mean_{valid_data_pts}(|(target - pred)|**p * weights_points)
                                 ) ** (1/p)
                             )
 
@@ -168,7 +171,7 @@ def lp_loss(
 
     The computations are:
     1. weight the rows of |(target - pred)|**p by wp = weights_points (if given)
-    2. take the mean over the row
+    2. take the mean over the row, counting only points where the target is not NaN
     3. weight the collapsed cols by wc = weights_channels (if given)
     4. take the mean over the channel-weighted cols
 
@@ -196,7 +199,14 @@ def lp_loss(
     )
     if weights_points is not None:
         diff_p = (diff_p.transpose(1, 0) * weights_points).transpose(1, 0)
-    loss_chs = diff_p.mean(0) if with_mean else diff_p.sum(0)
+    if with_mean:
+        # Average per channel over its valid (non-NaN) points only. Averaging over all
+        # points instead would scale a channel's loss by its fraction of valid points,
+        # which silently starves sparsely observed channels of gradient. Channels
+        # without any valid point yield exactly 0.
+        loss_chs = diff_p.sum(0) / mask_nan.sum(0).clamp(min=1)
+    else:
+        loss_chs = diff_p.sum(0)
     loss_chs = torch.pow(loss_chs, 1.0 / p_norm) if with_p_root else loss_chs
     loss = torch.mean(loss_chs * weights_channels if weights_channels is not None else loss_chs)
 

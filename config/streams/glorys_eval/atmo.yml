@@ -5,6 +5,20 @@ ATMO:
   loss_weight : 0.0
   # channel order the checkpoint glorys_cont3_c1 was trained with
   channels_order : ['10u', '10v', '2d', '2t', 'cp', 'msl']
+  # Normalize with the ERA5 statistics the checkpoints were trained with
+  # (aifs-ea-an-oper-0001-mars-n320-1979-2023-6h-v8.zarr), not the IFS parquet's
+  # own stats: the parquet stats are computed on the unweighted regular grid
+  # (pole-oversampled: 2t mean 278.6/std 19.9 vs trained 287.2/15.5, ~+0.4 sigma
+  # input shift) and cp's stats are NaN (0/1 fallback zeroes the channel).
+  # Caveat: cp accumulation window may differ between products (amplitude ~18x
+  # low after this override) - still closer to trained distribution than 0/1.
+  stats_override :
+    2t: {mean: 287.20354310694995, var: 241.70868804321796}
+    2d: {mean: 282.2128525606813, var: 233.01505029361576}
+    10u: {mean: -0.3425378720223225, var: 30.424549871923276}
+    10v: {mean: 0.17550967089639657, var: 21.002649663417987}
+    msl: {mean: 101135.69349630405, var: 1279392.4532890317}
+    cp: {mean: 0.0003921354595720081, var: 1.6933063120921514e-06}
   source :
   - 2t
   - 2d

@@ -204,6 +204,20 @@ class DataReaderMesh(DataReaderTimestep):
 
         self.available_channels = list(self.col_map.keys())
 
+        # Optional per-channel normalization-stats override (e.g. to normalize
+        # forcing with the statistics a checkpoint was trained with, when the
+        # inference-time file carries different — or broken — stats).
+        stats_override = stream_info.get("stats_override")
+        if stats_override:
+            for ch, st in stats_override.items():
+                if ch not in self.col_map:
+                    raise ValueError(
+                        f"[Stream {stream_info.get('name')}] stats_override lists channel "
+                        f"{ch!r} not available in {self.filename_source} / {self.filename_target}"
+                    )
+                self.stats_means[ch] = float(st["mean"])
+                self.stats_vars[ch] = float(st["var"])
+
         super().__init__(tw_handler, stream_info, data_start_time, data_end_time, period)
 
         self.source_idx = self._select_channels("source")
@@ -213,6 +227,37 @@ class DataReaderMesh(DataReaderTimestep):
 
         self.source_channels = [self.available_channels[i] for i in self.source_idx]
         self.target_channels = [self.available_channels[i] for i in self.target_idx]
+
+        # Optional static per-channel loss weights (multiplied on top of the
+        # DynamicLossEMA weights in LossPhysical). Config gives a mapping
+        # {channel name: weight}; unlisted target channels default to 1.0.
+        # NB MultiStreamDataSampler writes the expanded per-channel list back into
+        # stream_info under the same key, so a later reader instantiation may see
+        # a list instead of the config mapping - pass it through unchanged then.
+        weights_cfg = stream_info.get("target_channel_weights")
+        # NB the config arrives as an OmegaConf DictConfig, not a plain dict, so
+        # detect mapping-ness by the presence of keys() rather than isinstance.
+        is_mapping = hasattr(weights_cfg, "keys")
+        if weights_cfg is not None and not is_mapping:
+            weights_cfg = None if len(weights_cfg) == 0 else weights_cfg
+            if weights_cfg is not None:
+                if len(weights_cfg) != len(self.target_channels):
+                    raise ValueError(
+                        f"[Stream {stream_info.get('name')}] target_channel_weights list "
+                        f"has {len(weights_cfg)} entries for {len(self.target_channels)} "
+                        f"target channels"
+                    )
+                self.target_channel_weights = [float(w) for w in weights_cfg]
+        elif weights_cfg is not None and len(weights_cfg) > 0:
+            unknown = [ch for ch in weights_cfg if ch not in self.target_channels]
+            if unknown:
+                raise ValueError(
+                    f"[Stream {stream_info.get('name')}] target_channel_weights lists "
+                    f"channels that are not target channels: {unknown}"
+                )
+            self.target_channel_weights = [
+                float(weights_cfg.get(ch, 1.0)) for ch in self.target_channels
+            ]
 
         self._init_stats_arrays()
 

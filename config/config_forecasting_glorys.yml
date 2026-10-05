@@ -1,0 +1,36 @@
+streams_directory: "./config/streams/glorys_v2/"
+freeze_modules: ".*global.*|.*adapter.*|.*q_cells.*|.*aggregation.*|.*latent.*|.*fe_.*"
+
+# ae_local_max_tokens_per_cell: 256
+
+general:
+  istep: 0
+
+training_config:
+  
+  # training_mode: "masking", "student_teacher", "latent_loss"
+  training_mode: ["masking"]
+
+  num_mini_epochs: 64
+  samples_per_mini_epoch: 4096
+  shuffle: True
+
+#   start_date: 1993-01-01T00:00
+#   end_date: 2025-03-23T00:00
+
+#   time_window_step: 24:00:00
+#   time_window_len: 24:00:00
+
+#   forecast :
+#     time_step: 24:00:00
+#     offset: 1
+#     num_steps: 4
+#     policy: "fixed"
+
+# validation_config: 
+
+#   samples_per_mini_epoch: 128
+#   shuffle: False
+
+#   start_date: 2025-03-24T00:00
+#   end_date: 2026-03-24T00:00

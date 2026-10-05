@@ -1,4 +1,4 @@
-GLORYS:
+GLORYS2:
   type: mesh
   stream_id: 2137
   loss_weight: 1.0
@@ -406,16 +406,38 @@ GLORYS:
   - vo_380.213m
   - vo_453.938m
   - vo_541.089m
-  - siconc
-  - sithick
-  - usi
-  - vsi
+  # Static per-channel loss weights for surface-focused finetuning: multiplied
+  # on top of the DynamicLossEMA (Samudra-2) weights in LossPhysical, train only.
+  # zos and the top ~5m of each 3-D field are up-weighted to close the day-1
+  # surface gap; unlisted channels default to 1.0.
+  target_channel_weights:
+    zos: 4.0
+    thetao_0.494025m: 2.0
+    thetao_1.54138m: 2.0
+    thetao_2.64567m: 2.0
+    thetao_3.81949m: 2.0
+    thetao_5.07822m: 2.0
+    so_0.494025m: 2.0
+    so_1.54138m: 2.0
+    so_2.64567m: 2.0
+    so_3.81949m: 2.0
+    so_5.07822m: 2.0
+    uo_0.494025m: 2.0
+    uo_1.54138m: 2.0
+    uo_2.64567m: 2.0
+    uo_3.81949m: 2.0
+    uo_5.07822m: 2.0
+    vo_0.494025m: 2.0
+    vo_1.54138m: 2.0
+    vo_2.64567m: 2.0
+    vo_3.81949m: 2.0
+    vo_5.07822m: 2.0
   location_weight : cosine_latitude
   masking_rate : 0.6
   masking_rate_none : 0.05
   token_size : 32
   tokenize_spacetime : True
-  max_num_targets: -1
+  max_num_targets: 16384
   embed :
     net : transformer
     num_tokens : 1

@@ -1,0 +1,59 @@
+global_plotting_options:
+ regions: ["global"]
+ image_format : "png" 
+ animation_format: "mp4"
+ dpi_val : 300
+ fps: 4
+#  EERIE_ATMO:
+#    use_datashader: true
+ FESOM_ELEM:
+  use_datashader: True
+    # scale_marker: 0.1
+    # marker_size: 0.3
+ FESOM_NODE:
+  use_datashader: True
+    # scale_marker: 0.1
+    # marker_size: 0.3
+
+evaluation:
+  metrics  : ["rmse", "froct"]
+  regions: ["global"]
+  summary_plots : true
+  ratio_plots : false
+  heat_maps : false
+  summary_dir: "./plots/"
+  plot_ensemble: "false" #supported: false, "std", "minmax", "members"
+  plot_score_maps: false #plot scores on a 2D maps. it slows down score computation 
+  print_summary: false #print out score values on screen. it can be verbose
+  log_scale: false
+  add_grid: false
+  score_cards: false
+  bar_plots: false
+
+default_streams:
+  FESOM_ELEM:
+    channels: ["u_2", "v_2", "u_95", "v_95", "u_450", "v_450"]
+    evaluation:
+      forecast_step: "all"
+      sample: "all"
+    plotting:
+      forecast_step: "all"
+      sample: "all"
+      plot_maps: true
+      plot_bias: true
+      plot_target: true
+      plot_histograms: true
+      plot_animations: true
+  FESOM_NODE:
+    channels: ['ssh', 'temp_2', 'salt_2', 'temp_95', 'salt_95', 'temp_450', 'salt_450'] 
+    evaluation:
+      forecast_step: "all"
+      sample: "all"
+    plotting:
+      forecast_step: "all"
+      sample: "all"
+      plot_maps: true
+      plot_bias: true
+      plot_target: true
+      plot_histograms: true
+      plot_animations: true

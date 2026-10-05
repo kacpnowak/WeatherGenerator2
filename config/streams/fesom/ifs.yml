@@ -10,14 +10,25 @@
 IFS_ATMO :
   type : fesom
   stream_id : 2139
-  filenames : ['atmos_all']
+  filenames : ['/e/data1/climateai/hclimrep/data/ifs-fesom/atmos_all']
   loss_weight : 1.
-  source : null
-  target : ["2t"]
+  source : 
+  - 2t
+  - 2d
+  - 10u
+  - 10v
+  - msl
+  - cp
+  - lsp
+  - tsr
+  - tsrc
+  target : [""]
   target_exclude: ['msl', 'tsr', 'tsrc', 'z']
   masking_rate : 0.6
   masking_rate_none : 0.05
-  token_size : 128
+  token_size : 64
+  location_weight : cosine_latitude
+  tokenize_spacetime : True
   embed : 
     net : transformer
     num_tokens : 1
@@ -29,8 +40,8 @@ IFS_ATMO :
     dim_embed : 256
   target_readout :
     num_layers : 2
-    num_heads : 4
+    num_heads : 0
     # sampling_rate : 0.2
   pred_head :
     ens_size : 1
-    num_layers : 1
+    num_layers : 0

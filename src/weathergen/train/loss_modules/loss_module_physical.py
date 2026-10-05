@@ -73,11 +73,19 @@ class DynamicLossEMA:
             return
 
         with torch.no_grad():
-            mse_per_chan = loss_lfct_chs.detach().clamp(min=1e-6)
-            inv_mse = 1.0 / mse_per_chan
-            self.channel_weights_ema[stream_name] = (
-                1.0 - 1.0 / self.window
-            ) * self.channel_weights_ema[stream_name] + (1.0 / self.window) * inv_mse
+            losses = loss_lfct_chs.detach()
+            # A channel whose targets are all missing reports a loss of exactly 0 (and a
+            # spoofed one may report NaN). Feeding either into the inverse would pin the
+            # channel at the clamp maximum in get_weights and starve every real channel,
+            # so leave those channels at their previous EMA value.
+            has_signal = losses > 0.0
+            if not bool(has_signal.any()):
+                return
+
+            inv_mse = 1.0 / losses.clamp(min=1e-6)
+            ema = self.channel_weights_ema[stream_name]
+            updated = (1.0 - 1.0 / self.window) * ema + (1.0 / self.window) * inv_mse
+            self.channel_weights_ema[stream_name] = torch.where(has_signal, updated, ema)
 
 
 class LossPhysical(LossModuleBase):
@@ -295,7 +303,9 @@ class LossPhysical(LossModuleBase):
             if self.dynamic_loss_ema.enabled and weights_channels is not None:
                 losses_all[stream_name][str(self.forecast_offset)]["mse_ema_weight"] = {}
                 for ch_n, w in zip(target_channels, weights_channels, strict=True):
-                    losses_all[stream_name][str(self.forecast_offset)]["mse_ema_weight"][ch_n] = w.item()
+                    losses_all[stream_name][str(self.forecast_offset)]["mse_ema_weight"][ch_n] = (
+                        w.item()
+                    )
 
             # TODO: make nicer
             output_step_loss_weights = self._get_output_step_weights(len(targets.output_idxs))

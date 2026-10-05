@@ -1,0 +1,26 @@
+# OceanBench inference config for the v2 model family (GLORYS2 133-channel
+# stream + radiation ATMO), sibling of the frozen v1 file
+# `config_forecasting_glorys_obench.yml` - same keys, only streams_directory
+# differs.
+#
+# IMPORTANT: run with this file as `--config` and do NOT also pass
+# `--options streams_directory=...`: each config source carrying a
+# streams_directory loads its own stream set and OmegaConf MERGES the stream
+# dicts across sources instead of replacing them (config.py::_load_config), so
+# a config file pointing at glorys_eval plus an --options override pointing at
+# glorys_v2_eval yields the union {ATMO, GLORYS, GLORYS2} and checkpoint
+# loading fails on the phantom GLORYS embeds. (Invisible in the v1 driver,
+# where both sources named the same directory.)
+
+streams_directory: "./config/streams/glorys_v2_eval/"
+
+general:
+  istep: 0
+
+training_config:
+  # training_mode: "masking", "student_teacher", "latent_loss"
+  training_mode: ["masking"]
+
+  num_mini_epochs: 64
+  samples_per_mini_epoch: 4096
+  shuffle: True

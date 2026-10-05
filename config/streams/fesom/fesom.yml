@@ -7,16 +7,212 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-FESOM_NODE :
+FESOM_NODES :
   type : fesom
   stream_id : 2138
-  filenames : ['ocean_node']
+  filenames : ['/e/data1/climateai/hclimrep/data/ifs-fesom/ocean_node']
   loss_weight : 1.
-  source : null
-  target : ["sst", "sss", "ssh", "temp_", "salt_"]
+  # Nodes below the bathymetry are stored as 0.0, not as missing data (30-100% of the
+  # nodes depending on depth; temp_6125/salt_6125 are 100% fill). Turn them into NaN in
+  # the targets so the loss ignores them. Sources keep the fill as-is.
+  target_fill_value : 0.0
+  source :
+  - ssh
+  - temp_2
+  - temp_7
+  - temp_15
+  - temp_25
+  - temp_35
+  - temp_45
+  - temp_55
+  - temp_65
+  - temp_75
+  - temp_85
+  - temp_95
+  - temp_107
+  - temp_125
+  - temp_147
+  - temp_175
+  - temp_210
+  - temp_255
+  - temp_310
+  - temp_375
+  - temp_450
+  - temp_535
+  - temp_630
+  - temp_735
+  - temp_850
+  - temp_975
+  - temp_1110
+  - temp_1255
+  - temp_1415
+  - temp_1600
+  - temp_1810
+  - temp_2035
+  - temp_2275
+  - temp_2525
+  - temp_2775
+  - temp_3025
+  - temp_3275
+  - temp_3525
+  - temp_3775
+  - temp_4025
+  - temp_4275
+  - temp_4525
+  - temp_4775
+  - temp_5025
+  - temp_5275
+  - temp_5525
+  - temp_5825
+  - temp_6125
+  - salt_2
+  - salt_7
+  - salt_15
+  - salt_25
+  - salt_35
+  - salt_45
+  - salt_55
+  - salt_65
+  - salt_75
+  - salt_85
+  - salt_95
+  - salt_107
+  - salt_125
+  - salt_147
+  - salt_175
+  - salt_210
+  - salt_255
+  - salt_310
+  - salt_375
+  - salt_450
+  - salt_535
+  - salt_630
+  - salt_735
+  - salt_850
+  - salt_975
+  - salt_1110
+  - salt_1255
+  - salt_1415
+  - salt_1600
+  - salt_1810
+  - salt_2035
+  - salt_2275
+  - salt_2525
+  - salt_2775
+  - salt_3025
+  - salt_3275
+  - salt_3525
+  - salt_3775
+  - salt_4025
+  - salt_4275
+  - salt_4525
+  - salt_4775
+  - salt_5025
+  - salt_5275
+  - salt_5525
+  - salt_5825
+  - salt_6125
+  target : 
+  - ssh
+  - temp_2
+  - temp_7
+  - temp_15
+  - temp_25
+  - temp_35
+  - temp_45
+  - temp_55
+  - temp_65
+  - temp_75
+  - temp_85
+  - temp_95
+  - temp_107
+  - temp_125
+  - temp_147
+  - temp_175
+  - temp_210
+  - temp_255
+  - temp_310
+  - temp_375
+  - temp_450
+  - temp_535
+  - temp_630
+  - temp_735
+  - temp_850
+  - temp_975
+  - temp_1110
+  - temp_1255
+  - temp_1415
+  - temp_1600
+  - temp_1810
+  - temp_2035
+  - temp_2275
+  - temp_2525
+  - temp_2775
+  - temp_3025
+  - temp_3275
+  - temp_3525
+  - temp_3775
+  - temp_4025
+  - temp_4275
+  - temp_4525
+  - temp_4775
+  - temp_5025
+  - temp_5275
+  - temp_5525
+  - temp_5825
+  - temp_6125
+  - salt_2
+  - salt_7
+  - salt_15
+  - salt_25
+  - salt_35
+  - salt_45
+  - salt_55
+  - salt_65
+  - salt_75
+  - salt_85
+  - salt_95
+  - salt_107
+  - salt_125
+  - salt_147
+  - salt_175
+  - salt_210
+  - salt_255
+  - salt_310
+  - salt_375
+  - salt_450
+  - salt_535
+  - salt_630
+  - salt_735
+  - salt_850
+  - salt_975
+  - salt_1110
+  - salt_1255
+  - salt_1415
+  - salt_1600
+  - salt_1810
+  - salt_2035
+  - salt_2275
+  - salt_2525
+  - salt_2775
+  - salt_3025
+  - salt_3275
+  - salt_3525
+  - salt_3775
+  - salt_4025
+  - salt_4275
+  - salt_4525
+  - salt_4775
+  - salt_5025
+  - salt_5275
+  - salt_5525
+  - salt_5825
+  - salt_6125
   masking_rate : 0.6
   masking_rate_none : 0.05
-  token_size : 128
+  token_size : 64
+  location_weight : cosine_latitude
+  tokenize_spacetime : True
   embed : 
     net : transformer
     num_tokens : 1
@@ -24,7 +220,7 @@ FESOM_NODE :
     dim_embed : 256
     num_blocks : 2
   embed_target_coords :
-    net : linear
+    net : mlp
     dim_embed : 256
   target_readout :
     num_layers : 2

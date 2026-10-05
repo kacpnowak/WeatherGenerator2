@@ -1,12 +1,12 @@
-GLORYS:
+# Stream name must match the training stream (glorys_v2/glorys.yml: GLORYS2) --
+# it keys the checkpoint's embedding modules (embeds.<name>.*).
+GLORYS2:
   type: mesh
   stream_id: 2137
   loss_weight: 1.0
   filenames:
-  # !!! LOUD WARNING: this file DOES NOT EXIST YET as of writing this config. !!!
-  # It must be rebuilt (same pipeline used for the v2/v3 nowcast rebuild, see Task 1c) with
-  # ice (siconc/sithick/usi/vsi) added and the full <=541.089m depth axis, before this eval
-  # config can be used for any v2-model evaluation.
+  # Built 2026-08-04 (glorys_ic_rebuild/REPORT_v3_rebuild.md): 133 channels incl. ice,
+  # 54 Tuesday stamps, all acceptance checks passed.
   - /e/data1/climateai/hclimrep/data/glorys_forcings/glo_nowcast_025_v3_fixed.parq
   # training file: supplies the normalization statistics the checkpoint was trained with
   target_file: /e/data1/climateai/hclimrep/data/glorys_025/glorys_025_mesh_fixed.parq
@@ -411,10 +411,6 @@ GLORYS:
   - vo_380.213m
   - vo_453.938m
   - vo_541.089m
-  - siconc
-  - sithick
-  - usi
-  - vsi
   location_weight : cosine_latitude
   masking_rate : 0.6
   masking_rate_none : 0.05
