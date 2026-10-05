@@ -105,6 +105,12 @@ def test_stack_with_incomplete_window_is_unavailable():
         )
 
 
+def test_stack_requires_expected_snapshots():
+    values, times, coords = _window(num_snapshots=3)
+    with pytest.raises(ValueError, match="expected_snapshots"):
+        forcing_field_from_window(values, times, coords, None, 0, 12, "stack")
+
+
 def test_empty_window_is_unavailable():
     empty = np.zeros((0, 2), dtype=np.float32)
     with pytest.raises(ForcingUnavailableError, match="no forcing data"):

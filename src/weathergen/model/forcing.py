@@ -189,13 +189,17 @@ def forcing_field_from_window(
     time_reduce :
         See :func:`reduce_forcing_time`.
     expected_snapshots :
-        If given, a window with a different snapshot count is rejected.
+        If given, a window with a different snapshot count is rejected. Required for ``stack``.
 
     Returns
     -------
     (field, cell_idx): ``field`` is ``(num_cells, 2 * num_out_vars)`` = [cell_values |
     cell_valid]; ``cell_idx`` is the index used, to be cached by the caller.
     """
+    if time_reduce == "stack" and expected_snapshots is None:
+        raise ValueError(
+            "time_reduce 'stack' needs expected_snapshots: the field width depends on it"
+        )
     num_snapshots = count_snapshots(datetimes)
     if num_snapshots == 0:
         raise ForcingUnavailableError("window holds no forcing data")
