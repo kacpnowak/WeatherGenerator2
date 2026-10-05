@@ -638,11 +638,24 @@ class OutputBatchData:
             return np.array(self.forecast_steps_override)
         return np.arange(len(self.targets) + self.forecast_offset)
 
+    @functools.cached_property
+    def _item_forecast_steps(self):
+        """
+        Forecast steps of the output items: `forecast_steps`, plus the source-only step 0 when
+        overridden steps start at the first step of an offset-1 forecast (an un-chunked rollout
+        or its first chunk), so the store keeps its step-0 source item as without an override.
+        """
+        steps = self.forecast_steps
+        if self._forecast_step_to_index is not None and self.forecast_offset == 1:
+            if len(steps) > 0 and steps[0] == 1:
+                steps = np.concatenate([[0], steps])
+        return steps
+
     def items(self) -> typing.Generator[OutputItem, None, None]:
         """Iterate over possible output items"""
         # TODO: filter for empty items?
         for s, fo_s, fi_s in itertools.product(
-            self.samples, self.forecast_steps, self.streams.keys()
+            self.samples, self._item_forecast_steps, self.streams.keys()
         ):
             yield self.extract(ItemKey(int(s), int(fo_s), fi_s))
 
@@ -702,7 +715,9 @@ class OutputBatchData:
             - `forecast_step` is adjusted from including `forecast_offset` to indexing
                the data (always starts at 0)
         """
-        if self._forecast_step_to_index is None:
+        source_only = key.forecast_step == 0 and self.forecast_offset == 1
+        if self._forecast_step_to_index is None or source_only:
+            # the source-only step 0 of an offset-1 forecast reads no target/prediction data
             forecast_step = key.forecast_step - self.forecast_offset
         else:
             if key.forecast_step not in self._forecast_step_to_index:
