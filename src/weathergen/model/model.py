@@ -37,7 +37,11 @@ from weathergen.model.engines import (
     TargetPredictionEngine,
     TargetPredictionEngineClassic,
 )
-from weathergen.model.forcing import ForcingInjection, forcing_num_vars_from_cfg
+from weathergen.model.forcing import (
+    ForcingInjection,
+    forcing_field_is_empty,
+    forcing_num_vars_from_cfg,
+)
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.norms import AdaLayerNorm
 from weathergen.model.utils import get_num_parameters
@@ -101,6 +105,28 @@ class ModelOutput:
             return len(self.batch)
 
         return self.get_last_latent_state().z_pre_norm.shape[0]
+
+
+def rollout_step_range(
+    batch: BatchSamples | None, rollout_steps: int, step_offset: int
+) -> tuple[int, int]:
+    """
+    First loop step of a `Model.forward` rollout and the offset from loop step to batch step.
+
+    A full-range call (`rollout_steps` equals the batch's output length: training and the
+    teachers) loops over the batch's absolute output steps from the first forecast step, so
+    predictions are stored under the step the losses read. Any other call (one chunk of a
+    validation / inference rollout) loops from 0 and maps loop step i to batch step
+    `step_offset + output_idxs[0] + i`. Either way the target of batch step k is decoded
+    after the same number of forecast-engine applications.
+    """
+    if batch is None:
+        return 0, step_offset
+    output_idxs = batch.get_output_idxs()
+    first_output_idx = output_idxs[0] if len(output_idxs) > 0 else 0
+    if rollout_steps == batch.get_output_len():
+        return first_output_idx, step_offset
+    return 0, step_offset + first_output_idx
 
 
 class ModelParams(torch.nn.Module):
@@ -374,6 +400,8 @@ class Model(torch.nn.Module):
         self.register_token_idxs = list(range(cf.num_register_tokens))
         self.aux_token_idxs = list(range(cf.num_register_tokens + cf.num_class_tokens))
         self.num_aux_tokens = cf.num_register_tokens + cf.num_class_tokens
+        # a step without a forcing field runs unforced; warn about that only once
+        self._warned_missing_forcing = False
 
     def _create_latent_pred_head(
         self, global_cfg, name, loss_cfg, use_class_token, use_patch_token
@@ -782,15 +810,12 @@ class Model(torch.nn.Module):
             output.add_latent_prediction(0, "posteriors", latent_state)
         output.batch = batch_ctx
         output.step_offset = step_offset
-        batch_step_offset = step_offset
-        if batch_ctx is not None and rollout_steps != batch_ctx.get_output_len():
-            output_idxs = batch_ctx.get_output_idxs()
-            batch_step_offset += output_idxs[0] if len(output_idxs) > 0 else 0
+        first_step, batch_step_offset = rollout_step_range(batch_ctx, rollout_steps, step_offset)
 
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
         # roll-out in latent space, iterate and generate output over requested output steps
-        for step in range(rollout_steps):
+        for step in range(first_step, rollout_steps):
             # apply forecasting engine (if present)
             if self.forecast_engine:
                 without_grad = p_fwd and self.training and step != rollout_steps - 1
@@ -805,6 +830,13 @@ class Model(torch.nn.Module):
                         if forcing_list is not None and fidx < len(forcing_list)
                         else None
                     )
+                    if forcing_field_is_empty(forcing_field) and not self._warned_missing_forcing:
+                        logger.warning(
+                            f"No forcing field for forecast step {fidx}: the forecast step runs "
+                            "without forcing (e.g. a teacher's target batch). Warned once per "
+                            "model."
+                        )
+                        self._warned_missing_forcing = True
                     tokens, condition = self.forcing_module(
                         tokens, condition, forcing_field, self.num_aux_tokens
                     )

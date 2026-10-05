@@ -239,6 +239,11 @@ def forcing_num_vars_from_cfg(stream_cfg) -> int:
     return len(source_channels)
 
 
+def forcing_field_is_empty(field) -> bool:
+    """True if a step's forcing field is missing or empty, i.e. the step runs unforced."""
+    return field is None or not torch.is_tensor(field) or field.numel() == 0
+
+
 class ForcingEmbed(nn.Module):
     """
     Per-cell forcing embedding shared by all injection modes.
@@ -377,7 +382,7 @@ class ForcingInjection(nn.Module):
 
     @staticmethod
     def _is_empty(x) -> bool:
-        return x is None or not torch.is_tensor(x) or x.numel() == 0
+        return forcing_field_is_empty(x)
 
     def _cell_emb(self, forcing_field: torch.Tensor, dtype) -> torch.Tensor:
         """Per-cell embedding (num_cells, dim) from the scattered field (num_cells, 2*num_vars)."""
