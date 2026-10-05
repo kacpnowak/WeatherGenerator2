@@ -1069,9 +1069,16 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             condition_ds = condition_data.readers
             self._build_condition_data(batch, condition_ds[0], idx, num_output_steps)
 
-        # for per-step forcing streams (e.g. SST)
+        # for per-step forcing streams (e.g. SST); the model consumes the forcing of the forecast
+        # steps [output_offset, num_output_steps) only, never the source window's (offset 1)
         for _, forcing_data in self.forcing_datasets.items():
-            self._build_forcing_data(batch, forcing_data.readers[0], idx, num_output_steps)
+            self._build_forcing_data(
+                batch,
+                forcing_data.readers[0],
+                idx,
+                num_output_steps,
+                step_range=(self.output_offset, num_output_steps),
+            )
 
         source_in_steps = input_steps.max().item()
         target_in_steps = np.array([tc.get("num_steps_input", 1) for _, tc in target_cfgs.items()])
@@ -1286,6 +1293,11 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             for t in range(batch.len_targets()):
                 reset_slots(batch.get_target_sample(t).get_stream_data(stream_name))
 
+        # the chunk's forcing fields (on the device after to_device) are consumed as well
+        forcing = batch.get_source_samples().forcing
+        for i in range(start, end):
+            forcing[i] = []
+
     def __iter__(self) -> ModelBatch:
         """
         Return one batch of data
@@ -1305,6 +1317,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         # idx_raw is used to index into the dataset; the decoupling is needed
         # since there are empty batches
         idx_raw = iter_start
+        # samples skipped for missing forcing since the last batch: a structural problem
+        # (grid mismatch, wrong frequency, period not covered) hits every sample
+        forcing_skips = 0
         for i, _bidx in enumerate(range(iter_start, iter_end, self.batch_size)):
             # num_forecast_steps needs to be constant per batch
             # (amortized through data parallel training)
@@ -1326,6 +1341,13 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     try:
                         batch = self._get_batch(idx, num_forecast_steps)
                     except ForcingUnavailableError as e:
+                        forcing_skips += 1
+                        if forcing_skips >= perms.shape[0]:
+                            raise RuntimeError(
+                                f"Skipped {forcing_skips} samples for missing forcing without "
+                                "producing a batch, as many as there are samples: the forcing "
+                                f"stream cannot serve this dataset. Last error: {e}"
+                            ) from e
                         logger.warning(f"Skipping sample with idx={idx}: {e}")
                         continue
 
@@ -1340,6 +1362,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 if not_valid:
                     logger.warning(f"Skipping empty batch with idx={idx}.")
                 else:
+                    forcing_skips = 0
                     break
 
             yield batch

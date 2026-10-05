@@ -1,6 +1,14 @@
 """Tests for forcing-stream handling in MultiStreamDataSampler (no data access)."""
 
+import types
+
+import numpy as np
+import pytest
+
+from weathergen.datasets.batch import ModelBatch
+from weathergen.datasets.data_reader_base import ReaderData
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
+from weathergen.model.forcing import ForcingUnavailableError
 
 
 def test_fesom_streams_resolve_to_fesom_reader():
@@ -35,14 +43,6 @@ def test_latent_output_uses_chunk_relative_step_index():
     assert requested == [0, 1]
     assert len(latents) == 2 and latents[0][0]["head"].shape == (3,)
 
-
-import types
-
-import numpy as np
-import pytest
-
-from weathergen.datasets.data_reader_base import ReaderData
-from weathergen.model.forcing import ForcingUnavailableError
 
 _COORDS = np.array([[80.0, 10.0], [80.0, 10.5], [-80.0, 10.0], [-80.0, 10.5]], dtype=np.float32)
 
@@ -263,4 +263,100 @@ def test_iter_skips_sample_without_forcing():
     )
     batches = list(MultiStreamDataSampler.__iter__(stub))
     assert tried == [0, 1, 2]
+    assert batches == [good, good]
+
+
+def _eager_sampler(output_offset):
+    """Stub `self` that drives `_get_batch` down to its forcing call, without data streams."""
+    stub = _sampler()
+    stub.output_offset = output_offset
+    stub.mode_cfg = {"training_mode": ["masking"], "model_input": {"random": {}}}
+    no_masks = types.SimpleNamespace(masks=[])
+    stub.streams_datasets = {"S": types.SimpleNamespace(info={}, readers=[])}
+    stub._get_source_target_masks = lambda mode: ({"S": (no_masks, no_masks, [])}, 1, 1)
+    stub._get_output_length = lambda n: MultiStreamDataSampler._get_output_length(stub, n)
+    stub._get_data_windows = lambda *args: (None, None)
+    stub.tokenizer = types.SimpleNamespace(get_tokens_windows=lambda *args: None)
+    stub.condition_datasets = {}
+    reader = _FakeReader()
+    stub.forcing_datasets = {"F": types.SimpleNamespace(readers=[reader])}
+    stub._build_forcing_data = lambda *args, **kwargs: (
+        MultiStreamDataSampler._build_forcing_data(stub, *args, **kwargs)
+    )
+    stub._preprocess_model_batch = lambda batch, *args: batch
+    return stub, reader
+
+
+@pytest.mark.parametrize("output_offset, requested", [(1, [11, 12]), (0, [10, 11])])
+def test_eager_batch_reads_forcing_only_for_the_forecast_steps(output_offset, requested):
+    stub, reader = _eager_sampler(output_offset)
+    batch = MultiStreamDataSampler._get_batch(stub, 10, 2)
+
+    # the model consumes the forcing of the forecast steps output_idxs only
+    assert reader.requested == requested
+    forcing = batch.get_source_samples().forcing
+    assert [len(forcing[i]) > 0 for i in range(len(forcing))] == [
+        i in batch.get_output_idxs() for i in range(len(forcing))
+    ]
+
+
+def test_eager_batch_does_not_need_the_source_windows_forcing():
+    stub, reader = _eager_sampler(1)
+    reader.empty_windows = {10}  # only the source window lacks forcing
+    MultiStreamDataSampler._get_batch(stub, 10, 2)
+    assert reader.requested == [11, 12]
+
+
+def test_release_target_chunk_frees_the_chunks_forcing():
+    stub = types.SimpleNamespace(num_healpix_cells=12, streams_datasets={})
+    batch = ModelBatch([], 0, 0, 1, 5)
+    forcing = batch.get_source_samples().forcing
+    forcing[:] = [np.full((12, 4), float(i)) for i in range(5)]
+
+    MultiStreamDataSampler._release_target_chunk(stub, batch, (1, 3))
+
+    assert [len(f) for f in forcing] == [12, 0, 0, 12, 12]
+
+
+def _iter_stub(get_batch, perms):
+    return types.SimpleNamespace(
+        worker_workset=lambda: (0, 2),
+        len=2,
+        reset=lambda: (np.array(perms), np.array([1, 1])),
+        batch_size=1,
+        mode_cfg={"training_mode": ["forecast"]},
+        _lazy_targets=False,
+        _get_batch=get_batch,
+    )
+
+
+def test_iter_stops_when_no_sample_has_forcing():
+    tried = []
+
+    def get_batch(idx, num_forecast_steps):
+        tried.append(int(idx))
+        raise ForcingUnavailableError(f"forcing stream 'F': window {idx}: no data")
+
+    stub = _iter_stub(get_batch, [0, 1, 2])
+    with pytest.raises(RuntimeError, match="window 2: no data"):
+        list(MultiStreamDataSampler.__iter__(stub))
+    assert tried == [0, 1, 2]
+
+
+def test_iter_forcing_skip_count_resets_after_a_batch():
+    good = types.SimpleNamespace(
+        sources_empty=lambda: False, is_nan=lambda: False, targets_empty=lambda: False
+    )
+    tried = []
+
+    def get_batch(idx, num_forecast_steps):
+        tried.append(int(idx))
+        if idx != 1:
+            raise ForcingUnavailableError("forcing stream 'F': no data")
+        return good
+
+    # 0 skipped, 1 yielded; 2 and 0 skipped, 1 yielded: three skips, but never three in a row
+    stub = _iter_stub(get_batch, [0, 1, 2])
+    batches = list(MultiStreamDataSampler.__iter__(stub))
+    assert tried == [0, 1, 2, 0, 1]
     assert batches == [good, good]
