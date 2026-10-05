@@ -276,10 +276,16 @@ class ForcingEmbed(nn.Module):
     dim_embed :
         Output embedding width (typically the FE model dim for additive injection).
     mean, stdev :
-        Per-channel normalisation statistics, shape ``(num_vars,)``. If None, the input is
-        assumed already normalised.
+        Per-channel normalisation statistics, shape ``(num_vars,)``. If both are None, the input
+        is assumed already normalised and used as is.
     hidden_factor :
         Width multiplier for the MLP hidden layer.
+
+    The statistics are non-persistent buffers: they are not part of the state dict, since
+    FSDP2 shards parameters but leaves buffers plain tensors, which breaks the sharded
+    checkpoint save and load. Without explicit statistics the (identity) buffers are never
+    read, so the embedding needs no buffer values after a meta-device build or ``to_empty``
+    followed by a state-dict load (FSDP continuation, EMA model copies).
     """
 
     def __init__(
@@ -294,12 +300,15 @@ class ForcingEmbed(nn.Module):
         self.num_vars = num_vars
         self.dim_embed = dim_embed
 
+        self.normalise = mean is not None or stdev is not None
         if mean is None:
             mean = np.zeros(num_vars, dtype=np.float32)
         if stdev is None:
             stdev = np.ones(num_vars, dtype=np.float32)
-        self.register_buffer("mean", torch.as_tensor(np.asarray(mean), dtype=torch.float32))
-        self.register_buffer("stdev", torch.as_tensor(np.asarray(stdev), dtype=torch.float32))
+        mean = torch.as_tensor(np.asarray(mean), dtype=torch.float32)
+        stdev = torch.as_tensor(np.asarray(stdev), dtype=torch.float32)
+        self.register_buffer("mean", mean, persistent=False)
+        self.register_buffer("stdev", stdev, persistent=False)
 
         # input = normalised values (num_vars) concatenated with validity (num_vars)
         in_dim = 2 * num_vars
@@ -329,9 +338,12 @@ class ForcingEmbed(nn.Module):
         -------
         ``(..., num_cells, dim_embed)`` per-cell forcing embedding.
         """
-        mean = self.mean.to(cell_values.dtype)
-        stdev = self.stdev.to(cell_values.dtype).clamp_min(1e-6)
-        normed = (cell_values - mean) / stdev
+        if self.normalise:
+            mean = self.mean.to(cell_values.dtype)
+            stdev = self.stdev.to(cell_values.dtype).clamp_min(1e-6)
+            normed = (cell_values - mean) / stdev
+        else:
+            normed = cell_values  # identity statistics: (x - 0) / 1
         # zero-out normalised value where there is no data so it reads as "absent"
         normed = torch.where(cell_valid > 0, normed, torch.zeros_like(normed))
         x = torch.cat([normed, cell_valid.to(normed.dtype)], dim=-1)

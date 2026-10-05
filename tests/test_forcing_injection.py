@@ -1,9 +1,14 @@
 """Tests for ForcingInjection and its sizing from the stream config."""
 
+import copy
+
+import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
 
 from weathergen.model.forcing import (
+    ForcingEmbed,
     ForcingInjection,
     check_one_latent_token_per_cell,
     forcing_num_vars_from_cfg,
@@ -164,3 +169,89 @@ def test_injection_needs_one_latent_token_per_cell(mode):
 
 def test_disabled_injection_accepts_several_latent_tokens_per_cell():
     check_one_latent_token_per_cell("none", ae_local_num_queries=4)
+
+
+def _trained(mode):
+    """An injection whose output depends on the forcing (open gate)."""
+    injection = _injection(mode)
+    injection.gate.data.fill_(1.0)
+    return injection
+
+
+def _outputs(injection):
+    tokens, condition, field = _inputs()
+    return injection(tokens, condition, field, NUM_AUX)
+
+
+def _assert_same_outputs(injection, reference):
+    for out, ref in zip(_outputs(injection), _outputs(reference), strict=True):
+        assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_forcing_module_state_dict_holds_parameters_only(mode):
+    # FSDP2 turns parameters into DTensors but leaves buffers plain tensors, and both the
+    # checkpoint save (full_tensor()) and the sharded load (device_mesh) need DTensors
+    state_dict = _injection(mode).state_dict()
+    assert not [k for k in state_dict if k.endswith(("embed.mean", "embed.stdev"))]
+    assert set(state_dict) == {name for name, _ in _injection(mode).named_parameters()}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_state_dict_round_trip(mode):
+    source, target = _trained(mode), ForcingInjection(NUM_VARS, DIM, mode, DIM_AUX, 4)
+    target.load_state_dict(source.state_dict(), strict=True)
+    assert torch.equal(target.embed.mean, torch.zeros(NUM_VARS))
+    assert torch.equal(target.embed.stdev, torch.ones(NUM_VARS))
+    _assert_same_outputs(target, source)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_state_dict_copy_into_an_emptied_module(mode):
+    # EMAModel.reset: to_empty (arbitrary memory, here NaN) then load the student's state dict
+    source = _trained(mode)
+    copied = copy.deepcopy(source).to_empty(device="cpu")
+    with torch.no_grad():
+        for tensor in [*copied.parameters(), *copied.buffers()]:
+            tensor.fill_(float("nan"))
+    copied.load_state_dict(source.state_dict())
+    _assert_same_outputs(copied, source)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_load_into_a_meta_built_module(mode):
+    # continuing a forced run under FSDP: meta build, then load_state_dict(assign=True)
+    source = _trained(mode)
+    with torch.device("meta"):
+        loaded = ForcingInjection(NUM_VARS, DIM, mode, DIM_AUX, 4)
+    loaded.load_state_dict(source.state_dict(), assign=True)
+    _assert_same_outputs(loaded, source)
+
+
+def test_forcing_embed_with_explicit_statistics_normalises():
+    torch.manual_seed(2)
+    stats = ForcingEmbed(NUM_VARS, DIM, np.full(NUM_VARS, 2.0), np.full(NUM_VARS, 4.0))
+    plain = ForcingEmbed(NUM_VARS, DIM)
+    plain.load_state_dict(stats.state_dict())
+    values, valid = torch.randn(NUM_CELLS, NUM_VARS), torch.ones(NUM_CELLS, NUM_VARS)
+    assert torch.allclose(stats(values, valid), plain((values - 2.0) / 4.0, valid))
+
+
+def test_fully_sharded_forcing_module_state_dict_gathers(tmp_path):
+    # the checkpoint save loop under FSDP2, on a single CPU rank
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    if dist.is_initialized():
+        pytest.skip("a process group is already initialised")
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'pg'}", rank=0, world_size=1)
+    try:
+        model = torch.nn.Module()
+        model.forcing_module = _injection("cross_attn")
+        fully_shard(model, mesh=init_device_mesh("cpu", (1,)))
+        full = {name: t.full_tensor() for name, t in model.state_dict().items()}
+        assert set(full) == {
+            f"forcing_module.{n}" for n, _ in _injection("cross_attn").named_parameters()
+        }
+    finally:
+        dist.destroy_process_group()
