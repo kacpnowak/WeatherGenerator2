@@ -751,18 +751,6 @@ class Trainer(TrainerBase):
                         self.model,
                     )
 
-                    targets_and_auxs = {}
-                    for loss_name, target_aux in self.target_and_aux_calculators.items():
-                        # find targets for this target-aux calculator
-                        target_idxs = get_target_idxs_from_cfg(self.training_cfg, loss_name)
-                        # apply target-aux calculator
-                        targets_and_auxs[loss_name] = target_aux.compute(
-                            self.cf.general.istep,
-                            batch.get_target_samples(target_idxs),
-                            self.model_params,
-                            self.model,
-                        )
-
                 loss = self.loss_calculator.compute_loss(
                     preds=preds,
                     targets_and_aux=targets_and_auxs,
