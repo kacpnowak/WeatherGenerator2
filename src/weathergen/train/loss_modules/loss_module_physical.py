@@ -20,6 +20,7 @@ from omegaconf import DictConfig
 import weathergen.train.loss_modules.loss_functions as loss_fns
 from weathergen.train.loss_modules.loss_module_base import LossModuleBase, LossValues
 from weathergen.train.utils import TRAIN, VAL, Stage
+from weathergen.utils.utils import is_stream_fe_only
 
 _logger = logging.getLogger(__name__)
 
@@ -281,7 +282,14 @@ class LossPhysical(LossModuleBase):
         source2target_idxs, output_info, target2source_idxs, target_info = metadata
 
         # TODO: iterate over batch dimension
-        for stream_name, stream_info in self.cf.streams.items():
+        data_streams = [
+            stream_cfg
+            for stream_cfg in self.cf.streams.values()
+            if not is_stream_fe_only(stream_cfg)
+        ]
+
+        for stream_info in data_streams:
+            stream_name = stream_info["name"]
             # TODO: avoid this
             target_channels = (
                 stream_info.val_target_channels
@@ -301,8 +309,10 @@ class LossPhysical(LossModuleBase):
 
             # TODO: make nicer
             output_step_loss_weights = self._get_output_step_weights(len(targets.output_idxs))
-            if len(targets.physical) - len(targets.output_idxs) > 0:
-                output_step_loss_weights.insert(0, None)
+            # Pad with Nones for forecast offsets so indices align with targets.physical
+            output_offset = len(targets.physical) - len(targets.output_idxs)
+            if output_offset > 0:
+                output_step_loss_weights = [None] * output_offset + list(output_step_loss_weights)
 
             # loss_stream: loss for given stream
             loss_stream = torch.tensor(0.0, device=self.device, requires_grad=True)

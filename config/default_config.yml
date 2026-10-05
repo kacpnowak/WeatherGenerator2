@@ -197,6 +197,8 @@ training_config:
       num_steps: 2
       offset: 1
       policy: "fixed"
+      # number of forecast steps to accumulate before writing to disk
+      chunk_size: null
 
 
 # validation config; full validation config is merge of training and validation config

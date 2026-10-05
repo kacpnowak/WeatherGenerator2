@@ -176,6 +176,11 @@ class BatchSamples:
         self.output_steps = output_steps
         self.output_idxs = output_idxs
         self.device = None
+        self.conditions = [[] for i in range(output_steps)]
+        # Per-step spatial forcing field (e.g. SST) on the FE latent cells (parallel to
+        # `conditions`, but spatial): each entry becomes a (num_cells, 2*num_vars) array of
+        # [cell_values | cell_valid] once built, then a tensor after to_device.
+        self.forcing = [[] for i in range(output_steps)]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -187,6 +192,16 @@ class BatchSamples:
         self.tokens_lens = (
             self.tokens_lens.to(device, non_blocking=True) if self.tokens_lens is not None else None
         )
+
+        self.conditions = [
+            torch.tensor(cond, dtype=torch.float32, device=device) if len(cond) > 0 else cond
+            for cond in self.conditions
+        ]
+
+        self.forcing = [
+            torch.as_tensor(f, dtype=torch.float32, device=device) if len(f) > 0 else f
+            for f in self.forcing
+        ]
 
         self.device = device
 
@@ -205,6 +220,24 @@ class BatchSamples:
             bs.samples = [bs.samples[i] for i in subset]
             torch_idxs = torch.tensor(subset, dtype=torch.long, device=bs.tokens_lens.device)
             bs.tokens_lens = torch.index_select(bs.tokens_lens, 1, torch_idxs)
+            return bs
+
+    def get_subset_view(self, subset: list | None = None):
+        """
+        Get a read-only view of a subset of samples without duplicating tensor storage.
+
+        Unlike `get_subset`, this does not deep-copy the underlying samples/tensors;
+        it only rebinds `samples` and `tokens_lens` to the selected subset. Safe as
+        long as the returned object's fields are not mutated in place.
+        """
+        if subset is None:
+            return self
+        else:
+            assert len(list(set(subset))) == len(subset), "subset contains duplicates"
+            bs = copy.copy(self)
+            bs.samples = [self.samples[i] for i in subset]
+            torch_idxs = torch.tensor(subset, dtype=torch.long, device=self.tokens_lens.device)
+            bs.tokens_lens = torch.index_select(self.tokens_lens, 1, torch_idxs)
             return bs
 
     def get_num_source_steps(self) -> int:
@@ -334,13 +367,17 @@ class ModelBatch:
 
         return self
 
-    def to_device(self, device):  # -> ModelBatch
+    def to_device(
+        self, device, include_targets: bool = True, include_sources: bool = True
+    ):  # -> ModelBatch
         """
         Move batch to device
         """
 
-        self.source_samples.to_device(device)
-        self.target_samples.to_device(device)
+        if include_sources:
+            self.source_samples.to_device(device)
+        if include_targets:
+            self.target_samples.to_device(device)
 
         self.device = device
 
@@ -462,6 +499,12 @@ class ModelBatch:
         Get target samples
         """
         return self.target_samples.get_subset(subset)
+
+    def get_target_samples_view(self, subset: list | None = None) -> BatchSamples:
+        """
+        Get a read-only view of target samples without duplicating underlying tensor storage.
+        """
+        return self.target_samples.get_subset_view(subset)
 
     def get_source_idx_for_target(self, target_idx: int) -> int:
         """

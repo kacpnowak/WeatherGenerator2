@@ -135,7 +135,7 @@ training_config:
   # training_mode: "masking", "student_teacher", "latent_loss"
   training_mode: ["masking"]
 
-  num_mini_epochs: 64
+  num_mini_epochs: 96
   samples_per_mini_epoch: 4096
   shuffle: True
 
@@ -171,6 +171,19 @@ training_config:
     "physical": {
         type: LossPhysical,
         loss_fcts: { "mse": { }, },
+        },
+    # cosine-band regulariser on consecutive forecast-engine latent steps: penalises
+    # per-token cosine similarity outside [cosine_low, cosine_high] to curb latent collapse
+    # (too-similar) and noise/chaos (too-dissimilar) in long rollouts. Remove/disable to omit.
+     "cosine_matching": {
+        type: LossLatent,
+        weight: 1.0,
+        loss_fcts: {
+            "params": {
+                cosine_low: 0.68,
+                cosine_high: 0.78,
+            },
+        },
         },
     }
   

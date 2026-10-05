@@ -87,6 +87,9 @@ class StreamData:
 
         self.source_is_spoof = [False for _ in range(self.input_steps)]
         self.target_is_spoof = [False for _ in range(self.output_steps)]
+        # free-running forecast step beyond the data: prediction is produced but there is no
+        # ground-truth target to write for this step.
+        self.target_is_query = [False for _ in range(self.output_steps)]
 
         # initialize empty members
         self.sample_idx = idx
@@ -292,6 +295,23 @@ class StreamData:
 
         self.target_is_spoof[fstep] = is_spoof
 
+    def add_target_query(
+        self, fstep: int, target_coords_raw: torch.Tensor, times_raw: torch.Tensor
+    ) -> None:
+        """
+        Add a free-running query target for a forecast step beyond the data.
+
+        There is no ground-truth target, but the prediction locations (coords/times, the full
+        grid) are recorded so the written prediction can carry its coordinates. Target values
+        are left empty and the step is flagged so write_output emits a full prediction with an
+        empty target.
+        """
+        self.target_coords_raw[fstep] = target_coords_raw
+        self.target_times_raw[fstep] = times_raw
+        self.target_tokens[fstep] = torch.tensor([])
+        self.idxs_inv[fstep] = None
+        self.target_is_query[fstep] = True
+
     def add_target_coords(
         self,
         stage: Stage,
@@ -445,6 +465,12 @@ class StreamData:
         Either source or target at step is spoof
         """
         return any(self.source_is_spoof) or self.target_is_spoof[step]
+
+    def is_forecast_query(self, step: int) -> bool:
+        """
+        Target at step is a free-running query (prediction only, no ground-truth target).
+        """
+        return self.target_is_query[step]
 
     def get_num_source_steps(self) -> int:
         """

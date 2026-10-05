@@ -29,6 +29,16 @@ def get_dtype(value: str) -> torch.dtype:
         )
 
 
+def is_stream_fe_only(stream_cfg: dict) -> bool:
+    """
+    Determine if a stream feeds the forecasting engine directly (a `condition` scalar or a
+    per-step spatial `forcing` such as SST) rather than the assimilation path. Such streams
+    are excluded from the encoder/embed/decoder/output per-data-stream lists, which must stay
+    aligned with `get_sources_size()` (which omits them).
+    """
+    return stream_cfg.get("type") in ("condition", "forcing")
+
+
 def is_stream_forcing(stream_cfg: dict, stage: Stage | None = None) -> bool:
     """
     Determine if stream is forcing, i.e. does not produce (physical) predictions

@@ -353,9 +353,25 @@ class Scores:
                     )
 
         if group_by_coord is not None and self._validate_groupby_coord(data, group_by_coord):
-            # Apply groupby to all DataArrays in args
+            # Apply groupby only to DataArrays that have the coord; skip (with warning) for others.
+            # In correct operation all DataArrays should have it; the guard prevents a cryptic
+            # KeyError if, for example, an aligned climatology was built without non-dim coords.
+            missing = [
+                k
+                for k, v in args.items()
+                if isinstance(v, xr.DataArray) and group_by_coord not in v.coords
+            ]
+            if missing:
+                _logger.warning(
+                    f"Coordinate '{group_by_coord}' missing from args {missing}; "
+                    f"groupby will be skipped for those — results may be incorrect."
+                )
             grouped_args = {
-                k: (v.groupby(group_by_coord) if isinstance(v, xr.DataArray) else v)
+                k: (
+                    v.groupby(group_by_coord)
+                    if isinstance(v, xr.DataArray) and group_by_coord in v.coords
+                    else v
+                )
                 for k, v in args.items()
             }
 

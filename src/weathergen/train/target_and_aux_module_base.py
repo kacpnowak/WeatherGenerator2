@@ -109,7 +109,7 @@ class PhysicalTargetAndAux(TargetAndAuxModuleBase):
             # collect targets for all forecast steps
             for step in output_idxs:
                 targets_cur, target_times_cur, target_coords_cur, meta_data = [], [], [], []
-                is_spoof, idxs_inv = [], []
+                is_spoof, idxs_inv, is_query = [], [], []
                 for sample in batch.samples:
                     targets_cur += [sample.streams_data[stream_name].target_tokens[step]]
                     target_times_cur += [sample.streams_data[stream_name].target_times_raw[step]]
@@ -117,6 +117,7 @@ class PhysicalTargetAndAux(TargetAndAuxModuleBase):
                     idxs_inv += [sample.streams_data[stream_name].idxs_inv[step]]
                     meta_data += [sample.meta_info]
                     is_spoof += [sample.streams_data[stream_name].is_spoof(step)]
+                    is_query += [sample.streams_data[stream_name].is_forecast_query(step)]
 
                 targets_step = {
                     "target": targets_cur,
@@ -124,6 +125,7 @@ class PhysicalTargetAndAux(TargetAndAuxModuleBase):
                     "target_coords": target_coords_cur,
                     "target_metda_data": meta_data,
                     "is_spoof": is_spoof,
+                    "is_forecast_query": is_query,
                     "idxs_inv": idxs_inv,
                 }
 

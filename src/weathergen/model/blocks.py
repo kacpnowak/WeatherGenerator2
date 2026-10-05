@@ -16,7 +16,7 @@ from weathergen.model.attention import (
 )
 from weathergen.model.layers import MLP
 from weathergen.model.norms import AdaLayerNormLayer
-from weathergen.utils.utils import get_dtype
+from weathergen.utils.utils import get_dtype, is_stream_fe_only
 
 
 class SelfAttentionBlock(nn.Module):
@@ -201,7 +201,10 @@ class OriginalPredictionBlock(nn.Module):
 
         self.block = nn.ModuleList()
 
-        target_readout_num_heads = next(self.cf.streams.values())["target_readout"]["num_heads"]
+        # first real data stream (condition/forcing streams have no target_readout)
+        target_readout_num_heads = next(
+            s for s in self.cf.streams.values() if not is_stream_fe_only(s)
+        )["target_readout"]["num_heads"]
 
         # Multi-Cross Attention Head
         self.block.append(

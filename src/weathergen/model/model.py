@@ -22,7 +22,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from weathergen.common.config import Config
-from weathergen.datasets.batch import ModelBatch
+from weathergen.datasets.batch import BatchSamples, ModelBatch
 from weathergen.datasets.utils import healpix_verts_rots, r3tos2
 from weathergen.model.encoder import EncoderModule
 from weathergen.model.engines import (
@@ -37,11 +37,13 @@ from weathergen.model.engines import (
     TargetPredictionEngine,
     TargetPredictionEngineClassic,
 )
+from weathergen.model.forcing import ForcingInjection
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.norms import AdaLayerNorm
 from weathergen.model.utils import get_num_parameters
+from weathergen.train.loss_modules.utils import compute_cos_sim_to_prev
 from weathergen.utils.distributed import is_root
-from weathergen.utils.utils import get_dtype, is_stream_forcing
+from weathergen.utils.utils import get_dtype, is_stream_fe_only, is_stream_forcing
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +58,13 @@ class ModelOutput:
     physical: list[dict[StreamName, torch.Tensor]]
     latent: list[dict[str, torch.Tensor | LatentState]]
 
-    def __init__(self, len_output: int) -> None:
+    def __init__(
+        self, len_output: int, batch: BatchSamples | None = None, step_offset: int = 0
+    ) -> None:
         self.physical = [{} for _ in range(len_output)]
         self.latent = [{} for _ in range(len_output)]
+        self.batch = batch
+        self.step_offset = step_offset
 
     def add_physical_prediction(
         self, fstep: int, stream_name: StreamName, pred: torch.Tensor
@@ -81,6 +87,20 @@ class ModelOutput:
 
     def get_latent_prediction(self, fstep: int):
         return self.latent[fstep]
+
+    def get_last_latent_state(self) -> LatentState:
+        for latent_pred in reversed(self.latent):
+            latent_state = latent_pred.get("latent_state", None)
+            if latent_state is not None:
+                return latent_state
+
+        raise ValueError("ModelOutput does not contain a latent_state prediction to continue from.")
+
+    def get_batch_size(self) -> int:
+        if self.batch is not None:
+            return len(self.batch)
+
+        return self.get_last_latent_state().z_pre_norm.shape[0]
 
 
 class ModelParams(torch.nn.Module):
@@ -302,7 +322,14 @@ class Model(torch.nn.Module):
         coordinates to its physical space.
     """
 
-    def __init__(self, cf: Config, sources_size, targets_num_channels, targets_coords_size):
+    def __init__(
+        self,
+        cf: Config,
+        sources_size,
+        targets_num_channels,
+        targets_coords_size,
+        condition_num_channels,
+    ):
         """
         Args:
             cf : Configuration with model parameters
@@ -329,7 +356,10 @@ class Model(torch.nn.Module):
         self.pred_heads = None
         self.q_cells: torch.Tensor | None = None
         self.streams: dict[str, typing.Any] = cf.streams
+        self.data_stream_names = None
         self.target_token_engines = None
+        self.data_streams: list = None
+        self.forecast_aux_infos = condition_num_channels
 
         assert cf.get("forecast", {}).get("att_dense_rate", 1.0) == 1.0, (
             "Local attention not adapted for register tokens"
@@ -380,7 +410,12 @@ class Model(torch.nn.Module):
 
         mode_cfg = cf.training_config
         if cf.fe_num_blocks > 0:
-            self.forecast_engine = ForecastingEngine(cf, mode_cfg, self.num_healpix_cells)
+            self.forecast_engine = ForecastingEngine(
+                cf,
+                mode_cfg,
+                self.num_healpix_cells,
+                self.forecast_aux_infos if self.forecast_aux_infos > 0 else None,
+            )
         else:
             self.forecast_engine = IdentityEngine()
 
@@ -390,7 +425,47 @@ class Model(torch.nn.Module):
         self.target_token_engines = torch.nn.ModuleDict()
         self.pred_heads = torch.nn.ModuleDict()
 
-        # determine stream names once so downstream components use consistent keys
+        # determine stream names once so downstream components use consistent keys.
+        # condition and per-step forcing (e.g. SST) streams feed the forecasting engine
+        # directly, not the assimilation/decoder path, so they are excluded here.
+        self.data_stream_names = [
+            stream_name
+            for stream_name, stream_cfg in cf.streams.items()
+            if not is_stream_fe_only(stream_cfg)
+        ]
+
+        self.data_streams = [
+            stream_cfg
+            for stream_cfg in cf.streams.values()
+            if not is_stream_fe_only(stream_cfg)
+        ]
+
+        # per-step spatial forcing injected into the FE (SST etc.); None if no such stream
+        self.forcing_module = None
+        for stream_cfg in cf.streams.values():
+            if stream_cfg.get("type") != "forcing":
+                continue
+            inj = stream_cfg.get("injection", {})
+            mode = inj.get("mode", "none")
+            if mode == "none":
+                continue
+            source_channels = stream_cfg.get("train_source_channels") or stream_cfg.get(
+                "val_source_channels", []
+            )
+            # dim_embed must equal the FE token dim so additive/cross_attn line up; the
+            # global/adaln_local modes then project this down to the conditioning dim.
+            self.forcing_module = ForcingInjection(
+                num_vars=len(source_channels),
+                dim_embed=cf.ae_global_dim_embed,
+                mode=mode,
+                dim_aux=self.forecast_aux_infos,
+                num_heads=cf.fe_num_heads,
+            )
+            break  # one forcing stream supported for now
+
+        for i_stream, _ in enumerate(self.data_streams):
+            stream_name = self.data_stream_names[i_stream]
+
         loss_terms = [
             v.type for _, v in cf.training_config.losses.items() if v.get("enabled", True)
         ]
@@ -399,8 +474,14 @@ class Model(torch.nn.Module):
                 v.type for _, v in cf.validation_config.losses.items() if v.get("enabled", True)
             ]
 
+        # cos_sim_to_prev is only needed by the latent (cosine-band) loss; compute it
+        # (and keep prev_tokens around for it) only when that loss is configured.
+        self.compute_cos_sim_to_prev = "LossLatent" in loss_terms
+
         if "LossPhysical" in loss_terms:
-            for i_stream, (stream_name, si) in enumerate(self.streams.items()):
+            for i_stream, si in enumerate(self.data_streams):
+                stream_name = self.data_stream_names[i_stream]
+
                 # skip decoder if channels are empty
                 if is_stream_forcing(si):
                     continue
@@ -491,7 +572,9 @@ class Model(torch.nn.Module):
                     )
 
             # iterate again to setup shared spatial pred heads if specified in config
-            for i_stream, (stream_name, si) in enumerate(self.streams.items()):
+            for i_stream, si in enumerate(self.data_streams):
+                stream_name = self.data_stream_names[i_stream]
+
                 # skip decoder if channels are empty
                 if is_stream_forcing(si):
                     continue
@@ -595,7 +678,7 @@ class Model(torch.nn.Module):
 
         num_params_embed = [
             get_num_parameters(self.encoder.embed_engine.embeds[name])
-            for name in self.streams.keys()
+            for name in self.data_stream_names
         ]
         num_params_total = get_num_parameters(self)
         num_params_ae_local = get_num_parameters(self.encoder.ae_local_engine.ae_local_blocks)
@@ -670,7 +753,12 @@ class Model(torch.nn.Module):
             z_pre_norm=tokens,
         )
 
-    def forward(self, model_params: ModelParams, batch: ModelBatch) -> ModelOutput:
+    def forward(
+        self,
+        model_params: ModelParams,
+        batch: BatchSamples | ModelOutput,
+        rollout_steps: int,
+    ) -> ModelOutput:
         """Forward pass of the model
 
         Tokens are processed through the model components, which were defined in the create method.
@@ -681,31 +769,72 @@ class Model(torch.nn.Module):
             A list containing all prediction results
         """
 
-        output = ModelOutput(batch.get_output_len())
-
-        tokens, posteriors = self.encoder(model_params, batch)
-        output.add_latent_prediction(0, "posteriors", posteriors)
-
-        # recover batch dimension and separate input_steps
-        shape = (len(batch), batch.get_num_source_steps(), *tokens.shape[1:])
-        # collapse along input step dimension
-        tokens = tokens.reshape(shape).sum(axis=1)
+        output = ModelOutput(rollout_steps)
+        if isinstance(batch, BatchSamples):
+            step_offset = 0
+            batch_ctx = batch
+            tokens, posteriors = self.encoder(model_params, batch_ctx)
+            output.add_latent_prediction(0, "posteriors", posteriors)
+            shape = (len(batch), batch.get_num_source_steps(), *tokens.shape[1:])
+            tokens = tokens.reshape(shape).sum(axis=1)
+        else:
+            step_offset = batch.step_offset + len(batch.physical)
+            latent_state = batch.get_last_latent_state()
+            batch_ctx = batch.batch
+            tokens = latent_state.z_pre_norm
+            output.add_latent_prediction(0, "posteriors", latent_state)
+        output.batch = batch_ctx
+        output.step_offset = step_offset
+        batch_step_offset = step_offset
+        if batch_ctx is not None and rollout_steps != batch_ctx.get_output_len():
+            output_idxs = batch_ctx.get_output_idxs()
+            batch_step_offset += output_idxs[0] if len(output_idxs) > 0 else 0
 
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
         # roll-out in latent space, iterate and generate output over requested output steps
-        for step in batch.get_output_idxs():
-            without_grad = p_fwd and self.training and step != max(batch.get_output_idxs())
-            if without_grad:
-                # Pushforward mode: advance tokens without grad; no decoding with torch.no_grad():
-                tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
-                continue
+        for step in range(rollout_steps):
+            # apply forecasting engine (if present)
+            if self.forecast_engine:
+                without_grad = p_fwd and self.training and step != rollout_steps - 1
+                condition = batch_ctx.conditions[step + batch_step_offset]
+                # inject the per-step spatial forcing (e.g. SST) into the FE latent state /
+                # conditioning before advancing; no-op when no forcing module or field.
+                if self.forcing_module is not None:
+                    forcing_list = getattr(batch_ctx, "forcing", None)
+                    fidx = step + batch_step_offset
+                    forcing_field = (
+                        forcing_list[fidx]
+                        if forcing_list is not None and fidx < len(forcing_list)
+                        else None
+                    )
+                    tokens, condition = self.forcing_module(
+                        tokens, condition, forcing_field, self.num_aux_tokens
+                    )
+                if without_grad:
+                    # Pushforward mode: advance tokens without grad; no decoding
+                    with torch.no_grad():
+                        tokens = self.forecast_engine(
+                            tokens, condition, coords=model_params.rope_coords
+                        )
+                    continue
+                prev_tokens = tokens if self.compute_cos_sim_to_prev else None
+                tokens = self.forecast_engine(tokens, condition, coords=model_params.rope_coords)
 
-            tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
+                # per-token cosine similarity between current and previous patch tokens,
+                # consumed by LossLatent (cosine-band regulariser)
+                if self.compute_cos_sim_to_prev:
+                    output.add_latent_prediction(
+                        step,
+                        "cos_sim_to_prev",
+                        compute_cos_sim_to_prev(tokens, prev_tokens, self.num_aux_tokens),
+                    )
             # decoder predictions
-            output = self.predict_decoders(model_params, step, tokens, batch, output)
+            output = self.predict_decoders(
+                model_params, step, step + batch_step_offset, tokens, batch_ctx, output
+            )
             # latent predictions (raw and with SSL heads)
-            output = self.predict_latent(model_params, step, tokens, batch, output)
+            output = self.predict_latent(model_params, step, tokens, batch_ctx, output)
 
         return output
 
@@ -735,9 +864,10 @@ class Model(torch.nn.Module):
     def predict_decoders(
         self,
         model_params: ModelParams,
-        step: int,
+        output_step: int,
+        batch_step: int,
         tokens: torch.Tensor,
-        batch: ModelBatch,
+        batch: BatchSamples | None,
         output: ModelOutput,
     ) -> ModelOutput:
         """
@@ -760,6 +890,12 @@ class Model(torch.nn.Module):
         if not self.pred_heads:
             return output
 
+        if batch is None:
+            raise ValueError(
+                "Decoder predictions require BatchSamples metadata. "
+                "Pass a BatchSamples/ModelBatch or a ModelOutput created from one."
+            )
+
         # remove register  and class tokens
         tokens = tokens[:, self.num_aux_tokens :]
 
@@ -775,10 +911,10 @@ class Model(torch.nn.Module):
         tokens_nbors_lens[0] = 0
 
         # pair with tokens from assimilation engine to obtain target tokens
-        for stream_name in self.streams.keys():
+        for stream_name in self.data_stream_names:
             # extract target coords for current stream and fstep and convert to one tensor
             t_coords = [
-                batch.samples[i_b].streams_data[stream_name].target_coords[step]
+                batch.samples[i_b].streams_data[stream_name].target_coords[batch_step]
                 for i_b in range(batch_size)
             ]
             t_coords_lens = [len(t) for t in t_coords]
@@ -809,7 +945,7 @@ class Model(torch.nn.Module):
                 # lens for varlen attention
                 tcls = torch.cat(
                     [
-                        sample.streams_data[stream_name].target_coords_lens[step]
+                        sample.streams_data[stream_name].target_coords_lens[batch_step]
                         for sample in batch.samples
                     ]
                 )
@@ -835,6 +971,6 @@ class Model(torch.nn.Module):
 
             # recover batch dimension (ragged, so as list)
             pred = torch.split(pred, t_coords_lens, dim=1)
-            output.add_physical_prediction(step, stream_name, pred)
+            output.add_physical_prediction(output_step, stream_name, pred)
 
         return output

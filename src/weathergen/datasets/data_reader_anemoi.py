@@ -7,6 +7,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import datetime
 import logging
 from pathlib import Path
 from typing import override
@@ -30,6 +31,50 @@ from weathergen.train.utils import Stage
 from weathergen.utils.distributed import is_root
 
 _logger = logging.getLogger(__name__)
+
+# Time-dependent "forcing" geoinfo channels: these are not weather fields but deterministic
+# functions of (lat, lon, datetime). anemoi-datasets bakes them into the zarr via earthkit's
+# forcings source; we recompute them identically so target queries can be built for future
+# forecast steps that lie beyond the dataset coverage. Verified bit-close to the zarr (~1e-7).
+_FORCING_GEOINFO_CHANNELS = frozenset(
+    ["insolation", "cos_local_time", "sin_local_time", "cos_julian_day", "sin_julian_day"]
+)
+_DAYS_PER_YEAR = 365.25
+
+
+def compute_forcing_geoinfos(
+    lat: NDArray, lon: NDArray, when: datetime.datetime
+) -> dict[str, NDArray]:
+    """
+    Reproduce the earthkit/anemoi time-dependent geoinfo forcings for a grid at one datetime.
+
+    Mirrors earthkit.data ForcingMaker (julian_day / local_time) and
+    earthkit.meteo.solar.cos_solar_zenith_angle (insolation). lat/lon are in degrees with the
+    same convention as the dataset; `when` is a tz-naive UTC datetime.
+    """
+    from earthkit.meteo.solar import cos_solar_zenith_angle
+
+    lat = np.asarray(lat, dtype=np.float64)
+    lon = np.asarray(lon, dtype=np.float64)
+
+    delta_year = when - datetime.datetime(when.year, 1, 1)
+    jd = delta_year.days + delta_year.seconds / 86400.0
+    ang = jd / _DAYS_PER_YEAR * 2.0 * np.pi
+
+    delta_day = when - datetime.datetime(when.year, when.month, when.day)
+    utc_hour = (delta_day.days + delta_day.seconds / 86400.0) * 24.0
+    local = (lon / 360.0 * 24.0 + utc_hour) % 24.0
+    local_rad = local / 24.0 * 2.0 * np.pi
+
+    insolation = np.clip(cos_solar_zenith_angle(when, lat, lon), 0.0, None)
+
+    return {
+        "cos_julian_day": np.full_like(lat, np.cos(ang)),
+        "sin_julian_day": np.full_like(lat, np.sin(ang)),
+        "cos_local_time": np.cos(local_rad),
+        "sin_local_time": np.sin(local_rad),
+        "insolation": np.asarray(insolation, dtype=np.float64),
+    }
 
 
 class DataReaderAnemoi(DataReaderTimestep):
@@ -174,6 +219,11 @@ class DataReaderAnemoi(DataReaderTimestep):
         self.mean = ds.statistics["mean"]
         self.stdev = ds.statistics["stdev"]
 
+        # cache of the time-invariant geoinfo channels (z, lsm, ...), filled lazily from the
+        # first available window and reused to build target queries for free-running forecast
+        # steps that lie beyond the dataset coverage.
+        self._static_geoinfo: NDArray[np.float32] | None = None
+
     @override
     def init_empty(self) -> None:
         super().init_empty()
@@ -257,6 +307,46 @@ class DataReaderAnemoi(DataReaderTimestep):
         check_reader_data(rd, dtr)
 
         return rd
+
+    def _ensure_static_geoinfo(self) -> None:
+        """Cache the geoinfo row from the first available window (static channels are time-
+        invariant; the time-varying channels are overwritten per query)."""
+        if self._static_geoinfo is not None or self.ds is None:
+            return
+        raw = self.ds[0:1][:, :, 0].astype(np.float32)
+        raw = raw.transpose([0, 2, 1]).reshape((raw.shape[0] * raw.shape[2], -1))
+        self._static_geoinfo = raw[:, list(self.geoinfo_idx)]
+
+    def get_target_query(self, when: datetime.datetime) -> ReaderData:
+        """
+        Build a full-grid target "query" for a forecast step beyond the dataset coverage.
+
+        Free-running forecasting has no ground truth past the data, but the decoder still needs
+        the prediction locations (the full grid) and their geoinfos. Coords come from the fixed
+        grid, static geoinfos from the cached window, and the time-dependent geoinfos are
+        computed analytically for `when` (see compute_forcing_geoinfos). Data values are unknown
+        and returned as zeros (predictions are written; there is no target to compare against).
+        """
+        self._ensure_static_geoinfo()
+
+        coords = np.stack([self.latitudes, self.longitudes], axis=-1).astype(np.float32)
+        geoinfos = self._static_geoinfo.copy()
+
+        forcings = compute_forcing_geoinfos(self.latitudes, self.longitudes, when)
+        for channel, values in forcings.items():
+            if channel in self.geoinfo_channels:
+                geoinfos[:, self.geoinfo_channels.index(channel)] = values.astype(np.float32)
+
+        data = np.zeros((coords.shape[0], len(self.target_idx)), dtype=np.float32)
+        datetimes = np.repeat(np.datetime64(when), coords.shape[0])
+
+        return ReaderData(
+            coords=coords,
+            geoinfos=geoinfos,
+            data=data,
+            datetimes=datetimes,
+            is_forecast_query=True,
+        )
 
     def select_channels(self, ds0: anemoi_datasets, ch_type: str) -> NDArray[np.int64]:
         """

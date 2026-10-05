@@ -24,7 +24,7 @@
 # max_workers: 36  # hard cap on parallel workers (I/O, plotting, scoring)
 
 evaluation:
-  metrics: ["rmse", "mae"]
+  metrics: []
   # regions: ["global", "nhem"] # Have regions here, if you want for them to apply to all streams (scores calculation)
   summary_plots : true
   ratio_plots : false
@@ -44,7 +44,7 @@ evaluation:
 default_streams:
   ERA5:
     regions: ["global"]
-    channels: ["2t", "10u", "10v", "z_500", "t_850", "u_850", "v_850", "q_850"]
+    channels: ["2t"]
     evaluation:
       forecast_step: "all"
       sample: "all"
@@ -52,23 +52,46 @@ default_streams:
     plotting:
       sample: [0]
       forecast_step: "all" #supported: "all", [1,2,3,...], "1-50" (equivalent of [1,2,3,...50])
-      plot_maps: true
+      plot_timeseries: true
+      plot_maps: false
       plot_histograms: false
-      plot_animations: true
-      plot_timeseries: false
-  CERRA:
-    regions: ["europe"]
-    channels: ["z_500", "t_850", "u_850"] #, "blah"]
-    evaluation:
-      forecast_step: "all"
-      sample: "all"
-    plotting:
-      sample: [0]
-      forecast_step: "all"
-      plot_maps: true
-      plot_bias: false
-      plot_target: false
-      plot_histograms: true
-      plot_animations: true
-      plot_timeseries: false
+      plot_animations: false
       
+run_ids :
+  # --- other runs commented out; evaluating only the decadal run below ---
+  # oxykl0iz:
+  #   label: "absolute"
+  #   results_base_dir : "./results/oxykl0iz"
+  #
+  # k6ns73h2:
+  #   label: "absolute_after_fix"
+  #   results_base_dir : "./results/k6ns73h2"
+  #
+  # pdweqg0k:
+  #   label: "absolute normalized"
+  #   results_base_dir : "./results/pdweqg0k"
+  #
+  # yb5z0sh7:
+  #   label: "cos_sin"
+  #   results_base_dir : "./results/yb5z0sh7"
+  #
+  # dlf08kxi:
+  #   label: "fourier_emb_16"
+  #   results_base_dir : "./results/dlf08kxi"
+  #
+  # l01scgw4:
+  #   label: "eager (chunk=20)"
+  #   results_base_dir : "./results/l01scgw4"
+  #
+  # mla8bvp3:
+  #   label: "lazy (chunk=5)"
+  #   results_base_dir : "./results/mla8bvp3"
+  #
+  # k70gybsp:
+  #   label: "continued (10->20)"
+  #   results_base_dir : "./results/k70gybsp"
+
+  decadal_2023_2026:
+    label: "decadal free-running (2023->2026)"
+    results_base_dir : "./results/decadal_2023_2026"
+    #NEW: if "streams" is not specified, the default streams are used

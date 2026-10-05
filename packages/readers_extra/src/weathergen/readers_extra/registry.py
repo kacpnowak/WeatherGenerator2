@@ -32,5 +32,9 @@ def get_extra_reader(stream_type: str) -> object | None:
             from weathergen.readers_extra.data_reader_fesom import DataReaderFesom
 
             return DataReaderFesom
+        case "forcing":
+            from weathergen.readers_extra.data_reader_forcing import DataReaderForcing
+
+            return DataReaderForcing
         case _:
             return None

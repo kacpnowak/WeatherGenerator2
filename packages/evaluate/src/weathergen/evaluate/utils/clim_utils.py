@@ -124,6 +124,13 @@ def align_clim_data(
             for dim in target_da.dims:
                 if dim in target_da.coords and target_da.coords[dim].dims == (dim,):
                     all_stat_coords[dim] = target_da.coords[dim].values
+            # Also copy non-dimensional coordinates (e.g. 'sample', 'lat', 'lon', 'valid_time')
+            # so that downstream groupby('sample') works for scatter data.
+            for coord_name, coord in target_da.coords.items():
+                if coord_name not in all_stat_coords and all(
+                    d in target_da.dims for d in coord.dims
+                ):
+                    all_stat_coords[coord_name] = (list(coord.dims), coord.values)
             aligned_clim[fstep] = xr.DataArray(
                 np.full(
                     (len(all_stats),) + target_da.shape,

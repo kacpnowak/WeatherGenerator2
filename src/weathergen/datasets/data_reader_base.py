@@ -156,6 +156,9 @@ class ReaderData:
     data: NDArray[DType]
     datetimes: NDArray[NPDT64]
     is_spoof: bool = False
+    # free-running forecast step beyond the data: coords/geoinfos are a query, there is no
+    # ground-truth target. Predictions are written; the target is left empty (not written).
+    is_forecast_query: bool = False
 
     @staticmethod
     def empty(num_data_fields: int, num_geo_fields: int) -> "ReaderData":
@@ -210,6 +213,8 @@ class ReaderData:
             self.geoinfos[idx_valid],
             self.data[idx_valid],
             self.datetimes[idx_valid],
+            is_spoof=self.is_spoof,
+            is_forecast_query=self.is_forecast_query,
         )
 
     def shuffle(self, rng, shuffle: bool, num_subset: int) -> "ReaderData":
@@ -370,6 +375,22 @@ class DataReaderBase(metaclass=ABCMeta):
         """
 
         return self.length()
+
+    def get_condition(self, idx: TIndex) -> ReaderData:
+        """
+        Get source data for idx
+        Parameters
+        ----------
+        idx : int
+            Index of temporal window
+        Returns
+        -------
+        condition data (data for aux info )
+        """
+
+        rdata = self._get(idx, self.condition_idx)
+
+        return rdata
 
     def get_source(self, idx: TIndex) -> ReaderData:
         """

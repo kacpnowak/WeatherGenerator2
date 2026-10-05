@@ -150,7 +150,7 @@ class TokenizerMasking(Tokenizer):
 
         return (source_tokens_cells, source_tokens_lens)
 
-    def get_target_coords(
+    def get_target(
         self,
         stream_info: dict,
         rdata: IOReaderData,
@@ -158,6 +158,14 @@ class TokenizerMasking(Tokenizer):
         time_win: tuple,
         cell_mask,
     ):
+        """
+        Compute target coords and target values in one pass.
+
+        tokenize_apply_mask_target already produces both the coords_local/coords_per_cell
+        pair and the data/datetimes/coords triple from a single masking pass, so calling it
+        once here (instead of once per get_target_coords/get_target_values call) avoids
+        redoing identical cell_to_token_mask and masking work per timestep.
+        """
         # create tokenization index
         (idxs_cells, idxs_cells_lens) = token_data
 
@@ -165,40 +173,7 @@ class TokenizerMasking(Tokenizer):
             idxs_cells, idxs_cells_lens, cell_mask
         )
 
-        # TODO: split up
-        _, _, _, coords_local, coords_per_cell = tokenize_apply_mask_target(
-            stream_info["stream_id"],
-            self.hl_target,
-            idxs_cells,
-            idxs_cells_lens,
-            mask_tokens,
-            mask_channels,
-            rdata,
-            time_win,
-            self.hpy_verts_rots_target,
-            self.hpy_verts_local_target,
-            self.hpy_nctrs_target,
-            encode_times_target,
-        )
-
-        return (coords_local, coords_per_cell)
-
-    def get_target_values(
-        self,
-        stream_info: dict,
-        rdata: IOReaderData,
-        token_data,
-        time_win: tuple,
-        cell_mask,
-    ):
-        # create tokenization index
-        (idxs_cells, idxs_cells_lens) = token_data
-
-        (mask_tokens, mask_channels) = self.cell_to_token_mask(
-            idxs_cells, idxs_cells_lens, cell_mask
-        )
-
-        data, datetimes, coords, _, _ = tokenize_apply_mask_target(
+        data, datetimes, coords, coords_local, coords_per_cell = tokenize_apply_mask_target(
             stream_info["stream_id"],
             self.hl_target,
             idxs_cells,
@@ -220,4 +195,4 @@ class TokenizerMasking(Tokenizer):
             # compute indices for inversion
             _, idxs_ord_inv = torch.sort(idxs_flat)
 
-        return (data, datetimes, coords, idxs_ord_inv)
+        return (data, datetimes, coords, coords_local, coords_per_cell, idxs_ord_inv)

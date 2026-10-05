@@ -800,6 +800,13 @@ def validate_forecast_policy_and_steps(forecast_cfg: OmegaConf, mode: str):
     if len(forecast_cfg) == 0:
         return
 
+    forecast_cfg.num_steps = forecast_cfg.get("num_steps", 1)
+    forecast_cfg.chunk_size = forecast_cfg.get("chunk_size", forecast_cfg.num_steps)
+    assert (
+        isinstance(forecast_cfg.chunk_size, int) and forecast_cfg.chunk_size <= 0,
+        f"'{mode}.forecast.fstep_chunk_size' must be a positive integer.",
+    )
+
     provide_forecast_policy = (
         f"'{mode}.forecast.policy' must be specified when '{mode}.forecast.num_steps' is not zero "
         f"and '{mode}.forecast.offset' is 1. "
