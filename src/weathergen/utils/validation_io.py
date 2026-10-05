@@ -95,7 +95,6 @@ def write_output(
 
             elif target_aux_out.physical[t_idx][sname]["is_spoof"][0]:
                 preds = model_output.get_physical_prediction(t_chunk_idx, sname)
-                preds_shape = preds[0].shape
                 targets = target_aux_out.physical[t_idx][sname]["target"]
                 # for-loop to make sure we have a consistent number of samples
                 preds_s = [np.zeros((1, 0, t.shape[1])) for t in targets]
@@ -172,9 +171,10 @@ def write_output(
 
     # more prep work
 
-    # output stream names to be written, use specified ones or all if nothing specified
-    stream_names = list(cf.streams.keys())
-    stream_infos = list(cf.streams.values())
+    # output stream names to be written, use specified ones or all if nothing specified;
+    # FE-only streams have no outputs, so index streams as preds_all/targets_all/sources do
+    stream_names = list(data_streams.keys())
+    stream_infos = [cf.streams[name] for name in stream_names]
     if val_cfg.get("output").get("streams") is not None:
         output_stream_names = val_cfg.output.streams
     else:
@@ -186,10 +186,10 @@ def write_output(
     }
     _logger.debug(f"Using output streams: {output_streams} from streams: {stream_names}")
 
-    target_channels: list[list[str]] = [list(stream.val_target_channels) for stream in stream_infos if not is_stream_fe_only(stream)]
-    source_channels: list[list[str]] = [list(stream.val_source_channels) for stream in stream_infos if not is_stream_fe_only(stream)]
+    target_channels: list[list[str]] = [list(stream.val_target_channels) for stream in stream_infos]
+    source_channels: list[list[str]] = [list(stream.val_source_channels) for stream in stream_infos]
 
-    geoinfo_channels = [[] for stream in stream_infos if not is_stream_fe_only(stream)]  # TODO obtain channels
+    geoinfo_channels = [[] for _ in stream_infos]  # TODO obtain channels
 
     # calculate global sample indices for this batch by offsetting by sample_start
     sample_start = batch_idx * batch_size
@@ -208,7 +208,11 @@ def write_output(
     source_windows = (twh.window(idx) for idx in sample_idxs)
     source_intervals = [TimeRange(window.start, window.end) for window in source_windows]
 
-    latents_all = get_latent_output(batch, model_output) if write_latents else None
+    latents_all = (
+        get_latent_output(batch, model_output, timestep_idxs, fstep_offset)
+        if write_latents
+        else None
+    )
 
     data = io.OutputBatchData(
         sources,
@@ -466,7 +470,7 @@ def _build_latent_metadata(cf, batch, sample_idx_in_batch, npoints):
     )
 
 
-def get_latent_output(batch, model_output):
+def get_latent_output(batch, model_output, timestep_idxs=None, fstep_offset=0):
     """
     Interface for getting latent states
     """
@@ -474,7 +478,8 @@ def get_latent_output(batch, model_output):
     # collect latent outputs per forecast step and per sample
     fp32 = torch.float32
 
-    timestep_idxs = [0] if len(batch.get_output_idxs()) == 0 else batch.get_output_idxs()
+    if timestep_idxs is None:
+        timestep_idxs = [0] if len(batch.get_output_idxs()) == 0 else batch.get_output_idxs()
 
     sample_idxs = [
         list(sample.streams_data.values())[0].sample_idx
@@ -484,7 +489,7 @@ def get_latent_output(batch, model_output):
     latents_all: list[list[dict]] = []
     for t_idx in timestep_idxs:
         latents_all.append([])
-        latent_pred = model_output.get_latent_prediction(t_idx)
+        latent_pred = model_output.get_latent_prediction(t_idx - fstep_offset)
         n_samples = len(sample_idxs)
         for i_sample in range(n_samples):
             per_sample: dict = {}

@@ -257,8 +257,6 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 return DataReaderObs
             case "anemoi":
                 return DataReaderAnemoi
-            case "fesom":
-                return DataReaderFesom
             case type_name:
                 dataset = get_extra_reader(type_name)
                 if dataset is None:

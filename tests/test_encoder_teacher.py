@@ -580,7 +580,7 @@ class TestFrozenTeacher:
 
         batch = MagicMock()
         teacher.forward_teacher(MagicMock(), batch)
-        model.assert_called_once_with(teacher_params, batch)
+        model.assert_called_once_with(teacher_params, batch, batch.get_output_len())
 
     def test_forward_teacher_falls_back_to_student_params(self):
         model = MagicMock()
@@ -593,7 +593,7 @@ class TestFrozenTeacher:
         student_params = MagicMock()
         batch = MagicMock()
         teacher.forward_teacher(student_params, batch)
-        model.assert_called_once_with(student_params, batch)
+        model.assert_called_once_with(student_params, batch, batch.get_output_len())
 
     def test_has_required_methods(self):
         """FrozenTeacher has all required TargetAndAuxModuleBase methods."""
