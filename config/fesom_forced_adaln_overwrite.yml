@@ -3,7 +3,59 @@
 # This software is licensed under the terms of the Apache Licence Version 2.0
 # which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
 
-# Overwrite that switches a FESOM run to the IFS-forced stream set with a condition
-# stream (adaln_local injection). The forecasting engine is built with AdaLN norms, so
-# checkpoints trained without a condition stream only load partially.
-streams_directory: "./config/streams/fesom_forced_adaln/"
+# Overwrite for continuing or fine-tuning a saved FESOM run with the IFS atmosphere as a
+# per-step forcing injected through a per-cell AdaLN condition, e.g.
+#   train_continue --from-run-id <run> --config config/fesom_forced_adaln_overwrite.yml
+#
+# It turns the run's IFS_ATMO stream into a per-step forcing (adaln_local injection), adds the
+# Forecast_conditions condition stream it builds on, and keeps the run's ocean streams as they
+# are. streams_directory is left alone: the streams come from the run's config. The condition
+# stream builds the forecasting engine with AdaLN norms, so a checkpoint trained without a
+# condition stream only loads partially (the AdaLN norms start fresh).
+#
+# Keys of the run's IFS_ATMO entry that are not named here survive the merge; none of them
+# affects the forcing. The ones that would (type, source, source_exclude, diagnostic, target
+# channel lists, loss weight) are set here.
+#
+# For a fresh run with the repository's current ocean stream definitions, set
+# `streams_directory: ./config/streams/fesom_forced_adaln/` instead of using this file.
+streams :
+  IFS_ATMO :
+    name : IFS_ATMO
+    type : forcing
+    reader : fesom
+    diagnostic : False
+    stream_id : 2139
+    filenames : ['atmos_all']
+    entry_point : "forecast_engine"
+    frequency : "06:00:00"
+    source : ['10u', '10v', '2d', '2t', 'cp', 'lsp', 'msl', 'tsr', 'tsrc']
+    source_exclude : []
+    train_target_channels : []
+    val_target_channels : []
+    geoinfo_channels : []
+    loss_weight : 0.
+    location_weight : cosine_latitude
+    token_size : 8
+    tokenize_spacetime : True
+    injection :
+      mode : adaln_local
+      time_reduce : mean
+    embed :
+      net : transformer
+      num_tokens : 1
+      num_heads : 8
+      dim_embed : 256
+      num_blocks : 2
+  # time-of-year / time-of-day condition for the forecasting engine; the adaln_local mode adds
+  # the per-cell forcing onto it
+  Forecast_conditions :
+    name : Forecast_conditions
+    type : condition
+    filenames : []
+    variables : ['start_day', 'start_time', 'end_day', 'end_time']
+    transform : "fourier"  # absolute, absolute_normalized, cos_sin, fourier
+    entry_point : "forecast_engine"
+    emb_dimension : 16
+    train_target_channels : []
+    val_target_channels : []

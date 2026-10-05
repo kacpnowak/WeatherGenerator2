@@ -17,3 +17,6 @@ Forecast_conditions :
   transform : "fourier"  # absolute, absolute_normalized, cos_sin, fourier
   entry_point : "forecast_engine"
   emb_dimension : 16
+  # not predicted; the dynamic loss reads the target channels of every stream
+  train_target_channels : []
+  val_target_channels : []
