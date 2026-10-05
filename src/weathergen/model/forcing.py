@@ -29,12 +29,13 @@ and one matmul per forecast step, independent of the assimilation engine.
 import numpy as np
 import torch
 import torch.nn as nn
+from numpy.typing import NDArray
 
 from weathergen.datasets.utils import coords_to_hpyidxs
 
 
 def build_forcing_cell_index(
-    latitudes: np.ndarray, longitudes: np.ndarray, healpix_level: int
+    latitudes: NDArray, longitudes: NDArray, healpix_level: int
 ) -> torch.Tensor:
     """
     Map each forcing grid point to its HEALPix latent cell (nested convention).
@@ -83,22 +84,22 @@ def scatter_to_cells(
             contributed (0 = no data, e.g. all-land cell), usable as an input feature/mask.
     """
     *batch_shape, num_points, num_vars = values.shape
-    flat = values.reshape(-1, num_points, num_vars)  # (B, P, V)
-    B = flat.shape[0]
+    flat = values.reshape(-1, num_points, num_vars)  # (num_batch, P, V)
+    num_batch = flat.shape[0]
     device = flat.device
 
-    valid = torch.isfinite(flat)  # (B, P, V)
+    valid = torch.isfinite(flat)  # (num_batch, P, V)
     filled = torch.where(valid, flat, torch.zeros_like(flat))
 
-    idx = cell_idx.to(device).view(1, num_points, 1).expand(B, num_points, num_vars)
+    idx = cell_idx.to(device).view(1, num_points, 1).expand(num_batch, num_points, num_vars)
 
-    sums = torch.zeros(B, num_cells, num_vars, device=device, dtype=flat.dtype)
+    sums = torch.zeros(num_batch, num_cells, num_vars, device=device, dtype=flat.dtype)
     sums.scatter_add_(1, idx, filled)
-    counts = torch.zeros(B, num_cells, num_vars, device=device, dtype=flat.dtype)
+    counts = torch.zeros(num_batch, num_cells, num_vars, device=device, dtype=flat.dtype)
     counts.scatter_add_(1, idx, valid.to(flat.dtype))
 
     cell_values = torch.where(counts > 0, sums / counts.clamp_min(1.0), torch.zeros_like(sums))
-    total = torch.zeros(B, num_cells, num_vars, device=device, dtype=flat.dtype)
+    total = torch.zeros(num_batch, num_cells, num_vars, device=device, dtype=flat.dtype)
     total.scatter_add_(1, idx, torch.ones_like(filled))
     cell_valid = torch.where(total > 0, counts / total.clamp_min(1.0), torch.zeros_like(counts))
 
@@ -114,12 +115,12 @@ class ForcingUnavailableError(RuntimeError):
 TIME_REDUCE_MODES = ("mean", "stack", "last")
 
 
-def count_snapshots(datetimes: np.ndarray) -> int:
+def count_snapshots(datetimes: NDArray) -> int:
     """Number of distinct valid times among the rows of one reader window."""
     return int(np.unique(np.asarray(datetimes)).size)
 
 
-def reduce_forcing_time(values: np.ndarray, num_snapshots: int, mode: str) -> np.ndarray:
+def reduce_forcing_time(values: NDArray, num_snapshots: int, mode: str) -> NDArray:
     """
     Reduce the snapshots of one forcing window to a single per-point field.
 
@@ -161,15 +162,15 @@ def reduce_forcing_time(values: np.ndarray, num_snapshots: int, mode: str) -> np
 
 
 def forcing_field_from_window(
-    values: np.ndarray,
-    datetimes: np.ndarray,
-    coords: np.ndarray | None,
+    values: NDArray,
+    datetimes: NDArray,
+    coords: NDArray | None,
     cell_idx: torch.Tensor | None,
     healpix_level: int,
     num_cells: int,
     time_reduce: str = "mean",
     expected_snapshots: int | None = None,
-) -> tuple[np.ndarray, torch.Tensor]:
+) -> tuple[NDArray, torch.Tensor]:
     """
     Turn one reader window of a forcing stream into the per-cell field injected at one step.
 
@@ -239,6 +240,20 @@ def forcing_num_vars_from_cfg(stream_cfg) -> int:
     return len(source_channels)
 
 
+def check_one_latent_token_per_cell(mode: str, ae_local_num_queries: int) -> None:
+    """
+    Reject a forcing injection the latent token layout cannot take.
+
+    The per-cell forcing embedding ``(num_cells, dim)`` is lined up with the cell tokens, so
+    every injection mode needs exactly one latent token per HEALPix cell.
+    """
+    if mode != "none" and ae_local_num_queries != 1:
+        raise ValueError(
+            f"forcing injection mode {mode!r} needs one latent token per HEALPix cell "
+            f"(ae_local_num_queries: 1), but ae_local_num_queries is {ae_local_num_queries}"
+        )
+
+
 def forcing_field_is_empty(field) -> bool:
     """True if a step's forcing field is missing or empty, i.e. the step runs unforced."""
     return field is None or not torch.is_tensor(field) or field.numel() == 0
@@ -271,8 +286,8 @@ class ForcingEmbed(nn.Module):
         self,
         num_vars: int,
         dim_embed: int,
-        mean: np.ndarray | None = None,
-        stdev: np.ndarray | None = None,
+        mean: NDArray | None = None,
+        stdev: NDArray | None = None,
         hidden_factor: int = 2,
     ) -> None:
         super().__init__()
@@ -294,6 +309,14 @@ class ForcingEmbed(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, dim_embed),
         )
+
+    def reset_parameters(self) -> None:
+        """Identity normalisation and freshly initialised MLP, as a default construction."""
+        nn.init.zeros_(self.mean)
+        nn.init.ones_(self.stdev)
+        for layer in self.mlp:
+            if isinstance(layer, nn.Linear):
+                layer.reset_parameters()
 
     def forward(self, cell_values: torch.Tensor, cell_valid: torch.Tensor) -> torch.Tensor:
         """
@@ -379,6 +402,26 @@ class ForcingInjection(nn.Module):
             self.cross_attn = nn.MultiheadAttention(dim_embed, num_heads, batch_first=True)
         elif mode in ("global", "adaln_local"):
             self.cond_proj = nn.Linear(dim_embed, dim_aux)
+
+    def reset_parameters(self) -> None:
+        """
+        Re-initialise to the state of a fresh construction, zero gate included.
+
+        With FSDP the model is built on the meta device and its memory is allocated
+        uninitialised; this restores the no-op-at-initialisation guarantee there, and for a
+        forcing module that a loaded checkpoint does not contain.
+        """
+        if self.mode == "none":
+            return
+        self.embed.reset_parameters()
+        nn.init.zeros_(self.gate)
+        if self.mode == "cross_attn":
+            self.norm_q.reset_parameters()
+            # _reset_parameters leaves the output projection's weight alone
+            self.cross_attn.out_proj.reset_parameters()
+            self.cross_attn._reset_parameters()
+        elif self.mode in ("global", "adaln_local"):
+            self.cond_proj.reset_parameters()
 
     @staticmethod
     def _is_empty(x) -> bool:

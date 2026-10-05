@@ -39,6 +39,7 @@ from weathergen.model.engines import (
 )
 from weathergen.model.forcing import (
     ForcingInjection,
+    check_one_latent_token_per_cell,
     forcing_field_is_empty,
     forcing_num_vars_from_cfg,
 )
@@ -477,6 +478,7 @@ class Model(torch.nn.Module):
             mode = inj.get("mode", "none")
             if mode == "none":
                 continue
+            check_one_latent_token_per_cell(mode, cf.ae_local_num_queries)
             # dim_embed must equal the FE token dim so additive/cross_attn line up; the
             # global/adaln_local modes then project this down to the conditioning dim.
             self.forcing_module = ForcingInjection(
@@ -691,7 +693,9 @@ class Model(torch.nn.Module):
 
     def reset_parameters(self):
         def _reset_params(module):
-            if isinstance(module, AdaLayerNorm | nn.Linear | nn.LayerNorm):
+            # the forcing module also restores its zero gate, identity normalisation buffers
+            # and cross-attention input projection (apply visits it after its children)
+            if isinstance(module, AdaLayerNorm | nn.Linear | nn.LayerNorm | ForcingInjection):
                 module.reset_parameters()
             else:
                 pass

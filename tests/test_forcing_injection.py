@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from weathergen.model.forcing import ForcingInjection, forcing_num_vars_from_cfg
+from weathergen.model.forcing import (
+    ForcingInjection,
+    check_one_latent_token_per_cell,
+    forcing_num_vars_from_cfg,
+)
 from weathergen.model.norms import AdaLayerNorm
 
 NUM_CELLS, NUM_VARS, DIM, DIM_AUX, NUM_AUX, BATCH = 12, 3, 16, 8, 2, 2
@@ -23,16 +27,58 @@ def _injection(mode):
     return ForcingInjection(NUM_VARS, DIM, mode, dim_aux=DIM_AUX, num_heads=4)
 
 
-@pytest.mark.parametrize("mode", MODES)
-def test_injection_is_a_noop_at_initialisation(mode):
+def _assert_noop(injection, mode):
     tokens, condition, field = _inputs()
-    out_tokens, out_condition = _injection(mode)(tokens, condition, field, NUM_AUX)
+    out_tokens, out_condition = injection(tokens, condition, field, NUM_AUX)
     assert torch.allclose(out_tokens, tokens)
     if mode == "adaln_local":
         assert out_condition.shape == (NUM_AUX + NUM_CELLS, DIM_AUX)
         assert torch.allclose(out_condition, condition.expand_as(out_condition))
     else:
         assert torch.allclose(out_condition, condition)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_injection_is_a_noop_at_initialisation(mode):
+    _assert_noop(_injection(mode), mode)
+
+
+POISON = 7.0
+
+
+def _poison(module):
+    # what FSDP's meta-device build leaves behind: arbitrary memory in every tensor
+    with torch.no_grad():
+        for tensor in [*module.parameters(), *module.buffers()]:
+            tensor.fill_(POISON)
+
+
+def _assert_reset(injection, mode):
+    assert torch.equal(injection.gate, torch.zeros(1))
+    assert torch.equal(injection.embed.mean, torch.zeros(NUM_VARS))
+    assert torch.equal(injection.embed.stdev, torch.ones(NUM_VARS))
+    for name, param in injection.named_parameters():
+        assert not torch.all(param == POISON), f"{name} was not re-initialised"
+    _assert_noop(injection, mode)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_reset_parameters_restores_the_initial_state(mode):
+    injection = _injection(mode)
+    _poison(injection)
+    injection.reset_parameters()
+    _assert_reset(injection, mode)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_model_reset_parameters_covers_the_forcing_module(mode):
+    from weathergen.model.model import Model
+
+    model = torch.nn.Module()  # stands in for the Model: reset_parameters only walks modules
+    model.forcing_module = _injection(mode)
+    _poison(model)
+    Model.reset_parameters(model)
+    _assert_reset(model.forcing_module, mode)
 
 
 @pytest.mark.parametrize("mode", ["additive", "cross_attn"])
@@ -107,3 +153,14 @@ def test_forcing_num_vars_from_cfg():
     assert forcing_num_vars_from_cfg({"train_source_channels": ["a", "b"]}) == 2
     assert forcing_num_vars_from_cfg({"val_source_channels": ["a", "b", "c"]}) == 3
     assert forcing_num_vars_from_cfg({}) == 0
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_injection_needs_one_latent_token_per_cell(mode):
+    check_one_latent_token_per_cell(mode, ae_local_num_queries=1)
+    with pytest.raises(ValueError, match="ae_local_num_queries"):
+        check_one_latent_token_per_cell(mode, ae_local_num_queries=2)
+
+
+def test_disabled_injection_accepts_several_latent_tokens_per_cell():
+    check_one_latent_token_per_cell("none", ae_local_num_queries=4)
