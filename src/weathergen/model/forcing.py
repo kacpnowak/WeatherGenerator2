@@ -107,6 +107,117 @@ def scatter_to_cells(
     return cell_values, cell_valid
 
 
+class ForcingUnavailableError(RuntimeError):
+    """A forcing stream has no usable data for a requested time window."""
+
+
+TIME_REDUCE_MODES = ("mean", "stack", "last")
+
+
+def count_snapshots(datetimes: np.ndarray) -> int:
+    """Number of distinct valid times among the rows of one reader window."""
+    return int(np.unique(np.asarray(datetimes)).size)
+
+
+def reduce_forcing_time(values: np.ndarray, num_snapshots: int, mode: str) -> np.ndarray:
+    """
+    Reduce the snapshots of one forcing window to a single per-point field.
+
+    Parameters
+    ----------
+    values :
+        ``(num_snapshots * num_points, num_vars)``, time-major, with the same point order in
+        every snapshot.
+    num_snapshots :
+        Number of snapshots the rows hold.
+    mode :
+        ``mean`` (NaN-aware mean over the snapshots), ``last`` (final snapshot) or ``stack``
+        (all snapshots concatenated along the channel axis, first snapshot first).
+
+    Returns
+    -------
+    ``(num_points, num_vars)`` for ``mean`` / ``last``, ``(num_points, num_snapshots *
+    num_vars)`` for ``stack``. A point/var that is NaN in every snapshot stays NaN under
+    ``mean``.
+    """
+    if mode not in TIME_REDUCE_MODES:
+        raise ValueError(f"unknown time_reduce {mode!r}, expected one of {TIME_REDUCE_MODES}")
+    values = np.asarray(values)
+    if num_snapshots <= 0 or values.shape[0] % num_snapshots != 0:
+        raise ForcingUnavailableError(
+            f"{values.shape[0]} rows cannot be split into {num_snapshots} snapshots"
+        )
+    num_points = values.shape[0] // num_snapshots
+    snapshots = values.reshape(num_snapshots, num_points, values.shape[-1])
+    if mode == "last":
+        return snapshots[-1]
+    if mode == "stack":
+        return np.concatenate(list(snapshots), axis=-1)
+    valid = np.isfinite(snapshots)
+    total = np.where(valid, snapshots, 0.0).sum(axis=0)
+    count = valid.sum(axis=0)
+    mean = np.where(count > 0, total / np.maximum(count, 1), np.nan)
+    return mean.astype(values.dtype, copy=False)
+
+
+def forcing_field_from_window(
+    values: np.ndarray,
+    datetimes: np.ndarray,
+    coords: np.ndarray | None,
+    cell_idx: torch.Tensor | None,
+    healpix_level: int,
+    num_cells: int,
+    time_reduce: str = "mean",
+    expected_snapshots: int | None = None,
+) -> tuple[np.ndarray, torch.Tensor]:
+    """
+    Turn one reader window of a forcing stream into the per-cell field injected at one step.
+
+    Parameters
+    ----------
+    values :
+        Normalised forcing values of the window, ``(num_snapshots * num_points, num_vars)``.
+    datetimes :
+        Valid time of every row; the number of distinct values is the snapshot count.
+    coords :
+        ``(rows, 2)`` latitude/longitude in degrees per row. Only read when ``cell_idx`` is
+        None, to build the cell index from the first snapshot.
+    cell_idx :
+        Precomputed point -> HEALPix cell index, or None to build it here.
+    healpix_level, num_cells :
+        Latent grid the field is scattered onto.
+    time_reduce :
+        See :func:`reduce_forcing_time`.
+    expected_snapshots :
+        If given, a window with a different snapshot count is rejected.
+
+    Returns
+    -------
+    (field, cell_idx): ``field`` is ``(num_cells, 2 * num_out_vars)`` = [cell_values |
+    cell_valid]; ``cell_idx`` is the index used, to be cached by the caller.
+    """
+    num_snapshots = count_snapshots(datetimes)
+    if num_snapshots == 0:
+        raise ForcingUnavailableError("window holds no forcing data")
+    if expected_snapshots is not None and num_snapshots != expected_snapshots:
+        raise ForcingUnavailableError(
+            f"window holds {num_snapshots} snapshots, expected {expected_snapshots}"
+        )
+    reduced = reduce_forcing_time(values, num_snapshots, time_reduce)
+    num_points = reduced.shape[0]
+    if cell_idx is None:
+        first = np.asarray(coords)[:num_points]
+        cell_idx = build_forcing_cell_index(first[:, 0], first[:, 1], healpix_level)
+    if len(cell_idx) != num_points:
+        raise ForcingUnavailableError(
+            f"{num_points} grid points do not match the cell index of {len(cell_idx)} points"
+        )
+    values_t = torch.as_tensor(np.ascontiguousarray(reduced), dtype=torch.float32)
+    cell_values, cell_valid = scatter_to_cells(values_t.unsqueeze(0), cell_idx, num_cells)
+    field = torch.cat([cell_values[0], cell_valid[0]], dim=-1).numpy()
+    return field, cell_idx
+
+
 class ForcingEmbed(nn.Module):
     """
     Per-cell forcing embedding shared by all injection modes.
