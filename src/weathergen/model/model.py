@@ -19,6 +19,7 @@ import astropy_healpix.healpy
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.distributed.fsdp import FSDPModule
 from torch.utils.checkpoint import checkpoint
 
 from weathergen.common.config import Config
@@ -1031,6 +1032,20 @@ class Model(torch.nn.Module):
             Predictions, (ens, num_target_points, channels), or an empty tensor when the
             coordinate embedding yields nothing to decode.
         """
+        # Under FSDP the backward pass recomputes this (checkpointed) step after the decoder's units
+        # have resharded, and while they skip the unshard in their pre-forward hook (FSDP leaves it
+        # to the pre-backward hook, which for this rollout step has not run yet): gather their
+        # parameters here. A no-op without FSDP or when already gathered; each unit's
+        # post-backward reshards as usual.
+        for decoder_part in (
+            self.embed_target_coords[stream_name],
+            self.target_token_engines[stream_name],
+            self.pred_heads[stream_name],
+        ):
+            for module in decoder_part.modules():
+                if isinstance(module, FSDPModule):
+                    module.unshard()
+
         tc_tokens = self._embed_target_coords(stream_name, t_coords)
         if tc_tokens is None:
             return torch.tensor([], device=tokens.device)

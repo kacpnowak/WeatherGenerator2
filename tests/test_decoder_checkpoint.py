@@ -143,3 +143,49 @@ def test_decode_runs_without_grad():
     with torch.no_grad():
         Model.predict_decoders(stub, params, 1, 1, tokens.detach(), batch, out)
     assert set(out.physical) == set(STREAMS)
+
+
+def test_rollout_decode_recompute_under_fsdp(tmp_path):
+    """
+    Under FSDP the backward pass recomputes an earlier rollout step's decode after the decoder's
+    units have resharded (and skip the unshard in their pre-forward hook): the decode step has
+    to gather their parameters itself.
+    """
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'pg'}", rank=0, world_size=1)
+    try:
+        stub, batch, params, tokens = _setup()
+
+        class Root(torch.nn.Module):
+            """Stands in for the model: decodes two rollout steps with the same decoders."""
+
+            def __init__(self):
+                super().__init__()
+                self.embed_target_coords = stub.embed_target_coords
+                self.target_token_engines = stub.target_token_engines
+                self.pred_heads = stub.pred_heads
+
+            def forward(self, tokens):
+                outputs = [_Output(), _Output()]
+                Model.predict_decoders(stub, params, 1, 1, tokens, batch, outputs[0])
+                Model.predict_decoders(stub, params, 1, 1, 2.0 * tokens, batch, outputs[1])
+                return sum(
+                    (p**2).sum() for o in outputs for pred in o.physical.values() for p in pred
+                )
+
+        mesh = init_device_mesh("cpu", (1,))
+        root = Root()
+        for engine in root.target_token_engines.values():
+            fully_shard(engine.lin, mesh=mesh)  # like the decoder's attention and MLP units
+        fully_shard(root, mesh=mesh)
+
+        root(tokens).backward()
+
+        assert tokens.grad is not None and tokens.grad.abs().sum() > 0
+        for engine in root.target_token_engines.values():
+            assert engine.lin.weight.grad is not None
+    finally:
+        dist.destroy_process_group()
