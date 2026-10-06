@@ -943,10 +943,14 @@ class Model(torch.nn.Module):
         batch_size = len(batch)
         s = [batch_size, self.num_healpix_cells, self.cf.ae_local_num_queries, tokens.shape[-1]]
         idxs = model_params.hp_nbours.unsqueeze(0).repeat((batch_size, 1, 1)).flatten(0, 1)
-        tokens_nbors = tokens.reshape(s).flatten(0, 1)[idxs.flatten()].flatten(0, 1)
+        tokens_cells = tokens.reshape(s).flatten(0, 1)
+        # the classic decoder gathers the neighbourhood inside its own checkpoints, so the gathered
+        # copy (9x the latent, ~0.8 GB on HEALPix level 5) is not kept for every rollout step
+        gather_in_decoder = self.cf.decoder_type == "PerceiverIOCoordConditioning"
+        tokens_nbors = None if gather_in_decoder else tokens_cells[idxs.flatten()].flatten(0, 1)
         # TODO: precompute in model_params?
         tokens_nbors_lens = torch.full(
-            (s[0] * s[1] + 1,), fill_value=9, dtype=torch.int32, device=tokens_nbors.device
+            (s[0] * s[1] + 1,), fill_value=9, dtype=torch.int32, device=tokens.device
         )
         tokens_nbors_lens[0] = 0
 
@@ -998,8 +1002,13 @@ class Model(torch.nn.Module):
                         tcs_lens,
                     ).unsqueeze(0)  # add ensemble dim: shape is then [1, preds_per_coord, channels]
                 else:
+                    latent = (
+                        {"latent": tokens_cells, "latent_idxs": idxs.flatten()}
+                        if gather_in_decoder
+                        else {"latent": tokens_nbors}
+                    )
                     tc_tokens = self.target_token_engines[stream_name](
-                        latent=tokens_nbors,
+                        **latent,
                         output=tc_tokens,
                         latent_lens=tokens_nbors_lens,
                         output_lens=tcs_lens,

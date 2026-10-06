@@ -704,6 +704,11 @@ class EnsPredictionHead(torch.nn.Module):
         return preds
 
 
+def _cross_attend_gathered(block, x_q, latent, latent_idxs, *args):
+    """Gather each target cell's neighbourhood of the latent, then cross-attend to it."""
+    return block(x_q, latent[latent_idxs].flatten(0, 1), *args)
+
+
 class TargetPredictionEngineClassic(nn.Module):
     def __init__(
         self,
@@ -788,7 +793,13 @@ class TargetPredictionEngineClassic(nn.Module):
                 )
             )
 
-    def forward(self, latent, output, latent_lens, output_lens, coordinates):
+    def forward(self, latent, output, latent_lens, output_lens, coordinates, latent_idxs=None):
+        """
+        latent_idxs : optional. If given, ``latent`` holds the un-gathered latent tokens and each
+            cross-attention block gathers ``latent[latent_idxs]`` inside its own checkpoint, so the
+            gathered copy (9 neighbours per cell) is recomputed in the backward pass instead of
+            being kept for every rollout step. Otherwise ``latent`` is already gathered.
+        """
         tc_tokens = output
         tcs_lens = output_lens
         tokens_stream = latent
@@ -798,6 +809,18 @@ class TargetPredictionEngineClassic(nn.Module):
         for ib, block in enumerate(self.tte):
             if self.cf.pred_self_attention and ib % 3 == 1:
                 tc_tokens = checkpoint(block, tc_tokens, tcs_lens, tcs_aux, use_reentrant=False)
+            elif latent_idxs is not None and isinstance(block, MultiCrossAttentionHeadVarlen):
+                tc_tokens = checkpoint(
+                    _cross_attend_gathered,
+                    block,
+                    tc_tokens,
+                    tokens_stream,
+                    latent_idxs,
+                    tcs_lens,
+                    tokens_lens,
+                    tcs_aux,
+                    use_reentrant=False,
+                )
             else:
                 tc_tokens = checkpoint(
                     block,
