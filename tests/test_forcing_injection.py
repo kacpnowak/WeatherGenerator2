@@ -255,3 +255,28 @@ def test_fully_sharded_forcing_module_state_dict_gathers(tmp_path):
         }
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_checkpointed_injection_matches_direct_call(mode):
+    # Model.forward runs the injection under activation checkpointing to save memory per step
+    from torch.utils.checkpoint import checkpoint
+
+    tokens, condition, field = _inputs()
+    results = []
+    for use_checkpoint in (False, True):
+        injection = _injection(mode)
+        injection.gate.data.fill_(0.5)  # non-zero so the forcing actually acts
+        x = tokens.clone().requires_grad_(True)
+        args = (x, condition, field, NUM_AUX)
+        if use_checkpoint:
+            out_tokens, out_condition = checkpoint(injection, *args, use_reentrant=False)
+        else:
+            out_tokens, out_condition = injection(*args)
+        (out_tokens.pow(2).sum() + out_condition.pow(2).sum()).backward()
+        grads = [p.grad.clone() for p in injection.parameters() if p.grad is not None]
+        results.append((out_tokens.detach(), out_condition.detach(), x.grad.clone(), grads))
+    (t0, c0, g0, p0), (t1, c1, g1, p1) = results
+    assert torch.allclose(t0, t1) and torch.allclose(c0, c1) and torch.allclose(g0, g1)
+    assert len(p0) == len(p1) > 0
+    assert all(torch.allclose(a, b) for a, b in zip(p0, p1, strict=True))

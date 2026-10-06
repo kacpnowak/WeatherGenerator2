@@ -842,6 +842,11 @@ class Trainer(TrainerBase):
 
             self.cf.general.istep += 1
 
+            # release this step's batch and outputs before the next forward pass: the model output
+            # holds the batch, including every forecast step's target coordinates (~2.3 GB for the
+            # FESOM streams), which otherwise stays on the GPU through the next step
+            del batch, x, preds, targets_and_auxs, loss
+
         self.dataset.advance()
 
     def validate(self, mini_epoch, mode_cfg, batch_size):

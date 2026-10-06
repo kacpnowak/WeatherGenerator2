@@ -841,8 +841,15 @@ class Model(torch.nn.Module):
                             "model."
                         )
                         self._warned_missing_forcing = True
-                    tokens, condition = self.forcing_module(
-                        tokens, condition, forcing_field, self.num_aux_tokens
+                    # checkpointed like the FE blocks: otherwise the forcing embedding keeps its
+                    # activations for every rollout step (~0.3 GB per step on HEALPix level 5)
+                    tokens, condition = checkpoint(
+                        self.forcing_module,
+                        tokens,
+                        condition,
+                        forcing_field,
+                        self.num_aux_tokens,
+                        use_reentrant=False,
                     )
                 if without_grad:
                     # Pushforward mode: advance tokens without grad; no decoding
