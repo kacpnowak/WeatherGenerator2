@@ -35,7 +35,7 @@ from weathergen.datasets.utils import (
 )
 from weathergen.readers_extra.data_reader_condition import DataReaderCondition
 from weathergen.readers_extra.registry import get_extra_reader
-from weathergen.train.utils import Stage, get_batch_size_from_config
+from weathergen.train.utils import TRAIN, Stage, get_batch_size_from_config
 from weathergen.utils.distributed import is_root
 
 type AnyDataReader = DataReaderBase | DataReaderAnemoi | DataReaderObs
@@ -128,6 +128,48 @@ def forcing_time_window_handler(
         tw_handler.t_window_len,
         tw_handler.t_window_step,
     )
+
+
+def resolve_prefix_range(forecast_cfg: dict, stage: Stage) -> tuple[int, int]:
+    """
+    Range [min, max] of the unsupervised spin-up steps drawn per training step.
+
+    `forecast.prefix_steps` lets a training rollout first advance the latent state for P steps
+    without gradients or targets, so the supervised steps start from the model's own drifted
+    state. Only the training stage uses it: validation and test configs inherit the training
+    forecast settings, and must keep rolling out from the initial condition.
+    """
+    prefix = forecast_cfg.get("prefix_steps")
+    if stage != TRAIN or prefix is None:
+        return (0, 0)
+    if (
+        not isinstance(prefix, list | tuple)
+        or len(prefix) != 2
+        or not all(isinstance(p, int) for p in prefix)
+        or not 0 <= prefix[0] <= prefix[1]
+    ):
+        raise ValueError(
+            f"forecast.prefix_steps must be [min, max] with integers 0 <= min <= max, "
+            f"got {prefix!r}"
+        )
+    return (prefix[0], prefix[1])
+
+
+def draw_prefix_steps(
+    prefix_range: tuple[int, int], seed: int, mini_epoch: int, position: int
+) -> int:
+    """
+    Spin-up length of the training step at `position` (sample index in the rank's share).
+
+    Seeded only by the run seed, the mini-epoch and the position, never by the rank or the
+    loader worker, so every rank draws the same length for the same training step: no rank
+    waits on another's longer spin-up, and all ranks run the same forecast-engine calls.
+    """
+    low, high = prefix_range
+    if high == 0:
+        return 0
+    rng = np.random.default_rng([seed, mini_epoch, position])
+    return int(rng.integers(low, high + 1))
 
 
 @dataclasses.dataclass
