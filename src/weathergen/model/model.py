@@ -834,6 +834,7 @@ class Model(torch.nn.Module):
                 condition = batch_ctx.conditions[step + batch_step_offset]
                 # inject the per-step spatial forcing (e.g. SST) into the FE latent state /
                 # conditioning before advancing; no-op when no forcing module or field.
+                forcing_field = None
                 if self.forcing_module is not None:
                     forcing_list = getattr(batch_ctx, "forcing", None)
                     fidx = step + batch_step_offset
@@ -849,31 +850,34 @@ class Model(torch.nn.Module):
                             "model."
                         )
                         self._warned_missing_forcing = True
-                    if without_grad:
-                        # nothing is back-propagated through this step: keep no activations
-                        with torch.no_grad():
-                            tokens, condition = self.forcing_module(
-                                tokens, condition, forcing_field, self.num_aux_tokens
-                            )
-                    else:
-                        # checkpointed like the FE blocks: otherwise the forcing embedding keeps
-                        # its activations for every rollout step (~0.3 GB per step on HEALPix
-                        # level 5)
-                        tokens, condition = checkpoint(
-                            self.forcing_module,
-                            tokens,
-                            condition,
-                            forcing_field,
-                            self.num_aux_tokens,
-                            use_reentrant=False,
-                        )
                 if without_grad:
                     # spin-up / pushforward: advance tokens without grad; no decoding
                     with torch.no_grad():
+                        if self.forcing_module is not None:
+                            tokens, condition = self.forcing_module(
+                                tokens, condition, forcing_field, self.num_aux_tokens
+                            )
                         tokens = self.forecast_engine(
                             tokens, condition, coords=model_params.rope_coords
                         )
+                    # autocast caches the low-precision copies of fp32 weights it casts; cast
+                    # under no_grad they are detached, and a later step with grad would reuse
+                    # them and lose the weights' gradients
+                    torch.clear_autocast_cache()
                     continue
+                # Supervised steps: apply forcing with checkpoint, then forecast engine with grad
+                if self.forcing_module is not None:
+                    # checkpointed like the FE blocks: otherwise the forcing embedding keeps
+                    # its activations for every rollout step (~0.3 GB per step on HEALPix
+                    # level 5)
+                    tokens, condition = checkpoint(
+                        self.forcing_module,
+                        tokens,
+                        condition,
+                        forcing_field,
+                        self.num_aux_tokens,
+                        use_reentrant=False,
+                    )
                 prev_tokens = tokens if self.compute_cos_sim_to_prev else None
                 tokens = self.forecast_engine(tokens, condition, coords=model_params.rope_coords)
 

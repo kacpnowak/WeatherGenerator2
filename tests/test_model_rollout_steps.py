@@ -50,6 +50,8 @@ def _stub_model():
         log.decodes.append(
             {"output_step": output_step, "batch_step": batch_step, "fe_calls": log.fe_calls}
         )
+        # Add physical prediction so assertions about output.physical are meaningful
+        output.add_physical_prediction(output_step, "stream", tokens)
         return output
 
     def predict_latent(model_params, step, tokens, batch, output):
@@ -201,6 +203,7 @@ def test_spin_up_steps_advance_without_gradients_and_are_not_decoded():
 
 def test_first_supervised_step_at_the_first_forecast_step_changes_nothing():
     model, log = _stub_model()
+    grad = _recording_grad(model)
     batch = _batch(offset=1, num_steps=2)
     batch.first_supervised_step = 1
     Model.forward(model, MODEL_PARAMS, batch, batch.get_output_len())
@@ -208,3 +211,64 @@ def test_first_supervised_step_at_the_first_forecast_step_changes_nothing():
     assert log.fe_calls == 2
     assert log.forcing == [1, 2]
     assert [(d["batch_step"], d["fe_calls"]) for d in log.decodes] == [(1, 1), (2, 2)]
+    assert grad["fe"] == [True, True]  # all steps are supervised, grad is on
+    assert grad["forcing"] == [True, True]
+
+
+def test_spin_up_under_autocast_preserves_forcing_gradients():
+    """Regression: autocast caches low-precision copies of weights under no_grad.
+    Supervised steps must not reuse detached copies or gradients are lost."""
+    model, _ = _stub_model()
+    # Replace forcing_module with a real Linear layer
+    lin = torch.nn.Linear(DIM, DIM)
+
+    def forcing_module_with_linear(tokens, condition, field, num_aux):
+        # Apply linear transformation to tokens
+        tokens = lin(tokens)
+        return tokens, condition
+
+    model.forcing_module = forcing_module_with_linear
+    batch = _batch(offset=1, num_steps=4)
+    batch.first_supervised_step = 3
+
+    # Run forward inside autocast context
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output = Model.forward(model, MODEL_PARAMS, batch, batch.get_output_len())
+
+    # Backward from the last step's latent state
+    last_latent = output.latent[4]["latent_state"]
+    last_latent.z_pre_norm.float().sum().backward()
+
+    # Assert that the linear layer received gradients
+    assert lin.weight.grad is not None
+    assert (lin.weight.grad.abs() > 0).any()
+
+
+def test_pushforward_under_autocast_preserves_forcing_gradients():
+    """Regression: same as spin-up but for pushforward mode."""
+    model, _ = _stub_model()
+    model.training = True
+    model.cf = SimpleNamespace(training_config={"forecast": {"pushforward": True}})
+
+    # Replace forcing_module with a real Linear layer
+    lin = torch.nn.Linear(DIM, DIM)
+
+    def forcing_module_with_linear(tokens, condition, field, num_aux):
+        # Apply linear transformation to tokens
+        tokens = lin(tokens)
+        return tokens, condition
+
+    model.forcing_module = forcing_module_with_linear
+    batch = _batch(offset=1, num_steps=3)
+
+    # Run forward inside autocast context
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output = Model.forward(model, MODEL_PARAMS, batch, batch.get_output_len())
+
+    # Backward from the last step's latent state
+    last_latent = output.latent[3]["latent_state"]
+    last_latent.z_pre_norm.float().sum().backward()
+
+    # Assert that the linear layer received gradients
+    assert lin.weight.grad is not None
+    assert (lin.weight.grad.abs() > 0).any()
