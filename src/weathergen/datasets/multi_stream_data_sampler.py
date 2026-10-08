@@ -203,6 +203,8 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.forecast_policy = forecast_cfg["policy"]
         steps = np.array(forecast_cfg["num_steps"], dtype=np.int32).reshape(-1)
         self.list_num_forecast_steps = np.array(steps, dtype=np.int32)
+        # unsupervised spin-up steps drawn per training step (training stage only)
+        self._prefix_range = resolve_prefix_range(forecast_cfg, stage)
 
         # Lazy target materialization: for a long single-sample rollout (decadal), building
         # every forecast step's targets up front blows memory. When the rollout is chunked
@@ -241,7 +243,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
         # check samples per mini epoch
         self.samples_per_mini_epoch = mode_cfg.samples_per_mini_epoch
-        self.check_samples(self._get_fsm())
+        self.check_samples(self._get_fsm() + self._prefix_range[1])
         self.streams_datasets = self._init_data_streams(cf)
         self.condition_datasets = self._init_condition_streams(cf)
         self.forcing_datasets = self._init_forcing_streams(cf)
@@ -249,6 +251,9 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         rs = cf.data_loading.rng_seed
         nw = cf.data_loading.num_workers
         self.data_loader_rng_seed = rs if rs > nw else rs * 97
+        # spin-up lengths are seeded by the run seed alone (data_loader_rng_seed is made
+        # unique per rank and worker), so every rank draws the same length for a step
+        self._prefix_seed = int(rs)
 
         self.rng = None
 
@@ -571,8 +576,10 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         """
         self.rng = np.random.default_rng(self.data_loader_rng_seed)
         fsm = self._get_fsm()
-        self.check_samples(fsm)
-        perms = self._calc_baseperms(fsm)
+        # start dates must leave room for the longest spin-up before the supervised steps
+        room = fsm + self._prefix_range[1]
+        self.check_samples(room)
+        perms = self._calc_baseperms(room)
 
         # rng changed, repeat if needed
         n_requested_idxs = self.samples_per_mini_epoch // self.batch_size
@@ -1420,6 +1427,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
         iter_start, iter_end = self.worker_workset()
         logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
+        # position of this worker's first sample in the rank's share: the same on every rank
+        rank_position = iter_start - self.rank * self.len
 
         # create new shuffeling
         perms, perms_num_forecast_steps = self.reset()
@@ -1435,6 +1444,13 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             # num_forecast_steps needs to be constant per batch
             # (amortized through data parallel training)
             num_forecast_steps = perms_num_forecast_steps[i]
+            # unsupervised spin-up of this training step, identical on every rank
+            prefix_steps = draw_prefix_steps(
+                self._prefix_range,
+                self._prefix_seed,
+                self.mini_epoch,
+                rank_position + i * self.batch_size,
+            )
 
             # use while loop due to the scattered nature of the data in time and to
             # ensure batches are not empty
@@ -1450,7 +1466,10 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     not_valid = batch.sources_empty() or batch.sources_nan()
                 else:
                     try:
-                        batch = self._get_batch(idx, num_forecast_steps)
+                        if prefix_steps > 0:
+                            batch = self._get_prefix_batch(idx, num_forecast_steps, prefix_steps)
+                        else:
+                            batch = self._get_batch(idx, num_forecast_steps)
                     except ForcingUnavailableError as e:
                         forcing_skips += 1
                         if forcing_skips >= perms.shape[0]:

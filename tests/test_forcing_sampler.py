@@ -268,6 +268,10 @@ def test_iter_skips_sample_without_forcing():
         mode_cfg={"training_mode": ["forecast"]},
         _lazy_targets=False,
         _get_batch=get_batch,
+        rank=0,
+        mini_epoch=0,
+        _prefix_range=(0, 0),
+        _prefix_seed=0,
     )
     batches = list(MultiStreamDataSampler.__iter__(stub))
     assert tried == [0, 1, 2]
@@ -335,6 +339,10 @@ def _iter_stub(get_batch, perms):
         mode_cfg={"training_mode": ["forecast"]},
         _lazy_targets=False,
         _get_batch=get_batch,
+        rank=0,
+        mini_epoch=0,
+        _prefix_range=(0, 0),
+        _prefix_seed=0,
     )
 
 
@@ -474,3 +482,97 @@ def test_prefix_batch_with_offset_zero():
     assert calls.materialized == (3, 5)
     assert sorted(reader.requested) == [10, 11, 12, 13, 14]
     assert batch.get_source_samples().first_supervised_step == 3
+
+
+_GOOD = types.SimpleNamespace(
+    sources_empty=lambda: False, is_nan=lambda: False, targets_empty=lambda: False
+)
+
+
+def _prefix_iter_stub(rank, prefix_range=(1, 90), get_prefix_batch=None):
+    seen = []
+
+    def get_batch(idx, num_forecast_steps):
+        seen.append(("eager", 0))
+        return _GOOD
+
+    def prefix_batch(idx, num_forecast_steps, prefix_steps):
+        seen.append(("prefix", prefix_steps))
+        return _GOOD
+
+    stub = types.SimpleNamespace(
+        worker_workset=lambda: (rank * 4, rank * 4 + 4),
+        len=4,
+        rank=rank,
+        mini_epoch=0,
+        reset=lambda: (np.arange(8), np.full(4, 15)),
+        batch_size=1,
+        mode_cfg={"training_mode": ["forecast"]},
+        _lazy_targets=False,
+        _get_batch=get_batch,
+        _get_prefix_batch=get_prefix_batch or prefix_batch,
+        _prefix_range=prefix_range,
+        _prefix_seed=7,
+    )
+    return stub, seen
+
+
+def test_every_rank_draws_the_same_prefix_for_the_same_step():
+    stub0, seen0 = _prefix_iter_stub(rank=0)
+    stub1, seen1 = _prefix_iter_stub(rank=1)
+    list(MultiStreamDataSampler.__iter__(stub0))
+    list(MultiStreamDataSampler.__iter__(stub1))
+    assert seen0 == seen1
+    assert len(seen0) == 4
+    assert all(kind == "prefix" and 1 <= p <= 90 for kind, p in seen0)
+
+
+def test_zero_prefix_range_keeps_the_eager_batch():
+    stub, seen = _prefix_iter_stub(rank=0, prefix_range=(0, 0))
+    list(MultiStreamDataSampler.__iter__(stub))
+    assert seen == [("eager", 0)] * 4
+
+
+def test_missing_forcing_in_a_prefix_skips_the_sample():
+    tried = []
+
+    def prefix_batch(idx, num_forecast_steps, prefix_steps):
+        tried.append(int(idx))
+        if idx == 0:
+            raise ForcingUnavailableError("forcing stream 'F': window 3: no data")
+        return _GOOD
+
+    stub, _ = _prefix_iter_stub(rank=0, prefix_range=(1, 1), get_prefix_batch=prefix_batch)
+    batches = list(MultiStreamDataSampler.__iter__(stub))
+    assert tried == [0, 1, 2, 3, 4]
+    assert batches == [_GOOD] * 4
+
+
+class _ResetStub:
+    """Stub `self` for `reset`: records the step count start dates must leave room for."""
+
+    def __init__(self, prefix_range):
+        self.room = []
+        self.data_loader_rng_seed = 1
+        self._prefix_range = prefix_range
+        self._get_fsm = lambda: 15
+        self.check_samples = lambda n: self.room.append(("check", n))
+        self._calc_baseperms = lambda n: self.room.append(("perms", n)) or np.arange(10)
+        self.samples_per_mini_epoch = 4
+        self.batch_size = 1
+        self.repeat_data = False
+        self.shuffle = False
+        self.forecast_policy = "fixed"
+        self.list_num_forecast_steps = np.array([15])
+        self.tokenizer = types.SimpleNamespace(reset_rng=lambda rng: None)
+
+    def __len__(self):
+        return 4
+
+
+@pytest.mark.parametrize("prefix_range, room", [((0, 90), 105), ((0, 0), 15)])
+def test_start_dates_leave_room_for_the_longest_prefix(prefix_range, room):
+    stub = _ResetStub(prefix_range)
+    perms, steps = MultiStreamDataSampler.reset(stub)
+    assert stub.room == [("check", room), ("perms", room)]
+    assert list(steps) == [15] * 4  # the supervised steps stay num_steps
