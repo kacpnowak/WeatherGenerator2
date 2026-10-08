@@ -60,6 +60,12 @@ logger = logging.getLogger(__name__)
 # cfg_keys_to_filter = ["losses", "model_input", "target_input"]
 
 
+def prefix_length(batch) -> int:
+    """Unsupervised spin-up steps at the start of a training batch's rollout (0 without)."""
+    first = getattr(batch, "first_supervised_step", None)
+    return 0 if first is None else first - batch.get_output_idxs()[0]
+
+
 class Trainer(TrainerBase):
     def __init__(self, train_logging: Config):
         TrainerBase.__init__(self)
@@ -80,6 +86,8 @@ class Trainer(TrainerBase):
         self.model = None
         self.model_params = None
         self.optimizer: torch.optim.Optimizer | None = None
+        # spin-up length of each training step since the last metrics log
+        self._prefix_hist: list[int] = []
         self.t_start: float = 0
         self.target_and_aux_calculators = None
         self.target_and_aux_calculators_val = None
@@ -739,6 +747,8 @@ class Trainer(TrainerBase):
                     x.get_output_len(),
                 )
 
+                self._prefix_hist.append(prefix_length(x))
+
                 targets_and_auxs = {}
                 for loss_name, target_aux in self.target_and_aux_calculators.items():
                     # find targets for this target-aux calculator
@@ -1065,11 +1075,19 @@ class Trainer(TrainerBase):
                     avg_loss=avg_loss,
                     lr=self.lr_scheduler.get_lr(),
                     elapsed_training_time_seconds=elapsed_time,
+                    extra_metrics=(
+                        {"forecast_prefix_steps": float(np.mean(self._prefix_hist))}
+                        if self._prefix_hist
+                        else None
+                    ),
                 )
 
         loss_calculator.loss_hist = []
         loss_calculator.losses_unweighted_hist = []
         loss_calculator.stddev_unweighted_hist = []
+
+        if stage == TRAIN:
+            self._prefix_hist = []
 
     def _get_tensor_item(self, tensor):
         """
@@ -1128,6 +1146,8 @@ class Trainer(TrainerBase):
                     )
                     if self.log_grad_norms:
                         pstr += f"gradient norm={self.last_grad_norm:.3f}, "
+                    if self._prefix_hist:
+                        pstr += f"prefix={self._prefix_hist[-1]}, "
                     pstr += f"s/sec={(print_freq * self.batch_size_per_gpu) / dt:.3f})"
                     logger.info(pstr)
                     logger.info("\t")
