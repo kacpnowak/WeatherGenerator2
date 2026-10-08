@@ -407,3 +407,70 @@ def test_forcing_reader_uses_the_samplers_window_without_shift(tmp_path):
     out, _ = _init_forcing(streams, tmp_path, tw_handler=_DAILY)
     reader = out["IFS_ATMO"].readers[0]
     assert reader.tw_handler is _DAILY and reader.forcing_tw_handler is _DAILY
+
+
+def test_first_supervised_step_defaults_to_none():
+    batch = ModelBatch(["s"], 1, 1, 1, 4)
+    assert batch.get_source_samples().first_supervised_step is None
+    assert batch.get_target_samples().first_supervised_step is None
+
+
+def _prefix_stub(output_offset=1):
+    """Stub `self` for `_get_prefix_batch`: records the skeleton and chunk calls."""
+    stub = _sampler()
+    stub.output_offset = output_offset
+    stub._get_output_length = lambda n: MultiStreamDataSampler._get_output_length(stub, n)
+    calls = types.SimpleNamespace(skeleton=None, materialized=None, conditions=[])
+    reader = _FakeReader()
+
+    def skeleton(idx, num_forecast_steps):
+        calls.skeleton = (int(idx), num_forecast_steps)
+        return ModelBatch([], 0, 0, output_offset, stub._get_output_length(num_forecast_steps))
+
+    def materialize(batch, step_range):
+        calls.materialized = tuple(step_range)
+        # like the real chunk builder, which also builds the chunk's forcing
+        MultiStreamDataSampler._build_forcing_data(
+            stub, batch, reader, 10, batch.output_steps, step_range=step_range
+        )
+        return batch
+
+    def get_condition(idx):
+        calls.conditions.append(int(idx))
+        return [float(idx)]
+
+    stub._build_batch_skeleton = skeleton
+    stub._materialize_target_chunk = materialize
+    stub.forcing_datasets = {"F": types.SimpleNamespace(readers=[reader])}
+    stub._build_forcing_data = lambda *a, **k: MultiStreamDataSampler._build_forcing_data(
+        stub, *a, **k
+    )
+    stub.condition_datasets = {
+        "C": types.SimpleNamespace(readers=[types.SimpleNamespace(get_condition=get_condition)])
+    }
+    stub._build_condition_data = lambda *a, **k: MultiStreamDataSampler._build_condition_data(
+        stub, *a, **k
+    )
+    return stub, reader, calls
+
+
+def test_prefix_batch_targets_only_the_supervised_steps_and_forces_every_step():
+    stub, reader, calls = _prefix_stub(output_offset=1)
+    batch = MultiStreamDataSampler._get_prefix_batch(stub, 10, 2, 3)
+
+    assert calls.skeleton == (10, 5)  # 3 spin-up + 2 supervised forecast steps
+    assert calls.materialized == (4, 6)  # targets for absolute steps 4 and 5 only
+    assert sorted(reader.requested) == [11, 12, 13, 14, 15]  # forcing for every forecast step
+    forcing = batch.get_source_samples().forcing
+    assert [len(f) > 0 for f in forcing] == [False, True, True, True, True, True]
+    assert calls.conditions == [10, 11, 12, 13]  # steps before the supervised chunk
+    assert batch.get_source_samples().first_supervised_step == 4
+
+
+def test_prefix_batch_with_offset_zero():
+    stub, reader, calls = _prefix_stub(output_offset=0)
+    batch = MultiStreamDataSampler._get_prefix_batch(stub, 10, 2, 3)
+
+    assert calls.materialized == (3, 5)
+    assert sorted(reader.requested) == [10, 11, 12, 13, 14]
+    assert batch.get_source_samples().first_supervised_step == 3

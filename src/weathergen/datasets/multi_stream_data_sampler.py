@@ -1158,6 +1158,46 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
         return batch
 
+    def _get_prefix_batch(self, idx: int, num_forecast_steps: int, prefix_steps: int):
+        """
+        Assemble a training batch whose rollout starts with `prefix_steps` spin-up steps.
+
+        The sample spans prefix_steps + num_forecast_steps forecast steps. The input side is
+        built as in `_get_batch`; targets only for the last `num_forecast_steps` steps, with the
+        step-range builders of lazy inference, so the spin-up steps' target slots stay empty
+        (the model does not decode them and the loss skips them). Forcing and conditions are
+        built for every step, since the model consumes them at each step.
+        """
+        total_steps = prefix_steps + num_forecast_steps
+        num_output_steps = self._get_output_length(total_steps)
+        first_supervised = self.output_offset + prefix_steps
+
+        batch = self._build_batch_skeleton(idx, total_steps)
+        # targets (and that chunk's conditions and forcing) of the supervised steps
+        self._materialize_target_chunk(batch, (first_supervised, num_output_steps))
+
+        # conditions and forcing of the steps before them; as in `_get_batch`, conditions
+        # start at step 0 and forcing at the first forecast step
+        for _, condition_data in self.condition_datasets.items():
+            self._build_condition_data(
+                batch,
+                condition_data.readers[0],
+                idx,
+                num_output_steps,
+                step_range=(0, first_supervised),
+            )
+        for _, forcing_data in self.forcing_datasets.items():
+            self._build_forcing_data(
+                batch,
+                forcing_data.readers[0],
+                idx,
+                num_output_steps,
+                step_range=(self.output_offset, first_supervised),
+            )
+
+        batch.get_source_samples().first_supervised_step = first_supervised
+        return batch
+
     def _resolve_selects(self, mode):
         """Determine which source/target fields a training mode builds."""
         source_select, target_select = [], []

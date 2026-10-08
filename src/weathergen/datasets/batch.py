@@ -181,6 +181,10 @@ class BatchSamples:
         # `conditions`, but spatial): each entry becomes a (num_cells, 2*num_vars) array of
         # [cell_values | cell_valid] once built, then a tensor after to_device.
         self.forcing = [[] for i in range(output_steps)]
+        # absolute output step of the first decoded and supervised step; the steps before it
+        # are a training spin-up (forecast.prefix_steps) that only advances the latent state.
+        # None: every output step is supervised.
+        self.first_supervised_step: int | None = None
 
     def __len__(self) -> int:
         return len(self.samples)
