@@ -164,3 +164,47 @@ def test_present_forcing_does_not_warn(caplog):
         Model.forward(model, MODEL_PARAMS, batch, batch.get_output_len())
 
     assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def _recording_grad(model):
+    """Wrap the stub's forecast engine and forcing module to record whether grad is on."""
+    grad = {"fe": [], "forcing": []}
+    fe, forcing = model.forecast_engine, model.forcing_module
+
+    def forecast_engine(tokens, condition, coords=None):
+        grad["fe"].append(torch.is_grad_enabled())
+        return fe(tokens, condition, coords)
+
+    def forcing_module(tokens, condition, field, num_aux):
+        grad["forcing"].append(torch.is_grad_enabled())
+        return forcing(tokens, condition, field, num_aux)
+
+    model.forecast_engine, model.forcing_module = forecast_engine, forcing_module
+    return grad
+
+
+def test_spin_up_steps_advance_without_gradients_and_are_not_decoded():
+    model, log = _stub_model()
+    grad = _recording_grad(model)
+    batch = _batch(offset=1, num_steps=4)
+    batch.first_supervised_step = 3
+    output = Model.forward(model, MODEL_PARAMS, batch, batch.get_output_len())
+
+    assert log.fe_calls == 4
+    assert log.forcing == [1, 2, 3, 4]  # forcing still drives every step
+    assert grad["fe"] == [False, False, True, True]
+    assert grad["forcing"] == [False, False, True, True]
+    assert [(d["batch_step"], d["fe_calls"]) for d in log.decodes] == [(3, 3), (4, 4)]
+    assert all(not output.physical[i] for i in (1, 2))  # the loss skips these steps
+    assert all("latent_state" not in output.latent[i] for i in (1, 2))
+
+
+def test_first_supervised_step_at_the_first_forecast_step_changes_nothing():
+    model, log = _stub_model()
+    batch = _batch(offset=1, num_steps=2)
+    batch.first_supervised_step = 1
+    Model.forward(model, MODEL_PARAMS, batch, batch.get_output_len())
+
+    assert log.fe_calls == 2
+    assert log.forcing == [1, 2]
+    assert [(d["batch_step"], d["fe_calls"]) for d in log.decodes] == [(1, 1), (2, 2)]

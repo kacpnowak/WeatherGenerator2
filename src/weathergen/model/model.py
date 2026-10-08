@@ -818,11 +818,19 @@ class Model(torch.nn.Module):
 
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
+        # first batch step that is decoded and supervised; the steps before it are a training
+        # spin-up (forecast.prefix_steps) that only advances the latent state
+        first_supervised = getattr(batch_ctx, "first_supervised_step", None)
         # roll-out in latent space, iterate and generate output over requested output steps
         for step in range(first_step, rollout_steps):
             # apply forecasting engine (if present)
             if self.forecast_engine:
-                without_grad = p_fwd and self.training and step != rollout_steps - 1
+                in_spin_up = (
+                    first_supervised is not None and step + batch_step_offset < first_supervised
+                )
+                without_grad = in_spin_up or (
+                    p_fwd and self.training and step != rollout_steps - 1
+                )
                 condition = batch_ctx.conditions[step + batch_step_offset]
                 # inject the per-step spatial forcing (e.g. SST) into the FE latent state /
                 # conditioning before advancing; no-op when no forcing module or field.
@@ -841,18 +849,26 @@ class Model(torch.nn.Module):
                             "model."
                         )
                         self._warned_missing_forcing = True
-                    # checkpointed like the FE blocks: otherwise the forcing embedding keeps its
-                    # activations for every rollout step (~0.3 GB per step on HEALPix level 5)
-                    tokens, condition = checkpoint(
-                        self.forcing_module,
-                        tokens,
-                        condition,
-                        forcing_field,
-                        self.num_aux_tokens,
-                        use_reentrant=False,
-                    )
+                    if without_grad:
+                        # nothing is back-propagated through this step: keep no activations
+                        with torch.no_grad():
+                            tokens, condition = self.forcing_module(
+                                tokens, condition, forcing_field, self.num_aux_tokens
+                            )
+                    else:
+                        # checkpointed like the FE blocks: otherwise the forcing embedding keeps
+                        # its activations for every rollout step (~0.3 GB per step on HEALPix
+                        # level 5)
+                        tokens, condition = checkpoint(
+                            self.forcing_module,
+                            tokens,
+                            condition,
+                            forcing_field,
+                            self.num_aux_tokens,
+                            use_reentrant=False,
+                        )
                 if without_grad:
-                    # Pushforward mode: advance tokens without grad; no decoding
+                    # spin-up / pushforward: advance tokens without grad; no decoding
                     with torch.no_grad():
                         tokens = self.forecast_engine(
                             tokens, condition, coords=model_params.rope_coords
