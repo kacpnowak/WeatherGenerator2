@@ -229,7 +229,7 @@ class Trainer(TrainerBase):
 
     def _rollout_state_path(self):
         """File where the resumable rollout state (carried latent + progress) is stored."""
-        return config.get_path_run(self.cf) / "rollout_state.pt"
+        return config.get_path_results(self.cf) / "rollout_state.pt"
 
     def _save_rollout_state(self, latent_state: LatentState, done_steps: int, idx: int):
         """
