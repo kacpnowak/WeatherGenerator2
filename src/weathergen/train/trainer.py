@@ -10,6 +10,7 @@
 # nor does it submit to any jurisdiction.
 import contextlib
 import copy
+import gc
 import logging
 import time
 from math import sqrt
@@ -856,6 +857,13 @@ class Trainer(TrainerBase):
             # holds the batch, including every forecast step's target coordinates (~2.3 GB for the
             # FESOM streams), which otherwise stays on the GPU through the next step
             del batch, x, preds, targets_and_auxs, loss
+
+            # stopgap: something still refers to this step's batch through a reference cycle, so the
+            # del above does not free it and its ~3 GB of GPU tensors stay allocated until Python's
+            # cyclic garbage collector happens to run, sometimes during the next step's
+            # backward (OOM). Collecting here frees it before the next forward; remove once
+            # the cycle is broken.
+            gc.collect()
 
         self.dataset.advance()
 
