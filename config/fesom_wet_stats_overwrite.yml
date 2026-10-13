@@ -1,0 +1,32 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Overwrite for continuing a saved FESOM run (stream names FESOM_NODE / FESOM_ELEM, as in the
+# frcwin checkpoints) with wet-point normalisation statistics. FESOM stores dry points (land,
+# below the sea floor) as 0.0, and the statistics in the archive include those zeros: salt_450 is
+# normalised with mean 23.9 / std 15.0 psu against 34.7 / 0.8 over the wet points, which crushes
+# the deep signal.
+#
+#   normalization_stats  JSON of {channel: {mean, std}} over wet points for the depth-dependent
+#                        channels (temp_*, salt_* / u_*, v_*), from compute_wet_stats.py;
+#                        surface channels keep the archive statistics
+#   target_fill_value    dry targets become NaN, so the loss skips them
+#   source_fill_value    dry inputs are replaced by the channel mean (0 after normalisation)
+#
+# The statistics change the scaling of the inputs and targets, so the stream embedders and
+# decoders must be trained again (do not freeze them).
+streams:
+  FESOM_NODE:
+    normalization_stats: config/streams/fesom/wet_stats_node.json
+    target_fill_value: 0.0
+    source_fill_value: 0.0
+  FESOM_ELEM:
+    normalization_stats: config/streams/fesom/wet_stats_elem.json
+    target_fill_value: 0.0
+    source_fill_value: 0.0
