@@ -1,4 +1,5 @@
 import glob
+import json
 import logging
 from pathlib import Path
 from typing import override
@@ -20,6 +21,58 @@ from weathergen.datasets.data_reader_base import (
 from weathergen.train.utils import Stage
 
 _logger = logging.getLogger(__name__)
+
+
+def apply_normalization_overrides(
+    colnames: list[str],
+    mean: NDArray,
+    std: NDArray,
+    overrides: dict,
+) -> tuple[NDArray, NDArray]:
+    """
+    Replace the normalisation statistics of selected channels.
+
+    Parameters
+    ----------
+    colnames :
+        channel names, in the order in which `mean` and `std` are indexed
+    mean, std :
+        statistics per column of `colnames`; they are not modified
+    overrides :
+        {channel: {"mean": float, "std": float}}. Keys starting with "_" (metadata) and channels
+        that are not in `colnames` (a stream may select fewer channels than the file covers)
+        are ignored.
+
+    Returns
+    -------
+    Copies of `mean` and `std` with the overridden channels replaced.
+
+    Raises
+    ------
+    ValueError
+        if `colnames`, `mean` and `std` differ in length, or an applied override has a
+        non-positive or non-finite std or a non-finite mean.
+    """
+    new_mean = np.array(mean, dtype=np.float64)
+    new_std = np.array(std, dtype=np.float64)
+    if not len(colnames) == len(new_mean) == len(new_std):
+        raise ValueError(
+            f"{len(colnames)} column names but {len(new_mean)} means and {len(new_std)} stds"
+        )
+
+    column = {name: i for i, name in enumerate(colnames)}
+    for name, stats in overrides.items():
+        if name.startswith("_") or name not in column:
+            continue
+        ch_mean, ch_std = float(stats["mean"]), float(stats["std"])
+        if not (np.isfinite(ch_std) and ch_std > 0.0):
+            raise ValueError(f"Normalisation override for {name!r} needs std > 0, got {ch_std}")
+        if not np.isfinite(ch_mean):
+            raise ValueError(f"Normalisation override for {name!r} has a non-finite mean")
+        new_mean[column[name]] = ch_mean
+        new_std[column[name]] = ch_std
+
+    return new_mean, new_std
 
 
 class DataReaderFesom(DataReaderTimestep):
@@ -142,6 +195,25 @@ class DataReaderFesom(DataReaderTimestep):
         else:
             return group["data"].attrs["nod2"]
 
+    def _read_slice(self, arr_list, cum_sizes, start_row, end_row):
+        import dask.array as da
+        start_f_idx = np.searchsorted(cum_sizes, start_row, side='right') - 1
+        end_f_idx = np.searchsorted(cum_sizes, end_row - 1, side='right') - 1
+        
+        if start_f_idx == end_f_idx:
+            l_start = start_row - cum_sizes[start_f_idx]
+            l_end = end_row - cum_sizes[start_f_idx]
+            return arr_list[start_f_idx][l_start:l_end]
+        else:
+            chunks = []
+            l_start = start_row - cum_sizes[start_f_idx]
+            chunks.append(arr_list[start_f_idx][l_start:])
+            for i in range(start_f_idx + 1, end_f_idx):
+                chunks.append(arr_list[i])
+            l_end = end_row - cum_sizes[end_f_idx]
+            chunks.append(arr_list[end_f_idx][:l_end])
+            return da.concatenate(chunks, axis=0)
+
     def _reorder_groups(self, colnames: list[str], groups: list[zarr.Group]) -> list[da.Array]:
         reordered_data_arrays: list[da.Array] = []
 
@@ -184,30 +256,36 @@ class DataReaderFesom(DataReaderTimestep):
         s_groups: list[zarr.Group] = [zarr.open_group(name, mode="r") for name in self.filenames]
         t_groups: list[zarr.Group] = [zarr.open_group(name, mode="r") for name in self.target_files]
 
-        # Explicitly wrap in da.from_zarr
-        s_times: list[da.Array] = [da.from_zarr(group["dates"]) for group in s_groups]
-        t_times: list[da.Array] = [da.from_zarr(group["dates"]) for group in t_groups]
-
-        self.source_time = da.concatenate(s_times, axis=0)
-        self.target_time = da.concatenate(t_times, axis=0)
+        # Store lists of dask arrays instead of concatenating them to avoid massive Dask graphs
+        self.s_times_list = [da.from_zarr(group["dates"]) for group in s_groups]
+        self.t_times_list = [da.from_zarr(group["dates"]) for group in t_groups]
+        
+        self.s_times_cum = np.cumsum([0] + [arr.shape[0] for arr in self.s_times_list])
+        self.t_times_cum = np.cumsum([0] + [arr.shape[0] for arr in self.t_times_list])
 
         # Use the first group for metadata
         self.source_mesh_size = self._get_mesh_size(s_groups[0])
         self.target_mesh_size = self._get_mesh_size(t_groups[0])
 
         # Metadata reading is cheap, but let's do it with the rest of the init
-        self.start_source = self.source_time[0][0].compute()
-        self.end_source = self.source_time[-1][0].compute()
+        self.start_source = self.s_times_list[0][0][0].compute()
+        self.end_source = self.s_times_list[-1][-1][0].compute()
+        
+        self.start_target = self.t_times_list[0][0][0].compute()
+        self.end_target = self.t_times_list[-1][-1][0].compute()
 
         if self.start_source > self._tw_handler.t_end or self.end_source < self._tw_handler.t_start:
             name = self._stream_info["name"]
-            _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
+            _logger.warning(
+                f"Stream {name} source lies completely outside the time window, "
+                f"no stream data will be generated. {self.start_source} - {self.end_source} "
+                f"vs {self._tw_handler.t_start} - {self._tw_handler.t_end}"
+            )
             self.init_empty()
             self._initialized = True
             return
 
-        self.start_target = self.target_time[0][0].compute()
-        self.end_target = self.target_time[-1][0].compute()
+
 
         if self.start_target > self._tw_handler.t_end or self.end_target < self._tw_handler.t_start:
             name = self._stream_info["name"]
@@ -217,10 +295,10 @@ class DataReaderFesom(DataReaderTimestep):
             return
 
         self.source_period = (
-            self.source_time[self.source_mesh_size][0] - self.source_time[0][0]
+            self.s_times_list[0][self.source_mesh_size][0] - self.s_times_list[0][0][0]
         ).compute()
         self.target_period = (
-            self.target_time[self.target_mesh_size][0] - self.target_time[0][0]
+            self.t_times_list[0][self.target_mesh_size][0] - self.t_times_list[0][0][0]
         ).compute()
 
         # Re-initialize the parent class with correct time info
@@ -259,10 +337,10 @@ class DataReaderFesom(DataReaderTimestep):
             (self._tw_handler.t_end - self.start_target) // self.target_period + 1
         ) * self.target_mesh_size
 
-        if self.source_end_idx > len(self.source_time):
-            self.source_end_idx = len(self.source_time)
-        if self.target_end_idx > len(self.target_time):
-            self.target_end_idx = len(self.target_time)
+        if self.source_end_idx > self.s_times_cum[-1]:
+            self.source_end_idx = int(self.s_times_cum[-1])
+        if self.target_end_idx > self.t_times_cum[-1]:
+            self.target_end_idx = int(self.t_times_cum[-1])
 
         self.source_len = (self.source_end_idx - self.source_start_idx) // self.source_mesh_size
         self.target_len = (self.target_end_idx - self.target_start_idx) // self.target_mesh_size
@@ -276,6 +354,9 @@ class DataReaderFesom(DataReaderTimestep):
 
         self.source_colnames: list[str] = list(s_groups[0]["data"].attrs["colnames"])
         self.target_colnames: list[str] = list(t_groups[0]["data"].attrs["colnames"])
+        # means / std below are indexed like these full lists (lon and lat included)
+        src_colnames_full = list(self.source_colnames)
+        trg_colnames_full = list(self.target_colnames)
 
         self.source_cols_idx = list(np.arange(len(self.source_colnames), dtype=int))
         self.target_cols_idx = list(np.arange(len(self.target_colnames), dtype=int))
@@ -285,8 +366,11 @@ class DataReaderFesom(DataReaderTimestep):
         self.trg_lat_index: int = self.target_colnames.index("lat")
         self.trg_lon_index: int = self.target_colnames.index("lon")
 
-        source_reorderd = self._reorder_groups(self.source_colnames, s_groups)
-        target_reorderd = self._reorder_groups(self.target_colnames, t_groups)
+        self.s_data_list = self._reorder_groups(self.source_colnames, s_groups)
+        self.t_data_list = self._reorder_groups(self.target_colnames, t_groups)
+        
+        self.s_data_cum = np.cumsum([0] + [arr.shape[0] for arr in self.s_data_list])
+        self.t_data_cum = np.cumsum([0] + [arr.shape[0] for arr in self.t_data_list])
 
         # Modify a copy, not the original list while iterating
         self.source_colnames = self._remove_lonlat(self.source_colnames)
@@ -318,8 +402,8 @@ class DataReaderFesom(DataReaderTimestep):
         )
         self.target_stdev[self.target_stdev <= 1e-5] = 1.0
 
-        self.source = da.concatenate(source_reorderd, axis=0)
-        self.target = da.concatenate(target_reorderd, axis=0)
+        self._override_normalization(src_colnames_full, trg_colnames_full)
+
 
         source_channels = self._stream_info.get("source")
         source_excl = self._stream_info.get("source_exclude")
@@ -337,8 +421,8 @@ class DataReaderFesom(DataReaderTimestep):
             else (self.target_colnames, self.target_cols_idx)
         )
 
-        src_timestep_lats = self.source[: self.source_mesh_size, self.src_lat_index].compute()
-        trg_timestep_lats = self.target[: self.target_mesh_size, self.trg_lat_index].compute()
+        src_timestep_lats = self.s_data_list[0][: self.source_mesh_size, self.src_lat_index].compute()
+        trg_timestep_lats = self.t_data_list[0][: self.target_mesh_size, self.trg_lat_index].compute()
 
         if np.any(src_timestep_lats > 90.0):
             _logger.warning(
@@ -356,8 +440,8 @@ class DataReaderFesom(DataReaderTimestep):
             )
             self._trg_lat_conv = True
 
-        src_timestep_lons = self.source[: self.source_mesh_size, self.src_lon_index].compute()
-        trg_timestep_lons = self.target[: self.target_mesh_size, self.trg_lon_index].compute()
+        src_timestep_lons = self.s_data_list[0][: self.source_mesh_size, self.src_lon_index].compute()
+        trg_timestep_lons = self.t_data_list[0][: self.target_mesh_size, self.trg_lon_index].compute()
 
         if np.any(src_timestep_lons > 180.0):
             _logger.warning(
@@ -375,10 +459,57 @@ class DataReaderFesom(DataReaderTimestep):
             )
             self._trg_lon_conv = True
 
+        if self._src_lat_conv: src_timestep_lats = 90.0 - src_timestep_lats
+        if self._trg_lat_conv: trg_timestep_lats = 90.0 - trg_timestep_lats
+        if self._src_lon_conv: src_timestep_lons = ((src_timestep_lons + 180.0) % 360.0) - 180.0
+        if self._trg_lon_conv: trg_timestep_lons = ((trg_timestep_lons + 180.0) % 360.0) - 180.0
+
+        self.cached_source_coords = np.stack([src_timestep_lats, src_timestep_lons], axis=1)
+        self.cached_target_coords = np.stack([trg_timestep_lats, trg_timestep_lons], axis=1)
+
         self.geoinfo_channels = []
         self.geoinfo_idx = []
+        
+        self.src_mean_vec = self.source_mean[self.source_idx]
+        self.src_stdev_vec = self.source_stdev[self.source_idx]
+        self.trg_mean_vec = self.target_mean[self.target_idx]
+        self.trg_stdev_vec = self.target_stdev[self.target_idx]
 
         self._initialized = True
+
+    def _override_normalization(
+        self, src_colnames_full: list[str], trg_colnames_full: list[str]
+    ) -> None:
+        """
+        Replace the archive statistics by those of the `normalization_stats` stream option.
+
+        The option is the path of a JSON file {channel: {"mean": ..., "std": ...}} (see
+        compute_wet_stats.py). The archive statistics include the zeros FESOM stores below the
+        sea floor; the file holds statistics over wet points only. `src_colnames_full` and
+        `trg_colnames_full` are the archive column names (lon and lat included), which is how
+        source_mean / target_mean are indexed.
+        """
+        stats_path = self._stream_info.get("normalization_stats")
+        if not stats_path:
+            return
+
+        with open(stats_path) as f:
+            overrides = json.load(f)
+
+        self.source_mean, self.source_stdev = apply_normalization_overrides(
+            src_colnames_full, self.source_mean, self.source_stdev, overrides
+        )
+        self.target_mean, self.target_stdev = apply_normalization_overrides(
+            trg_colnames_full, self.target_mean, self.target_stdev, overrides
+        )
+
+        src_changed = [c for c in src_colnames_full if c in overrides and not c.startswith("_")]
+        trg_changed = [c for c in trg_colnames_full if c in overrides and not c.startswith("_")]
+        _logger.info(
+            f"{self._stream_info['name']}: normalisation statistics of {len(src_changed)} source "
+            f"and {len(trg_changed)} target channels replaced from {stats_path}: "
+            f"{', '.join(trg_changed)}"
+        )
 
     def select(
         self,
@@ -528,26 +659,19 @@ class DataReaderFesom(DataReaderTimestep):
 
         # Note: we read all columns from start_row to end_row once,
         # then select the ones we need. This is more efficient for Zarr.
-        full_data_slice = self.source[start_row:end_row]
-        datetimes_lazy = self.source_time[start_row:end_row]
+        full_data_slice = self._read_slice(self.s_data_list, self.s_data_cum, start_row, end_row)
+        datetimes_lazy = self._read_slice(self.s_times_list, self.s_times_cum, start_row, end_row)
 
         # Define the specific slices we need from the larger block
         data_lazy = full_data_slice[:, self.source_idx]
-        lat_lazy = full_data_slice[:, self.src_lat_index]
-        lon_lazy = full_data_slice[:, self.src_lon_index]
 
         # Dask optimizes this to a single (or few) efficient read operation(s).
-        data, lat, lon, datetimes = dask.compute(
-            data_lazy, lat_lazy, lon_lazy, datetimes_lazy, scheduler="single-threaded"
+        data, datetimes = dask.compute(
+            data_lazy, datetimes_lazy, scheduler="single-threaded"
         )
-
-        if self._src_lat_conv:
-            lat = 90.0 - lat
-
-        if self._src_lon_conv:
-            lon = ((lon + 180.0) % 360.0) - 180.0
-
-        coords = np.stack([lat, lon], axis=1)
+        
+        n_steps = data.shape[0] // self.source_mesh_size
+        coords = np.tile(self.cached_source_coords, (n_steps, 1))
         geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
         datetimes = np.squeeze(datetimes)
 
@@ -574,26 +698,19 @@ class DataReaderFesom(DataReaderTimestep):
 
         # Note: we read all columns from start_row to end_row once,
         # then select the ones we need. This is more efficient for Zarr.
-        full_data_slice = self.target[start_row:end_row]
-        datetimes_lazy = self.target_time[start_row:end_row]
+        full_data_slice = self._read_slice(self.t_data_list, self.t_data_cum, start_row, end_row)
+        datetimes_lazy = self._read_slice(self.t_times_list, self.t_times_cum, start_row, end_row)
 
         # Define the specific slices we need from the larger block
         data_lazy = full_data_slice[:, self.target_idx]
-        lat_lazy = full_data_slice[:, self.trg_lat_index]
-        lon_lazy = full_data_slice[:, self.trg_lon_index]
 
         # Dask optimizes this to a single (or few) efficient read operation(s).
-        data, lat, lon, datetimes = dask.compute(
-            data_lazy, lat_lazy, lon_lazy, datetimes_lazy, scheduler="single-threaded"
+        data, datetimes = dask.compute(
+            data_lazy, datetimes_lazy, scheduler="single-threaded"
         )
-
-        if self._trg_lat_conv:
-            lat = 90.0 - lat
-
-        if self._trg_lon_conv:
-            lon = ((lon + 180.0) % 360.0) - 180.0
-
-        coords = np.stack([lat, lon], axis=1)
+        
+        n_steps = data.shape[0] // self.target_mesh_size
+        coords = np.tile(self.cached_target_coords, (n_steps, 1))
         geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
         datetimes = np.squeeze(datetimes)
 
@@ -624,9 +741,17 @@ class DataReaderFesom(DataReaderTimestep):
         -------
         Normalized data
         """
+        self._lazy_init()
         assert source.shape[-1] == len(self.source_idx), "incorrect number of source channels"
-        for i, ch in enumerate(self.source_idx):
-            source[..., i] = (source[..., i] - self.source_mean[ch]) / self.source_stdev[ch]
+        # values marking no-data (e.g. below-bathymetry fill) are replaced by the channel mean,
+        # i.e. they become 0 after normalisation. Setting them to 0 afterwards is the same but
+        # exact for float32 data with float64 statistics.
+        fill_value = self._stream_info.get("source_fill_value")
+        no_data = None if fill_value is None else source == fill_value
+        source -= self.src_mean_vec
+        source /= self.src_stdev_vec
+        if no_data is not None:
+            source[no_data] = 0.0
 
         return source
 
@@ -644,9 +769,15 @@ class DataReaderFesom(DataReaderTimestep):
         -------
         Normalized data
         """
+        self._lazy_init()
         assert target.shape[-1] == len(self.target_idx), "incorrect number of target channels"
-        for i, ch in enumerate(self.target_idx):
-            target[..., i] = (target[..., i] - self.target_mean[ch]) / self.target_stdev[ch]
+        # values marking no-data (e.g. below-bathymetry fill) become NaN so the loss
+        # masks them; sources are left untouched since the encoder needs finite inputs
+        fill_value = self._stream_info.get("target_fill_value")
+        if fill_value is not None:
+            target = np.where(target == fill_value, np.nan, target)
+        target -= self.trg_mean_vec
+        target /= self.trg_stdev_vec
 
         return target
 
@@ -664,9 +795,10 @@ class DataReaderFesom(DataReaderTimestep):
         -------
         Denormalized data
         """
+        self._lazy_init()
         assert source.shape[-1] == len(self.source_idx), "incorrect number of source channels"
-        for i, ch in enumerate(self.source_idx):
-            source[..., i] = (source[..., i] * self.source_stdev[ch]) + self.source_mean[ch]
+        source *= self.src_stdev_vec
+        source += self.src_mean_vec
 
         return source
 
@@ -684,8 +816,9 @@ class DataReaderFesom(DataReaderTimestep):
         -------
         Denormalized data
         """
+        self._lazy_init()
         assert data.shape[-1] == len(self.target_idx), "incorrect number of target channels"
-        for i, ch in enumerate(self.target_idx):
-            data[..., i] = (data[..., i] * self.target_stdev[ch]) + self.target_mean[ch]
+        data *= self.trg_stdev_vec
+        data += self.trg_mean_vec
 
         return data

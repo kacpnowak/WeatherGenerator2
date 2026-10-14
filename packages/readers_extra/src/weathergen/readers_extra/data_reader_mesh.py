@@ -1,5 +1,7 @@
 import json
 import logging
+import warnings
+from collections import OrderedDict
 from pathlib import Path
 from typing import override
 
@@ -26,6 +28,8 @@ _logger = logging.getLogger(__name__)
 # Small epsilon to handle time boundary exclusivity
 t_epsilon = np.timedelta64(1, "ms")
 MIN_PATCH_POINTS = 512
+# Keep a few recently used patch index sets around (patch_stability_window reuse)
+_PATCH_MASK_CACHE_SIZE = 8
 
 
 class DataReaderMesh(DataReaderTimestep):
@@ -36,6 +40,18 @@ class DataReaderMesh(DataReaderTimestep):
     - Persistence of State time indexing (forward fill).
     - Robust Multi-Node/Worker support (Fork-safe, Dask-safe).
     - Dynamic Patching (local) OR Global Sparse Sampling.
+
+    Performance notes:
+    - Chunk reads are batched into a single dask.compute call per fetch.
+      `read_threads` (default 1, serial) can enable threaded reads for
+      non-dataloader use; keep 1 under torch dataloader parallelism.
+    - Data is sliced to the spatial bounding box of the requested points
+      lazily, before compute, so full fields are never materialized for
+      patch-style access.
+    - Decoded blocks are kept in a small byte-bounded LRU cache
+      (`block_cache_mb`, default 256) so that get_target can reuse the
+      blocks read by get_source for the same window (chunks are expensive
+      to decode, e.g. GRIB-referenced Virtual Zarr).
     """
 
     def __init__(
@@ -64,6 +80,16 @@ class DataReaderMesh(DataReaderTimestep):
         self.sampling_step = stream_info.get("sampling_step", 1)
         self.patch_stability_window = stream_info.get("patch_stability_window", 1)
         self.filler_values = stream_info.get("filler_values", [])
+
+        # Performance tuning knobs. read_threads defaults to 1: dataloader workers
+        # already parallelize across processes and extra threads oversubscribe cores.
+        self.read_threads = int(stream_info.get("read_threads", 1))
+        self.block_cache_mb = int(stream_info.get("block_cache_mb", 256))
+        self._block_cache: OrderedDict = OrderedDict()
+        self._block_cache_bytes = 0
+        self._patch_mask_cache: OrderedDict = OrderedDict()
+        self._regular_idx_cache: dict = {}
+        self._dims_cache: dict = {}
 
         # Auto-enable staircase mode if window is defined and we are in patch mode
         auto_use_counter = self.sampling_mode == "patch" and "patch_stability_window" in stream_info
@@ -244,7 +270,6 @@ class DataReaderMesh(DataReaderTimestep):
         self.mapper_src = fsspec.get_mapper(
             "reference://", fo=str(self.filename_source), remote_protocol="file"
         )
-        import warnings
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*separate the stored chunks.*")
@@ -309,6 +334,58 @@ class DataReaderMesh(DataReaderTimestep):
     def get_target(self, idx: TIndex) -> ReaderData:
         return self._fetch_data(idx, self.target_channels, is_source=False)
 
+    def _get_patch_indices(self, lat_0: float, lon_0: float, is_source: bool) -> NDArray:
+        """
+        Spatial indices of the points inside the patch [lat_0, lat_0+patch_size) x
+        [lon_0, lon_0+patch_size). Memoized: with patch_stability_window the same
+        patch is requested many times in a row and the mask over all nodes is
+        expensive to recompute.
+        """
+        lats = self.lats_src if is_source else self.lats_trg
+        lons = self.lons_src if is_source else self.lons_trg
+        # id() lets src/trg share cache entries when they refer to the same file
+        key = (float(lat_0), float(lon_0), id(lats))
+        cached = self._patch_mask_cache.get(key)
+        if cached is not None:
+            self._patch_mask_cache.move_to_end(key)
+            return cached
+
+        mask = (
+            (lats >= lat_0)
+            & (lats < lat_0 + self.patch_size_deg)
+            & (lons >= lon_0)
+            & (lons < lon_0 + self.patch_size_deg)
+        )
+        indices = np.where(mask)[0]
+
+        self._patch_mask_cache[key] = indices
+        while len(self._patch_mask_cache) > _PATCH_MASK_CACHE_SIZE:
+            self._patch_mask_cache.popitem(last=False)
+        return indices
+
+    def _get_regular_indices(self, is_source: bool) -> NDArray:
+        """Deterministic indices for 'regular' sampling; computed once per side."""
+        spatial_indices_ref = self.spatial_indices_src if is_source else self.spatial_indices_trg
+        grid_dims = self.grid_dims_src if is_source else self.grid_dims_trg
+        key = (id(spatial_indices_ref), grid_dims)
+        cached = self._regular_idx_cache.get(key)
+        if cached is not None:
+            return cached
+
+        if grid_dims:
+            h, w = grid_dims
+            n = self.sampling_step
+            rows = spatial_indices_ref // w
+            cols = spatial_indices_ref % w
+            mask = (rows % n == 0) & (cols % n == 0)
+            indices_local = np.where(mask)[0]
+        else:
+            total_points = len(spatial_indices_ref)
+            indices_local = np.arange(0, total_points, self.sampling_step)
+
+        self._regular_idx_cache[key] = indices_local
+        return indices_local
+
     def _fetch_data(self, idx: TIndex, channels: list[str], is_source: bool) -> ReaderData:
         self._lazy_init()
         (t_idxs, dtr) = self._get_persistent_time_idxs(idx)
@@ -316,7 +393,7 @@ class DataReaderMesh(DataReaderTimestep):
         if len(t_idxs) == 0 or not channels:
             return ReaderData.empty(len(channels), 0)
 
-        channel_indices = [self.available_channels.index(c) for c in channels]
+        channel_indices = self.source_idx if is_source else self.target_idx
         start_t, end_t = t_idxs[0], t_idxs[-1] + 1
         n_steps = len(t_idxs)
 
@@ -357,18 +434,7 @@ class DataReaderMesh(DataReaderTimestep):
             use_contiguous_read = False
 
         elif self.sampling_mode == "regular":
-            grid_dims = self.grid_dims_src if is_source else self.grid_dims_trg
-            if grid_dims:
-                h, w = grid_dims
-                n = self.sampling_step
-                rows = spatial_indices_ref // w
-                cols = spatial_indices_ref % w
-                mask = (rows % n == 0) & (cols % n == 0)
-                indices_local = np.where(mask)[0]
-            else:
-                total_points = len(spatial_indices_ref)
-                indices_local = np.arange(0, total_points, self.sampling_step)
-
+            indices_local = self._get_regular_indices(is_source)
             patch_coords_base = coords_ref[indices_local]
             final_disk_indices = spatial_indices_ref[indices_local]
             use_contiguous_read = False
@@ -377,25 +443,10 @@ class DataReaderMesh(DataReaderTimestep):
             lat_range = max(0.0, (self.roi_max_lat - self.roi_min_lat) - self.patch_size_deg)
             lon_range = max(0.0, (self.roi_max_lon - self.roi_min_lon) - self.patch_size_deg)
 
-            patch_indices_local = np.array([])
-
             lat_0 = self.roi_min_lat + patch_rng.random() * lat_range
             lon_0 = self.roi_min_lon + patch_rng.random() * lon_range
 
-            mask_src = (
-                (self.lats_src >= lat_0)
-                & (self.lats_src < lat_0 + self.patch_size_deg)
-                & (self.lons_src >= lon_0)
-                & (self.lons_src < lon_0 + self.patch_size_deg)
-            )
-            mask_trg = (
-                (self.lats_trg >= lat_0)
-                & (self.lats_trg < lat_0 + self.patch_size_deg)
-                & (self.lons_trg >= lon_0)
-                & (self.lons_trg < lon_0 + self.patch_size_deg)
-            )
-
-            patch_indices_local = np.where(mask_src if is_source else mask_trg)[0]
+            patch_indices_local = self._get_patch_indices(lat_0, lon_0, is_source)
 
             patch_coords_base = (
                 self.coords_src[patch_indices_local]
@@ -447,26 +498,14 @@ class DataReaderMesh(DataReaderTimestep):
                 None,
             )
 
-        if data_block.size > 0:
-            d_max = np.nanmax(np.abs(data_block))
-            if d_max > 1e10:
-                data_block[np.abs(data_block) > 1e10] = np.nan
-
         coords_flat = np.tile(patch_coords_base, (n_steps, 1))
         dt_values = self._time_values_cached[start_t:end_t:stride]
         dt_flat = np.repeat(dt_values, patch_coords_base.shape[0])
 
         if data_block.size > 0:
-            # Check for NaNs across any channel
-            valid_mask = ~np.isnan(data_block).any(axis=1)
-
-            # Check for filler values across any channel
-            if self.filler_values:
-                valid_mask &= ~np.isin(data_block, self.filler_values).any(axis=1)
-
-            data_block = data_block[valid_mask]
-            coords_flat = coords_flat[valid_mask]
-            dt_flat = dt_flat[valid_mask]
+            data_block, coords_flat, dt_flat = self._filter_invalid_points(
+                data_block, coords_flat, dt_flat
+            )
 
         if data_block.size == 0:
             _logger.warning(
@@ -483,88 +522,180 @@ class DataReaderMesh(DataReaderTimestep):
         )
         return rdata
 
+    def _filter_invalid_points(self, data_block, coords, times):
+        """
+        Convert invalid values (fill magnitudes, filler values) to NaN per element and
+        drop only points that are invalid in every channel. Points with a partially
+        valid column (e.g. shelf ocean above the deepest configured level) are kept;
+        the remaining NaNs are masked per channel in the loss.
+        """
+        invalid = np.abs(data_block) > 1e10
+        if invalid.any():
+            data_block[invalid] = np.nan
+
+        if self.filler_values:
+            data_block[np.isin(data_block, self.filler_values)] = np.nan
+
+        valid_mask = ~np.isnan(data_block).all(axis=1)
+
+        return data_block[valid_mask], coords[valid_mask], times[valid_mask]
+
+    def _cache_get(self, key):
+        arr = self._block_cache.get(key)
+        if arr is not None:
+            self._block_cache.move_to_end(key)
+        return arr
+
+    def _cache_put(self, key, arr):
+        budget = self.block_cache_mb * 1024 * 1024
+        if arr.nbytes > budget or key in self._block_cache:
+            return
+        self._block_cache[key] = arr
+        self._block_cache_bytes += arr.nbytes
+        while self._block_cache_bytes > budget and self._block_cache:
+            _, evicted = self._block_cache.popitem(last=False)
+            self._block_cache_bytes -= evicted.nbytes
+
+    @staticmethod
+    def _spatial_plan(spatial_shape: tuple, abs_idx: NDArray):
+        """
+        Translate flat spatial indices into (lazy slicer, local flat indices, identity).
+
+        The slicer restricts the read to the bounding box of the requested points
+        so that only a small block is materialized; `local` re-selects the points
+        inside the flattened bounding box. `identity` is True when the bounding box
+        contains exactly the requested points in order (no fancy indexing needed).
+        """
+        if len(spatial_shape) == 2:
+            w = spatial_shape[1]
+            rows = abs_idx // w
+            cols = abs_idx % w
+            r0, r1 = int(rows.min()), int(rows.max())
+            c0, c1 = int(cols.min()), int(cols.max())
+            bw = c1 - c0 + 1
+            local = (rows - r0) * bw + (cols - c0)
+            span = (r1 - r0 + 1) * bw
+            slicer = (slice(r0, r1 + 1), slice(c0, c1 + 1))
+        elif len(spatial_shape) == 1:
+            s0, s1 = int(abs_idx.min()), int(abs_idx.max())
+            local = abs_idx - s0
+            span = s1 - s0 + 1
+            slicer = (slice(s0, s1 + 1),)
+        else:
+            # Unexpected layout: read everything, select with the flat indices
+            return None, abs_idx, False
+
+        identity = span == len(local) and bool(np.all(np.diff(local) == 1))
+        return slicer, local, identity
+
     def _load_block_from_ds(
         self, ds, arr_cache, indices, start_t, end_t, stride, n_steps, disk_indices, rel_indices
     ) -> np.typing.NDArray:
         if rel_indices is not None:
-            num_points = len(rel_indices)
+            # Contiguous read: disk_indices is a slice; recover absolute flat indices
+            abs_idx = rel_indices + disk_indices.start
         else:
-            num_points = len(disk_indices)
+            abs_idx = disk_indices
+        num_points = len(abs_idx)
 
         if not indices:
             return np.zeros((n_steps * num_points, 0), dtype=np.float32)
 
         output_block = np.zeros((n_steps * num_points, len(indices)), dtype=np.float32)
 
-        with dask.config.set(scheduler="single-threaded"):
-            for i, idx in enumerate(indices):
-                ch_name = self.available_channels[idx]
-                if ch_name not in arr_cache:
-                    info = self.col_map[ch_name]
-                    if info["var"] in ds:
-                        arr_cache[ch_name] = ds[info["var"]].data
-                    else:
-                        continue
+        cache_tag = "s" if ds is self.ds_source else "t"
+        plans: dict = {}  # spatial_shape -> (slicer, local, identity)
+        # Blocks not in cache: (out_col, key, lazy, has_time, local, identity)
+        pending: list = []
+        ready: list = []  # (out_col, block, has_time, local, identity)
 
+        for i, idx in enumerate(indices):
+            ch_name = self.available_channels[idx]
+            if ch_name not in arr_cache:
                 info = self.col_map[ch_name]
-                base_arr = arr_cache[ch_name]
-                dims = ds[info["var"]].dims
-                # 1. Apply Vertical Level Selection
-                sliced = base_arr
-                if info["sel"]:
-                    sls = [slice(None)] * sliced.ndim
-                    for d, val in info["sel"].items():
-                        if d in dims:
-                            sls[dims.index(d)] = val
-                    sliced = sliced[tuple(sls)]
-
-                # 2. Slice Time (keeps memory small before we flatten)
-                if "time" in dims:
-                    sliced = sliced[start_t:end_t:stride]
-
-                # 3. Compute the block into memory
-                chunk = sliced.compute().astype(np.float32)
-
-                # 4. FLATTEN THE SPATIAL DIMENSIONS FIRST (Crucial for 2D Grids)
-                if chunk.ndim > 1:
-                    if "time" in dims:
-                        # (time, lat, lon) -> (time, nodes)
-                        chunk = chunk.reshape(chunk.shape[0], -1)
-                    else:
-                        # (lat, lon) -> (nodes)
-                        chunk = chunk.reshape(-1)
-
-                # 5. NOW apply the spatial indices (which are 1D flat indices)
-                if rel_indices is not None:
-                    if "time" in dims:
-                        # Contiguous read: Apply raw disk bounds, then rel_indices
-                        chunk = chunk[:, disk_indices]
-
-                        # Safety check: if chunk is completely empty, fill with NaNs
-                        if chunk.shape[1] == 0:
-                            assert False, "Empty chunk after disk indexing with time dimension"
-
-                        else:
-                            chunk = chunk[:, rel_indices]
-                    else:
-                        chunk = chunk[disk_indices]
-                        if chunk.size == 0:
-                            assert False, "Empty chunk after disk indexing with rel_indices"
-                        else:
-                            chunk = chunk[rel_indices]
-                        chunk = np.repeat(np.expand_dims(chunk, 0), n_steps, axis=0)
+                if info["var"] in ds:
+                    arr_cache[ch_name] = ds[info["var"]].data
                 else:
-                    # Fancy Indexing (Sparse Global)
-                    if "time" in dims:
-                        chunk = chunk[:, disk_indices]
-                    else:
-                        chunk = chunk[disk_indices]
-                        chunk = np.repeat(np.expand_dims(chunk, 0), n_steps, axis=0)
+                    continue
 
-                # 6. Apply Land Masks
-                chunk[(chunk <= -9000.0)] = np.nan
-                chunk[~np.isfinite(chunk)] = np.nan
-                output_block[:, i] = chunk.reshape(-1)
+            info = self.col_map[ch_name]
+            base_arr = arr_cache[ch_name]
+
+            dims_key = (cache_tag, ch_name)
+            dims = self._dims_cache.get(dims_key)
+            if dims is None:
+                dims = ds[info["var"]].dims
+                self._dims_cache[dims_key] = dims
+
+            # 1. Apply Vertical Level Selection
+            sliced = base_arr
+            if info["sel"]:
+                sls = [slice(None)] * sliced.ndim
+                for d, val in info["sel"].items():
+                    if d in dims:
+                        sls[dims.index(d)] = val
+                sliced = sliced[tuple(sls)]
+
+            # 2. Slice Time (keeps memory small before we flatten)
+            has_time = "time" in dims
+            if has_time:
+                sliced = sliced[start_t:end_t:stride]
+                spatial_shape = sliced.shape[1:]
+            else:
+                spatial_shape = sliced.shape
+
+            # 3. Restrict lazily to the bounding box of the requested points
+            plan = plans.get(spatial_shape)
+            if plan is None:
+                plan = self._spatial_plan(spatial_shape, abs_idx)
+                plans[spatial_shape] = plan
+            slicer, local, identity = plan
+
+            if has_time:
+                key = (cache_tag, ch_name, int(start_t), int(end_t), int(stride), slicer)
+            else:
+                key = (cache_tag, ch_name, "static", slicer)
+
+            block = self._cache_get(key)
+            if block is not None:
+                ready.append((i, block, has_time, local, identity))
+                continue
+
+            if slicer is not None:
+                if has_time:
+                    sliced = sliced[(slice(None),) + slicer]
+                else:
+                    sliced = sliced[slicer]
+            pending.append((i, key, sliced, has_time, local, identity))
+
+        # 4. Compute all missing blocks in one batched graph
+        if pending:
+            scheduler = "threads" if self.read_threads > 1 else "single-threaded"
+            computed = dask.compute(
+                *[p[2] for p in pending], scheduler=scheduler, num_workers=self.read_threads
+            )
+            for (i, key, _, has_time, local, identity), block in zip(
+                pending, computed, strict=True
+            ):
+                self._cache_put(key, block)
+                ready.append((i, block, has_time, local, identity))
+
+        # 5. Select the requested points and post-process (small arrays only)
+        for i, block, has_time, local, identity in ready:
+            if has_time:
+                flat = block.reshape(block.shape[0], -1)
+                chunk = flat if identity else flat[:, local]
+                chunk = chunk.astype(np.float32)
+            else:
+                flat = block.reshape(-1)
+                chunk = flat if identity else flat[local]
+                chunk = chunk.astype(np.float32)
+                chunk = np.repeat(np.expand_dims(chunk, 0), n_steps, axis=0)
+
+            # 6. Apply Land Masks
+            chunk[(chunk <= -9000.0)] = np.nan
+            chunk[~np.isfinite(chunk)] = np.nan
+            output_block[:, i] = chunk.reshape(-1)
 
         return output_block
 

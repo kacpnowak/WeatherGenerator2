@@ -19,6 +19,7 @@ from omegaconf import DictConfig
 
 import weathergen.train.loss_modules.loss_functions as loss_fns
 from weathergen.train.loss_modules.loss_module_base import LossModuleBase, LossValues
+from weathergen.train.loss_modules.supervised_steps import first_supervised_timestep
 from weathergen.train.utils import TRAIN, VAL, Stage
 from weathergen.utils.utils import is_stream_fe_only
 
@@ -74,11 +75,15 @@ class DynamicLossEMA:
             return
 
         with torch.no_grad():
-            mse_per_chan = loss_lfct_chs.detach().clamp(min=1e-6)
-            inv_mse = 1.0 / mse_per_chan
-            self.channel_weights_ema[stream_name] = (
-                1.0 - 1.0 / self.window
-            ) * self.channel_weights_ema[stream_name] + (1.0 / self.window) * inv_mse
+            mse_per_chan = loss_lfct_chs.detach()
+            # a per-channel loss of exactly 0 means the channel had no valid points
+            # in this batch; keep its EMA unchanged instead of feeding it the
+            # clamp-inflated inverse (1e6), which would pin it at the max weight
+            has_data = mse_per_chan > 0.0
+            inv_mse = 1.0 / mse_per_chan.clamp(min=1e-6)
+            ema = self.channel_weights_ema[stream_name]
+            updated = (1.0 - 1.0 / self.window) * ema + (1.0 / self.window) * inv_mse
+            self.channel_weights_ema[stream_name] = torch.where(has_data, updated, ema)
 
 
 class LossPhysical(LossModuleBase):
@@ -139,8 +144,14 @@ class LossPhysical(LossModuleBase):
         if self.stage == TRAIN:
             # set loss_weights to 1. when not specified
             stream_info_loss_weight = stream_info.get("loss_weight", 1.0)
+            # list(): torch.tensor() probes its argument for __cuda_array_interface__ and
+            # __dlpack__; OmegaConf answers each probe on a ListConfig with an exception that
+            # refers to itself through its traceback. That reference cycle keeps this frame and,
+            # through f_back, compute_loss and LossCalculator.compute_loss alive with the step's
+            # predictions and targets (most of the batch on the GPU) until Python's cyclic
+            # garbage collector runs, sometimes only in the next step's backward (CUDA OOM).
             weights_channels_static = (
-                torch.tensor(stream_info["target_channel_weights"]).to(
+                torch.tensor(list(stream_info["target_channel_weights"])).to(
                     device=device, non_blocking=True
                 )
                 if stream_info.get("target_channel_weights")
@@ -301,7 +312,8 @@ class LossPhysical(LossModuleBase):
 
             stream_loss_weight, weights_channels = self._get_weights(stream_name, stream_info)
             if self.dynamic_loss_ema.enabled and weights_channels is not None:
-                losses_all[stream_name][str(self.forecast_offset)]["mse_ema_weight"] = {}
+                ema_weights = losses_all[stream_name][str(self.forecast_offset)]
+                ema_weights["mse_ema_weight"] = {}
                 for ch_n, w in zip(target_channels, weights_channels, strict=True):
                     losses_all[stream_name][str(self.forecast_offset)]["mse_ema_weight"][ch_n] = (
                         w.item()
@@ -313,6 +325,9 @@ class LossPhysical(LossModuleBase):
             output_offset = len(targets.physical) - len(targets.output_idxs)
             if output_offset > 0:
                 output_step_loss_weights = [None] * output_offset + list(output_step_loss_weights)
+
+            # the dynamic channel weights track the first supervised step's error
+            ema_timestep = first_supervised_timestep(preds.physical, stream_name)
 
             # loss_stream: loss for given stream
             loss_stream = torch.tensor(0.0, device=self.device, requires_grad=True)
@@ -409,7 +424,7 @@ class LossPhysical(LossModuleBase):
                         # Update EMA for dynamic loss if enabled
                         if (
                             self.dynamic_loss_ema.enabled
-                            and timestep_idx == self.forecast_offset
+                            and timestep_idx == ema_timestep
                             and loss_fct_name == "mse"
                             and not is_spoof
                         ):

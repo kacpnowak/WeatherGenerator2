@@ -196,7 +196,10 @@ def lp_loss(
     )
     if weights_points is not None:
         diff_p = (diff_p.transpose(1, 0) * weights_points).transpose(1, 0)
-    loss_chs = diff_p.mean(0) if with_mean else diff_p.sum(0)
+    # normalize per channel by the number of valid (non-NaN) points; channels with
+    # many NaNs (e.g. ocean levels below bathymetry) would otherwise report a
+    # deflated loss since masked points contribute 0 to the sum
+    loss_chs = diff_p.sum(0) / mask_nan.sum(0).clamp(min=1) if with_mean else diff_p.sum(0)
     loss_chs = torch.pow(loss_chs, 1.0 / p_norm) if with_p_root else loss_chs
     loss = torch.mean(loss_chs * weights_channels if weights_channels is not None else loss_chs)
 
