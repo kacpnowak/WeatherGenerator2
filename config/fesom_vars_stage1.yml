@@ -1,0 +1,32 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Stage 1 of the from-scratch retrain on the per-variable FESOM streams: overlay for
+# config/config_fesom_vars.yml (whose schedule is frcwin01's fine-tune). The schedule is the one of
+# this lineage's own from-scratch run i2gcwl1k (64 x 4096 samples, lr_max 5e-5, 4-day rollout,
+# nothing frozen), so the new streams, dry masking, bathymetry geoinfo, wet statistics and IFS
+# forcing are the only changes against it. Longer rollouts and the spin-up window come in later
+# stages (continued with train_continue).
+
+training_config:
+  num_mini_epochs: 64
+  samples_per_mini_epoch: 4096
+  learning_rate_scheduling:
+    lr_start: 1e-6
+    lr_max: 5e-5
+    lr_final_decay: 2e-6
+    lr_final: 0.0
+    num_steps_warmup: 256
+    num_steps_cooldown: 512
+  forecast:
+    num_steps: 4
+
+# 256 of the 365 days of 2209 (shuffle off: January to mid-September, the same every epoch)
+validation_config:
+  samples_per_mini_epoch: 256
