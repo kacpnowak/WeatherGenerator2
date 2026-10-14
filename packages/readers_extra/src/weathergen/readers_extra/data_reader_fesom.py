@@ -566,6 +566,11 @@ class DataReaderFesom(DataReaderTimestep):
     def init_empty(self) -> None:
         super().init_empty()
         self.len = 0
+        # the model was sized with the bathymetry geoinfo channel; an empty reader must keep
+        # the same token width
+        if self._stream_info.get("bathymetry_geoinfo"):
+            self.geoinfo_channels = ["bathymetry"]
+            self.geoinfo_idx = [0]
 
     @override
     def length(self) -> int:

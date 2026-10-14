@@ -73,3 +73,44 @@ def test_without_mesh_keys_the_reader_is_unchanged():
     a, b = _reader(), _reader()
     np.testing.assert_array_equal(a.get_source(1).data, b.get_source(1).data)
     assert a.get_source(1).geoinfos.shape[1] == 0
+
+
+def _outside_reader(**keys):
+    info = {"name": "T", "type": "fesom", "stream_id": 2150, "filenames": ["ocean_node"],
+            "source": CHANNELS, "target": CHANNELS, "loss_weight": 1.0, **keys}
+    tw = TimeWindowHandler(np.datetime64("1900-01-01T00:00"), np.datetime64("1900-01-20T00:00"),
+                           np.timedelta64(1, "D"), np.timedelta64(1, "D"))
+    return get_extra_reader("fesom")(tw_handler=tw, filename=ROOT / "ocean_node",
+                                     stream_info=info, stage="train")
+
+
+@pytest.mark.parametrize("keys,width", [(MESH_KEYS, 1), ({}, 0)])
+def test_empty_reader_keeps_geoinfo_width(keys, width):
+    reader = _outside_reader(**keys)
+    assert reader.get_geoinfo_size() == width
+    assert len(reader) == 0
+    assert reader.get_geoinfo_size() == width  # still after _lazy_init emptied it
+    for out in (reader.get_source(0), reader.get_target(0)):
+        assert out.geoinfos.shape[1] == width
+
+
+@pytest.mark.parametrize(
+    "entity,channel", [("ocean_elem", "u_450"), ("ocean_node", "temp_450")]
+)
+def test_mesh_dry_mask_lines_up_with_archive(entity, channel):
+    if not (ROOT / entity).is_dir():
+        pytest.skip(f"{entity} absent")
+    info = {"name": "T", "type": "fesom", "stream_id": 2150, "filenames": [entity],
+            "source": [channel], "target": [channel], "loss_weight": 1.0}
+    tw = TimeWindowHandler(np.datetime64("2100-01-01T00:00"), np.datetime64("2100-01-20T00:00"),
+                           np.timedelta64(1, "D"), np.timedelta64(1, "D"))
+    reader = get_extra_reader("fesom")(tw_handler=tw, filename=ROOT / entity,
+                                       stream_info=info, stage="train")
+    data = reader.get_target(1).data
+    n_steps = data.shape[0] // reader.target_mesh_size
+    dry = dry_mask([channel], read_mesh_entity(MESH, reader.target_mesh_size), n_steps)
+    assert dry.shape == data.shape
+    d, w = data[dry], data[~dry]
+    assert ((d == 0) | np.isnan(d)).mean() > 0.9999
+    assert not np.isnan(w).any()
+    assert (w != 0).mean() > 0.99
