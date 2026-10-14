@@ -8,6 +8,7 @@ def test_fesom_vars_training_config_merges():
     assert set(cf.streams) == {"TEMP", "SALT", "U", "V", "SURFACE", "IFS_ATMO"}
     assert cf.freeze_modules == ""
     assert cf.healpix_level == 5 and cf.fe_num_blocks == 16 and cf.ae_global_dim_embed == 2048
+    assert cf.ae_local_max_tokens_per_cell == 256  # not in the default schema; read with cf.get(..., 64)
     fc = cf.training_config.forecast
     assert fc.num_steps == 15 and fc.offset == 1 and fc.get("prefix_steps") is None
     assert str(cf.training_config.start_date).startswith("2000-01-01")
