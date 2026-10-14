@@ -31,7 +31,7 @@ def test_ocean_stream(name):
     assert list(s["source"]) == channels and list(s["target"]) == channels
     assert s["loss_weight"] == 1.0
     assert s["wet_mask_from_mesh"] is True and s["bathymetry_geoinfo"] is True
-    assert Path(s["mesh_path"]).name == "fesom.mesh.diag.nc"
+    assert s["mesh_path"] == "/work/ab0995/a270225/atmorep_data/multiverse/core2/original/cycle_1/fesom.mesh.diag.nc"
     if stats:
         assert s["normalization_stats"] == f"config/streams/fesom/{stats}"
     else:
