@@ -12,7 +12,17 @@ from weathergen.utils.utils import is_stream_fe_only
 CONFIG = Path(__file__).resolve().parents[1] / "config"
 STREAMS = CONFIG / "streams"
 IFS_CHANNELS = ["10u", "10v", "2d", "2t", "cp", "lsp", "msl", "tsr", "tsrc"]
-FORCED_SETS = {"fesom_forced": "additive", "fesom_forced_adaln": "adaln_local"}
+# atmospheric state only: no variable computed from the coupled model's ocean or sea ice
+ATM_CHANNELS = ["10u", "10v", "2t", "2d", "msl", "cp", "lsp", "tcc", "tsr"]
+# ocean / sea-ice state or fluxes computed from it (atmosphere and ocean archives)
+OCEAN_DERIVED = {"sst", "ci", "tsrc", "fh", "fw", "evap", "prec", "swr", "snow", "a_ice", "m_ice",
+                 "MLD2", "tx_sur", "ty_sur"}
+FORCED_SETS = {
+    "fesom_forced": "additive",
+    "fesom_forced_adaln": "adaln_local",
+    "fesom_forced_atm": "additive",
+}
+ATMOS_ARCHIVE = Path("/work/ab0995/a270088/Kacper/weathergenertor/AWICM3/atmos_all")
 
 
 def _ocean_stream_names():
@@ -20,20 +30,20 @@ def _ocean_stream_names():
     return set(load_streams(STREAMS / "fesom").keys()) - {"IFS_ATMO"}
 
 
-def _check_ifs_forcing(ifs, mode):
+def _check_ifs_forcing(ifs, mode, channels=IFS_CHANNELS):
     assert ifs["type"] == "forcing" and ifs["reader"] == "fesom"
     assert ifs["injection"]["mode"] == mode
     assert ifs["injection"]["time_reduce"] == "mean"
-    assert list(ifs["source"]) == IFS_CHANNELS
+    assert list(ifs["source"]) == channels
     assert parse_timedelta(ifs["frequency"]) == np.timedelta64(6, "h")
     # IFS stamps 06/12/18/00 describe the day that starts at 00
     assert parse_timedelta(ifs["window_shift"]) == np.timedelta64(6, "h")
     assert is_stream_fe_only(ifs)
 
 
-def _check_forced_set(name, mode):
+def _check_forced_set(name, mode, channels=IFS_CHANNELS):
     streams = load_streams(STREAMS / name)
-    _check_ifs_forcing(streams["IFS_ATMO"], mode)
+    _check_ifs_forcing(streams["IFS_ATMO"], mode, channels)
     ocean = {n: s for n, s in streams.items() if not is_stream_fe_only(s)}
     assert len(ocean) == 2
     assert all(s["type"] == "fesom" for s in ocean.values())
@@ -51,6 +61,20 @@ def test_fesom_forced_adaln_stream_set():
     assert set(streams.keys()) == _ocean_stream_names() | {"IFS_ATMO", "Forecast_conditions"}
     assert streams["Forecast_conditions"]["type"] == "condition"
     assert is_stream_fe_only(streams["Forecast_conditions"])
+
+
+def test_fesom_forced_atm_stream_set():
+    streams = _check_forced_set("fesom_forced_atm", "additive", ATM_CHANNELS)
+    assert set(streams.keys()) == _ocean_stream_names() | {"IFS_ATMO"}
+    assert not set(streams["IFS_ATMO"]["source"]) & OCEAN_DERIVED
+
+
+@pytest.mark.skipif(not ATMOS_ARCHIVE.is_dir(), reason="AWI-CM3 IFS data not available")
+def test_atm_forcing_channels_exist_in_the_archive():
+    import zarr
+
+    colnames = zarr.open_group(ATMOS_ARCHIVE / "2100.zarr", mode="r")["data"].attrs["colnames"]
+    assert set(ATM_CHANNELS) <= set(colnames)
 
 
 @pytest.mark.parametrize("name", FORCED_SETS)
