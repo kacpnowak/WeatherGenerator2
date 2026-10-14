@@ -18,6 +18,7 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
     t_epsilon,
 )
+from weathergen.readers_extra.fesom_mesh import bathymetry, dry_mask, read_mesh_entity
 from weathergen.train.utils import Stage
 
 _logger = logging.getLogger(__name__)
@@ -119,8 +120,19 @@ class DataReaderFesom(DataReaderTimestep):
         self.source_idx = []
         self.target_channels = []
         self.target_idx = []
-        self.geoinfo_channels = []
-        self.geoinfo_idx = []
+        # the sampler sizes tokens from get_geoinfo_size() before any data is read, so the
+        # geoinfo channels are fixed here from the stream config
+        self._wet_mask_from_mesh = bool(stream_info.get("wet_mask_from_mesh"))
+        self._bathymetry_geoinfo = bool(stream_info.get("bathymetry_geoinfo"))
+        if (self._wet_mask_from_mesh or self._bathymetry_geoinfo) and not stream_info.get(
+            "mesh_path"
+        ):
+            raise ValueError(
+                f"Stream {stream_info.get('name')!r}: wet_mask_from_mesh and bathymetry_geoinfo "
+                "need the stream option mesh_path"
+            )
+        self.geoinfo_channels = ["bathymetry"] if self._bathymetry_geoinfo else []
+        self.geoinfo_idx = [0] if self._bathymetry_geoinfo else []
         self.properties = {}
         self.fake_specs = {}
         self.fake_target = False
@@ -467,13 +479,29 @@ class DataReaderFesom(DataReaderTimestep):
         self.cached_source_coords = np.stack([src_timestep_lats, src_timestep_lons], axis=1)
         self.cached_target_coords = np.stack([trg_timestep_lats, trg_timestep_lons], axis=1)
 
-        self.geoinfo_channels = []
-        self.geoinfo_idx = []
-        
+        if not self._bathymetry_geoinfo:
+            self.geoinfo_channels = []
+            self.geoinfo_idx = []
+
         self.src_mean_vec = self.source_mean[self.source_idx]
         self.src_stdev_vec = self.source_stdev[self.source_idx]
         self.trg_mean_vec = self.target_mean[self.target_idx]
         self.trg_stdev_vec = self.target_stdev[self.target_idx]
+
+        if self._wet_mask_from_mesh or self._bathymetry_geoinfo:
+            assert self.target_mesh_size == self.source_mesh_size, (
+                "mesh-based masking needs source and target on the same mesh"
+            )
+            self._mesh = read_mesh_entity(self._stream_info["mesh_path"], self.source_mesh_size)
+        if self._wet_mask_from_mesh:
+            # one-day masks in mesh order; tiled per time step in get_source / get_target
+            self._dry_src_day = dry_mask(self.source_channels, self._mesh, 1)
+            self._dry_trg_day = dry_mask(self.target_channels, self._mesh, 1)
+        if self._bathymetry_geoinfo:
+            raw = bathymetry(self._mesh)
+            self._geo_day = raw[:, None].astype(np.float32)
+            self.mean_geoinfo = np.array([raw.mean()])
+            self.stdev_geoinfo = np.array([raw.std()])
 
         self._initialized = True
 
@@ -672,7 +700,15 @@ class DataReaderFesom(DataReaderTimestep):
         
         n_steps = data.shape[0] // self.source_mesh_size
         coords = np.tile(self.cached_source_coords, (n_steps, 1))
-        geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
+        if self._wet_mask_from_mesh:
+            # rows are still in day-major mesh order here. Dry inputs become the channel mean,
+            # i.e. 0 after normalisation
+            dry = np.tile(self._dry_src_day, (n_steps, 1))
+            data = np.where(dry, self.src_mean_vec.astype(data.dtype), data)
+        if self._bathymetry_geoinfo:
+            geoinfos = np.tile(self._geo_day, (n_steps, 1))
+        else:
+            geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
         datetimes = np.squeeze(datetimes)
 
         rd = ReaderData(
@@ -711,7 +747,14 @@ class DataReaderFesom(DataReaderTimestep):
         
         n_steps = data.shape[0] // self.target_mesh_size
         coords = np.tile(self.cached_target_coords, (n_steps, 1))
-        geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
+        if self._wet_mask_from_mesh:
+            # dry targets are NaN so the loss skips them
+            dry = np.tile(self._dry_trg_day, (n_steps, 1))
+            data = np.where(dry, np.nan, data)
+        if self._bathymetry_geoinfo:
+            geoinfos = np.tile(self._geo_day, (n_steps, 1))
+        else:
+            geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
         datetimes = np.squeeze(datetimes)
 
         rd = ReaderData(
