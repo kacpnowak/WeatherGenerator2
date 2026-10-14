@@ -1,0 +1,69 @@
+# Paper evaluation config — FESOM2 emulator, run oe3i7whz.
+# Re-run with a new inference: change run_id + results_dir (and rebuild nothing else).
+run_id: oe3i7whz
+results_dir: /work/ab0995/a270225/WeatherGenerator2/results/oe3i7whz
+mini_epoch: 0
+mesh_path: /work/ab0995/a270225/atmorep_data/multiverse/core2/original/cycle_1/fesom.mesh.diag.nc
+streams: [FESOM_NODE, FESOM_ELEM]
+
+truth:   # ground-truth archives, used ONLY to build the day-of-year climatology
+  FESOM_NODE: /work/ab0995/a270088/Kacper/weathergenertor/AWICM3/ocean_node
+  FESOM_ELEM: /work/ab0995/a270088/Kacper/weathergenertor/AWICM3/ocean_elem
+
+climatology:
+  ref_start: 2180      # 30-year reference window centred on the evaluation period;
+  ref_end: 2209
+
+init_filter:           # held-out eval: drop Dec-2208 train-period inits
+  start: "2209-01-01"
+  end: null
+
+leads:
+  max: 30              # per-sample scores computed for leads 1..max
+  map_leads: [15, 30]  # leads with spatial accumulations + spectra
+
+regions:            # per-sample score aggregation regions; lat bounds [south, north]
+  global: null      # whole mesh
+  nh: [0, 90]       # lat >= 0
+  sh: [-90, 0]      # lat < 0   (boundary nodes at exactly 0 belong to nh)
+
+seasons:            # NH meteorological convention of the INIT month; local season
+                    # is reversed in the SH; December inits are excluded (see below)
+  DJF: [12, 1, 2]     # December contributes nothing (excluded below)
+  MAM: [3, 4, 5]
+  JJA: [6, 7, 8]
+  SON: [9, 10, 11]
+  exclude_init_months: [12]
+  channels: [sst, sss, ssh]    # channels for the seasonal curve figures
+
+showcase:              # single init used for snapshot map figures
+  init_time: "2209-06-01"   # nearest available init is used
+  leads: [1, 15, 30]
+
+spectra:
+  n_samples: 8               # time-spread subset of the (init-filtered) samples
+  leads: [15, 30]
+  scalar_channels: [ssh, sst]        # all-wet surface node channels only (sub-surface
+                                     # channels have land at depth: filtering would bleed
+                                     # through the 0.0 fill; deliberately excluded)
+  velocity_pairs: [[u_2, v_2]]       # FESOM_ELEM channel pairs -> KE spectra ("KE_u_2_v_2")
+  bands:
+    global: null                     # name -> null (whole mesh) | [lat_south, lat_north]
+  scale_min_km: 150
+  scale_max_km: 5000
+  n_scales: 20
+  filter_order: 1
+  filter_cache: /work/ab0995/a270225/WeatherGenerator2/paper_eval/cache/fesom_filter_core2.npz
+  n_workers: 12
+
+figures:
+  map_channels: [sst, ssh, sss, temp_107, salt_107, u_2, v_2]
+  curve_depths: [2, 107, 450]   # depth suffixes highlighted in curve figures
+  depth_rmse_normalised: true   # f06 top row shows RMSE / climatological RMSE
+
+compute:
+  n_workers: 16
+
+output:
+  cache_dir: /work/ab0995/a270225/WeatherGenerator2/paper_eval/cache_oe3i7whz
+  fig_dir: /work/ab0995/a270225/WeatherGenerator2/paper_eval/figures

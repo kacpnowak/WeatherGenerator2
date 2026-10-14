@@ -1,0 +1,96 @@
+# Paper evaluation config — EERIE ocean gridded-stream emulator, run u9tysfqr.
+# Task 24: first "geometry: eerie" config -- see paper_eval/scores.py's module
+# docstring and paper_eval/eerie_grid.py for what that branch does differently from
+# the FESOM native-mesh path (default.yaml/xjcn8rvp.yaml).
+run_id: u9tysfqr
+results_dir: /work/ab0995/a270225/WeatherGenerator2/results/u9tysfqr
+mini_epoch: 0
+geometry: eerie          # default (omitted) is "fesom" -- this is what selects the
+                         # eerie_grid.py-based scoring path in scores.py/snapshots.py
+streams: [OCEAN_2D, OCEAN_3D]   # EERIE_ATMO is present in the results archive but
+                                 # carries no target/prediction data (0-channel, 0-point
+                                 # empty groups) for this run -- excluded here rather
+                                 # than handled as a degenerate empty stream
+
+truth:   # kerchunk-parquet-referenced ground-truth archives: grid geometry (eerie_grid
+         # .load_grid, 2D store only -- both streams share one physical earth grid) and
+         # per-channel normalization stats (eerie_grid.load_norm_stats), NOT channel
+         # data (not read in Task 24; Task 25's climatology build will need it)
+  OCEAN_2D: /work/ab0995/a270225/data_transformation/eerie_ocean_gr025_2d_gridded_daily.parq
+  OCEAN_3D: /work/ab0995/a270225/data_transformation/eerie_ocean_gr025_3d_gridded_daily.parq
+
+climatology:
+  enabled: true    # Task 25 built build_clim_eerie.py (paper_eval/build_clim_eerie.py)
+                     # and wired scores._clim_lookup/_init_worker_eerie to read the
+                     # resulting clim zarr (clim_dir(cfg)/clim_{stream}_{ref_start}-
+                     # {ref_end}.zarr, same layout climatology.ClimLookup already reads)
+                     # -- but this key is LEFT false here: flip to true once clim zarrs
+                     # exist (i.e. once the 1984-2013 build submitted by Task 25 has
+                     # actually finished -- Task 27 flips it after the build completes).
+                     # While false, every acc score is NaN and the climatology-model row
+                     # is NaN outright (score_block's documented clim=None contract --
+                     # see scores._process_block_eerie), unchanged from Task 24.
+  ref_start: 1984   # 30-year reference period, disjoint from the 2013-11..2014-10 eval
+  ref_end: 2013      # period below
+
+init_filter:           # u9tysfqr's 360 samples span inits 2013-11-02..2014-10-27
+                       # (daily); excludes the ones overlapping the training period
+  start: "2014-01-01"
+  end: null
+
+leads:
+  max: 30              # per-sample scores computed for leads 1..max (fsteps 0..30 present)
+  map_leads: [15, 30]  # leads with spatial accumulations
+
+regions:            # per-sample score aggregation regions; lat bounds [south, north]
+  global: null      # whole grid
+  nh: [0, 90]       # lat >= 0
+  sh: [-90, 0]      # lat < 0   (boundary points at exactly 0 belong to nh)
+
+seasons:            # NH meteorological convention of the INIT month; local season
+                    # is reversed in the SH; December inits are excluded (see below)
+  DJF: [12, 1, 2]     # December contributes nothing (excluded below)
+  MAM: [3, 4, 5]
+  JJA: [6, 7, 8]
+  SON: [9, 10, 11]
+  exclude_init_months: [12]
+  channels: [avg_sos, avg_tos, avg_zos]    # channels for the seasonal curve figures
+
+showcase:              # single init used for snapshot map figures
+  init_time: "2014-06-01"   # nearest available init is used
+  leads: [1, 15, 30]
+
+spectra:
+  enabled: false   # native-mesh (implicit_filter) spectra stage doesn't apply to the
+                    # EERIE gridded geometry -- compute_spectra.py is NEVER run against
+                    # this config (not just skipped: it isn't even invoked), so this key
+                    # is documentation only, checked by nothing. plot.py's f09 already
+                    # [skip]s cleanly on a missing spectra.nc, which is what a cache
+                    # built from this config always has. The keys below are kept only so
+                    # this section's shape matches default.yaml/xjcn8rvp.yaml; their
+                    # values are otherwise meaningless here.
+  n_samples: 8
+  leads: [15, 30]
+  scalar_channels: [avg_tos, avg_zos]
+  velocity_pairs: []
+  bands:
+    global: null
+  scale_min_km: 150
+  scale_max_km: 5000
+  n_scales: 20
+  filter_order: 1
+  filter_cache: /work/ab0995/a270225/WeatherGenerator2/paper_eval/cache/fesom_filter_core2.npz
+  n_workers: 12
+
+figures:
+  map_channels: [avg_tos, avg_zos, avg_sos, avg_thetao_2.5m, avg_uoe_2.5m]
+  curve_depths: [2, 107, 450]   # n/a for EERIE geometry (FESOM depth-suffix figures
+                                # don't apply here) -- unused by compute.py; kept only
+                                # for config-shape parity with default.yaml
+
+compute:
+  n_workers: 12
+
+output:
+  cache_dir: /work/ab0995/a270225/WeatherGenerator2/paper_eval/cache_u9tysfqr
+  fig_dir: /work/ab0995/a270225/WeatherGenerator2/paper_eval/figures
