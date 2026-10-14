@@ -1,0 +1,109 @@
+# (C) Copyright 2024 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Per-variable FESOM stream: salinity (31 channels, archive 'ocean_node').
+# One stream per variable so each gets its own embedding and prediction head.
+# Wet/dry is derived from the FESOM mesh (wet_mask_from_mesh), not from stored zeros,
+# so no fill value is set; bathymetry_geoinfo adds log1p(bottom depth) as geoinfo.
+# Normalised with wet-point statistics (wet_stats_node.json), computed over wet points only.
+
+SALT :
+  type : fesom
+  stream_id : 2151
+  filenames : ['ocean_node']
+  loss_weight : 1.
+  mesh_path : /work/ab0995/a270225/atmorep_data/multiverse/core2/original/cycle_1/fesom.mesh.diag.nc
+  wet_mask_from_mesh : true
+  bathymetry_geoinfo : true
+  normalization_stats : config/streams/fesom/wet_stats_node.json
+  source :
+  - salt_2
+  - salt_7
+  - salt_15
+  - salt_25
+  - salt_35
+  - salt_45
+  - salt_55
+  - salt_65
+  - salt_75
+  - salt_85
+  - salt_95
+  - salt_107
+  - salt_125
+  - salt_147
+  - salt_175
+  - salt_210
+  - salt_255
+  - salt_310
+  - salt_375
+  - salt_450
+  - salt_535
+  - salt_630
+  - salt_735
+  - salt_850
+  - salt_975
+  - salt_1110
+  - salt_1255
+  - salt_1415
+  - salt_1600
+  - salt_1810
+  - salt_2035
+  target :
+  - salt_2
+  - salt_7
+  - salt_15
+  - salt_25
+  - salt_35
+  - salt_45
+  - salt_55
+  - salt_65
+  - salt_75
+  - salt_85
+  - salt_95
+  - salt_107
+  - salt_125
+  - salt_147
+  - salt_175
+  - salt_210
+  - salt_255
+  - salt_310
+  - salt_375
+  - salt_450
+  - salt_535
+  - salt_630
+  - salt_735
+  - salt_850
+  - salt_975
+  - salt_1110
+  - salt_1255
+  - salt_1415
+  - salt_1600
+  - salt_1810
+  - salt_2035
+  location_weight : cosine_latitude
+  masking_rate : 0.6
+  masking_rate_none : 0.05
+  token_size : 32
+  tokenize_spacetime : True
+  max_num_targets: 32768
+  embed :
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 256
+    num_blocks : 2
+  embed_target_coords :
+    net : mlp
+    dim_embed : 256
+  target_readout :
+    num_layers : 2
+    num_heads : 4
+  pred_head :
+    ens_size : 1
+    num_layers : 1
