@@ -159,9 +159,46 @@ def test_predict_decoders_hands_the_same_neighbourhood(decoder_type, gathers_ins
 
     expected = tokens.reshape(1, CELLS, 1, DIM).flatten(0, 1)[params.hp_nbours.flatten()]
     expected = expected.flatten(0, 1)
-    (latent, latent_idxs), = engine.calls
+    ((latent, latent_idxs),) = engine.calls
     if gathers_inside:
         torch.testing.assert_close(latent[latent_idxs].flatten(0, 1), expected)
     else:
         assert latent_idxs is None
         torch.testing.assert_close(latent, expected)
+
+
+def test_prediction_head_runs_in_fp32_under_autocast():
+    # the trainer runs the forward under bf16 autocast; the prediction head must not round the
+    # physical prediction to bf16 (steps of ~0.004 in normalised units)
+    from weathergen.model.engines import EnsPredictionHead
+
+    torch.manual_seed(0)
+    engine = _RecordingEngine(accepts_idxs=True)
+    stub = types.SimpleNamespace(
+        num_aux_tokens=0,
+        num_healpix_cells=CELLS,
+        cf=types.SimpleNamespace(
+            ae_local_num_queries=1, decoder_type="PerceiverIOCoordConditioning"
+        ),
+        data_stream_names=["S"],
+        embed_target_coords=torch.nn.ModuleDict({"S": torch.nn.Linear(5, DIM)}),
+        target_token_engines=torch.nn.ModuleDict({"S": engine}),
+        pred_heads=torch.nn.ModuleDict({"S": EnsPredictionHead(DIM, 3, 1, 1, "S")}),
+    )
+    sample = types.SimpleNamespace(
+        streams_data={
+            "S": types.SimpleNamespace(
+                target_coords=[None, torch.randn(POINTS, 5)],
+                target_coords_lens=[None, torch.tensor([POINTS], dtype=torch.int32)],
+            )
+        }
+    )
+    batch = type("Batch", (), {"samples": [sample], "__len__": lambda self: 1})()
+    params = types.SimpleNamespace(hp_nbours=torch.randint(0, CELLS, (CELLS, 9)))
+    output = _Output()
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        Model.predict_decoders(stub, params, 1, 1, torch.randn(1, CELLS, DIM), batch, output)
+
+    (pred,) = output.physical["S"]
+    assert pred.dtype == torch.float32

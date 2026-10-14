@@ -1035,8 +1035,11 @@ class Model(torch.nn.Module):
                         coordinates=t_coords,
                     )
 
-                    # final prediction head to map back to physical space
-                    pred = self.pred_heads[stream_name](tc_tokens)
+                    # final prediction head to map back to physical space, in fp32: under the
+                    # trainer's bf16 autocast its output would be rounded to bf16 (steps of
+                    # ~0.004 in normalised units), a floor for slowly varying channels
+                    with torch.autocast(device_type=tc_tokens.device.type, enabled=False):
+                        pred = self.pred_heads[stream_name](tc_tokens.float())
 
             # recover batch dimension (ragged, so as list)
             pred = torch.split(pred, t_coords_lens, dim=1)
