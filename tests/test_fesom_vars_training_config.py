@@ -11,5 +11,5 @@ def test_fesom_vars_training_config_merges():
     assert cf.ae_local_max_tokens_per_cell == 256  # not in the default schema; read with cf.get(..., 64)
     fc = cf.training_config.forecast
     assert fc.num_steps == 15 and fc.offset == 1 and fc.get("prefix_steps") is None
-    assert str(cf.training_config.start_date).startswith("2000-01-01")
-    assert str(cf.validation_config.start_date).startswith("2209-01-01")
+    assert str(cf.training_config.start_date).startswith("2010-01-01")
+    assert str(cf.validation_config.start_date).startswith("2200-01-01")

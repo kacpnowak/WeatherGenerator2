@@ -99,8 +99,8 @@ training_config:
   num_mini_epochs: 5
   samples_per_mini_epoch: 2048
   shuffle: True
-  start_date: 2000-01-01T00:00
-  end_date: 2208-12-31T00:00
+  start_date: 2010-01-01T00:00
+  end_date: 2199-12-31T00:00
   time_window_step: 86400
   time_window_len: 86400
 
@@ -148,8 +148,8 @@ training_config:
 validation_config:
   samples_per_mini_epoch: 64
   shuffle: False
-  start_date: 2209-01-01T00:00
-  end_date: 2209-12-31T00:00
+  start_date: 2200-01-01T00:00
+  end_date: 2200-12-31T00:00
   validate_with_ema:
     enabled: False
     ema_ramp_up_ratio: 0.09

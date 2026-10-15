@@ -27,6 +27,8 @@ training_config:
   forecast:
     num_steps: 4
 
-# 256 of the 365 days of 2209 (shuffle off: January to mid-September, the same every epoch)
+# 256 of the 365 days of the validation year 2200 (shuffle off: January to mid-September, the
+# same every epoch). Training is 2010-2199 (config_fesom_vars.yml); 2000-2009 and 2201-2209 are
+# never seen.
 validation_config:
   samples_per_mini_epoch: 256
