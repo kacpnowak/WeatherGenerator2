@@ -1,0 +1,32 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Stage 2 of the from-scratch retrain on the per-variable FESOM streams: continue stage 1 (4-day
+# rollout, run fvars001) with the 15-day rollout of the earlier lineage's fine-tune (nrhmwyk4,
+# frcwin01: lr_max 1e-5, warmup 256, cooldown 512). Nothing frozen (the smoke run showed a
+# 15-step rollout with every module trainable fits in memory). Applied with train_continue on top
+# of fvars001's saved config, with general.istep=0 so the schedule starts fresh.
+
+training_config:
+  num_mini_epochs: 12
+  samples_per_mini_epoch: 2048
+  learning_rate_scheduling:
+    lr_start: 1e-6
+    lr_max: 1e-5
+    lr_final_decay: 2e-6
+    lr_final: 0.0
+    num_steps_warmup: 256
+    num_steps_cooldown: 512
+  forecast:
+    num_steps: 15
+
+freeze_modules: ""
+
+validation_config:
+  samples_per_mini_epoch: 256
