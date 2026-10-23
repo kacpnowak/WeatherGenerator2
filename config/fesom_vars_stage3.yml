@@ -1,0 +1,47 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Stage 3 of the from-scratch retrain on the per-variable FESOM streams: continue stage 2
+# (fvars002, 15-day rollout) with the spin-up window of frcwin01/frcwin03 (10 x 2048 samples in
+# total there): every training rollout first advances the latent state for 0-90 days without
+# gradients, then supervises 15 days, so the model learns from its own drifted state. Nothing
+# frozen; fresh schedule (general.istep=0 on the command line).
+#
+# The surface layer (temp_2, salt_2) gets 5x weight within TEMP and SALT. After stage 2 it was
+# 25-37 % worse than the old lineage at day 15 (frcadd04, which weighted it twice through the
+# duplicate sst/sss channels), while the rest matched or beat it. The dynamic loss gives each
+# channel a weight inversely proportional to its error (at most 20x the smallest), so the
+# high-variance surface channels got the lowest weight; the static weight multiplies on top.
+
+training_config:
+  num_mini_epochs: 10
+  samples_per_mini_epoch: 2048
+  learning_rate_scheduling:
+    lr_start: 1e-6
+    lr_max: 1e-5
+    lr_final_decay: 2e-6
+    lr_final: 0.0
+    num_steps_warmup: 256
+    num_steps_cooldown: 512
+  forecast:
+    num_steps: 15
+    prefix_steps: [0, 90]
+
+freeze_modules: ""
+
+validation_config:
+  samples_per_mini_epoch: 256
+
+streams:
+  TEMP:
+    channel_weights:
+      temp_2: 5.0
+  SALT:
+    channel_weights:
+      salt_2: 5.0
