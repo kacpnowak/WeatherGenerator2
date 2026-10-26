@@ -41,6 +41,7 @@ class DynamicLossEMA:
 
     def __init__(self, cfg: dict | None, streams_cfg: dict, device: str):
         self.enabled = cfg is not None
+        self.device = device
         if self.enabled:
             self.window = cfg.get("window", 100)
             self.L = cfg.get("L", 20.0)
@@ -84,6 +85,30 @@ class DynamicLossEMA:
             ema = self.channel_weights_ema[stream_name]
             updated = (1.0 - 1.0 / self.window) * ema + (1.0 / self.window) * inv_mse
             self.channel_weights_ema[stream_name] = torch.where(has_data, updated, ema)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        """CPU copies of the per-stream channel-weight EMAs ({} when disabled)."""
+        if not self.enabled:
+            return {}
+        return {name: ema.detach().cpu().clone() for name, ema in self.channel_weights_ema.items()}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        """
+        Restore the EMAs saved by state_dict. Streams not in `state` keep their current EMA
+        (ones at the start of a run); streams not configured here are ignored.
+        """
+        if not self.enabled:
+            return
+        for name, ema in state.items():
+            if name not in self.channel_weights_ema:
+                continue
+            if ema.shape != self.channel_weights_ema[name].shape:
+                _logger.warning(
+                    f"Dynamic-loss state of stream {name} has shape {tuple(ema.shape)}, expected "
+                    f"{tuple(self.channel_weights_ema[name].shape)}: not restored."
+                )
+                continue
+            self.channel_weights_ema[name] = ema.to(self.device, copy=True)
 
 
 class LossPhysical(LossModuleBase):

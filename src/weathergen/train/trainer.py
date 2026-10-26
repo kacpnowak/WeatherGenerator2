@@ -35,8 +35,17 @@ from weathergen.model.model_interface import (
 from weathergen.model.utils import apply_fct_to_blocks, set_to_eval
 from weathergen.train.collapse_monitor import CollapseMonitor
 from weathergen.train.loss_calculator import LossCalculator
+from weathergen.train.loss_modules.loss_module_physical import DynamicLossEMA
 from weathergen.train.lr_scheduler import LearningRateScheduler
 from weathergen.train.target_and_aux_utils import get_target_aux_calculator
+from weathergen.train.train_state import (
+    gather_optimizer_state,
+    load_optimizer_state,
+    load_train_state,
+    save_train_state,
+    should_restore_train_state,
+    train_state_path,
+)
 from weathergen.train.trainer_base import TrainerBase
 from weathergen.train.utils import (
     TRAIN,
@@ -696,6 +705,18 @@ class Trainer(TrainerBase):
         val_cfg = self.validation_cfg
         self.loss_calculator_val = LossCalculator(cf, val_cfg, VAL, device=self.device)
 
+        # continue the optimizer and dynamic-loss state when this run is resumed, but not when a
+        # new run starts from another run's weights (general.istep=0); decided on the saved
+        # istep, since a world-size change can realign the counter of a resumed run to 0
+        if run_id_contd is not None:
+            if should_restore_train_state(istep_saved):
+                self._restore_train_state(run_id_contd, mini_epoch_contd, istep_saved)
+            elif is_root():
+                logger.info(
+                    f"Starting from the weights of {run_id_contd} with a new optimizer and "
+                    "dynamic-loss state (istep=0)."
+                )
+
         if is_root():
             config.save(self.cf, None)
             logger.info(config.format_cf(self.cf))
@@ -1018,6 +1039,67 @@ class Trainer(TrainerBase):
         # avoid that there is a systematic bias in the validation subset
         self.dataset_val.advance()
 
+    def _dynamic_loss_emas(self) -> dict[str, DynamicLossEMA]:
+        """The dynamic-loss EMAs of the training loss terms (by loss term name)."""
+        return {
+            loss_term: calculator.dynamic_loss_ema
+            for loss_term, calc_term in self.loss_calculator.loss_calculators.items()
+            for _, calculator in calc_term
+            if getattr(calculator, "dynamic_loss_ema", None) is not None
+        }
+
+    def _restore_train_state(self, run_id_contd: str, mini_epoch_contd: int | None, istep: int):
+        """
+        Restore the optimizer and dynamic-loss state saved with the checkpoint this run resumes
+        from; `istep` is the step counter its config recorded. Collective: rank 0 reads the file
+        and sends the other ranks their optimizer shards and its dynamic-loss state (all ranks
+        continue with rank 0's EMAs). Without a saved state the run continues as before, with
+        a new optimizer state and the EMAs at ones.
+        """
+        mini_epoch = -1 if mini_epoch_contd is None else mini_epoch_contd
+        model_path = config.get_path_model(self.cf, run_id=run_id_contd)
+        file_state = train_state_path(model_path, run_id_contd, mini_epoch)
+
+        state = load_train_state(file_state) if is_root() else None
+        # every rank has to know whether there is a state, restoring the optimizer is collective
+        shared = [None if state is None else (state["dynamic_loss"], state["istep"])]
+        if torch.distributed.is_initialized():
+            torch.distributed.broadcast_object_list(shared, src=0)
+        if shared[0] is None:
+            return
+        dynamic_loss, istep_state = shared[0]
+
+        load_optimizer_state(self.model, self.optimizer, state["optimizer"] if is_root() else {})
+        if is_root():
+            if istep_state != istep:
+                logger.warning(
+                    f"Training state {file_state} was saved at istep={istep_state} but the run "
+                    f"config records istep={istep}: the run was probably stopped while saving, "
+                    "the checkpoint's weights and optimizer state may not match the step counter."
+                )
+            logger.info(
+                f"Resuming {run_id_contd}: restored optimizer state from {file_state} "
+                f"(saved at istep={istep_state})."
+            )
+
+        for loss_term, ema in self._dynamic_loss_emas().items():
+            if not ema.enabled:
+                continue
+            saved = dynamic_loss.get(loss_term)
+            if not saved:
+                if is_root():
+                    logger.warning(
+                        f"No dynamic-loss state for loss term {loss_term} in {file_state}: its "
+                        "channel weights start from ones."
+                    )
+                continue
+            ema.load_state_dict(saved)
+            if is_root():
+                logger.info(
+                    f"Resuming {run_id_contd}: restored dynamic-loss state of loss term "
+                    f"{loss_term} for streams {sorted(saved)}."
+                )
+
     def _get_full_model_state_dict(self):
         maybe_sharded_sd = (
             self.model.state_dict() if self.ema_model is None else self.ema_model.state_dict()
@@ -1034,41 +1116,12 @@ class Trainer(TrainerBase):
         else:
             return maybe_sharded_sd
 
-    def _get_full_optimizer_state_dict(self):
-        is_rank_zero = is_root()
-        sharded_sd = self.optimizer.state_dict()
-        sharded_state = sharded_sd["state"]
-        full_state = {}
-        for group_id, sharded_group in sharded_state.items():
-            group_state = {}
-            for attr, sharded_tensor in sharded_group.items():
-                if isinstance(sharded_tensor, DTensor):
-                    # "exp_avg" in AdamW is `DTensor`
-                    full_tensor = sharded_tensor.full_tensor()
-                else:
-                    # "step" in AdamW is plain tensor
-                    full_tensor = sharded_tensor
-                if is_rank_zero:
-                    group_state[attr] = full_tensor.cpu()
-                else:
-                    del full_tensor
-            if is_rank_zero:
-                full_state[group_id] = group_state
-            else:
-                del group_state
-        if is_rank_zero:
-            return {
-                "param_groups": sharded_sd["param_groups"],
-                "state": full_state,
-            }
-        else:
-            return {}
-
     def save_model(self, mini_epoch: int, name=None):
         # Saving at mini_epoch == max_mini_epoch means that we are saving the latest checkpoint.
         max_mini_epoch = self.training_cfg.num_mini_epochs
         assert mini_epoch <= max_mini_epoch, (mini_epoch, max_mini_epoch)
         model_state_dict = self._get_full_model_state_dict()
+        base_path = config.get_path_model(self.cf)
 
         if is_root():
             filename = "".join(
@@ -1079,7 +1132,6 @@ class Trainer(TrainerBase):
                     ("_" + name) if name is not None else "",
                 ]
             )
-            base_path = config.get_path_model(self.cf)
             file_out = base_path / (filename + ".chkpt")
             file_tmp = base_path / (filename + "_tmp.chkpt")
             # save temp file (slow)
@@ -1088,9 +1140,30 @@ class Trainer(TrainerBase):
             file_tmp.replace(file_out)
             if is_root():
                 logger.info(f"Saved model to {file_out}")
+        del model_state_dict
+
+        # optimizer and dynamic-loss state next to the model, continued when the run is resumed
+        # (only from unnamed checkpoints); gathering is collective and only rank 0 receives the
+        # full state (on its CPU)
+        optimizer_state = None
+        if name is None:
+            optimizer_state = gather_optimizer_state(self.model, self.optimizer)
+        if is_root():
+            if optimizer_state is not None:
+                dynamic_loss = {
+                    loss_term: ema.state_dict()
+                    for loss_term, ema in self._dynamic_loss_emas().items()
+                }
+                file_state = train_state_path(base_path, self.cf.general.run_id, mini_epoch)
+                save_train_state(file_state, optimizer_state, dynamic_loss, self.cf.general.istep)
+                logger.info(
+                    f"Saved optimizer and dynamic-loss state (istep={self.cf.general.istep}) to "
+                    f"{file_state}"
+                )
 
             # save config
             config.save(self.cf, mini_epoch)
+        del optimizer_state
 
     def _log(self, stage: Stage):
         """
