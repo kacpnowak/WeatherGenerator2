@@ -227,6 +227,44 @@ def mse(
     )
 
 
+def mean_error_sq(
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    weights_channels: torch.Tensor | None,
+    weights_points: torch.Tensor | None,
+):
+    """
+    Computes the squared mean error (bias) per channel, which penalises a systematic offset
+    but not the scatter around it.
+    Arguments follow the lp_loss function above; the ensemble mean of pred is taken, NaN targets
+    are masked and the sum is normalised by the number of valid points per channel.
+
+    loss = Mean_{channels} ( weight_channels *
+                             ( Mean_{data_pts}((pred - target) * weights_points) ) ** 2 )
+
+    Params:
+        target : tensor of shape ( num_data_points , num_channels )
+        pred : tensor of shape ( ens_dim , num_data_points , num_channels)
+        weights_channels : tensor of shape = (num_channels,) or None
+        weights_points : tensor of shape = (num_data_points) or None
+
+    Return:
+        loss : (weighted) scalar loss (e.g. for gradient computation)
+        loss_chs : losses per channel
+    """
+
+    mask_nan = ~torch.isnan(target)
+    pred = pred.mean(0)
+
+    diff = torch.where(mask_nan, pred, 0) - torch.where(mask_nan, target, 0)
+    if weights_points is not None:
+        diff = (diff.transpose(1, 0) * weights_points).transpose(1, 0)
+    loss_chs = torch.pow(diff.sum(0) / mask_nan.sum(0).clamp(min=1), 2)
+    loss = torch.mean(loss_chs * weights_channels if weights_channels is not None else loss_chs)
+
+    return loss, loss_chs
+
+
 def rss(
     target: torch.Tensor,
     pred: torch.Tensor,
