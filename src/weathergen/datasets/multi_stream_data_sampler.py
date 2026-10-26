@@ -172,6 +172,68 @@ def draw_prefix_steps(
     return int(rng.integers(low, high + 1))
 
 
+def worker_ranges(rank: int, len_per_rank: int, num_workers: int) -> list[tuple[int, int]]:
+    """
+    Sample range [iter_start, iter_end) of every DataLoader worker of `rank`.
+
+    The rank's share [rank * len_per_rank, (rank + 1) * len_per_rank) is split evenly over the
+    workers, and the last worker also takes the remainder.
+    """
+    local_start, local_end = rank * len_per_rank, (rank + 1) * len_per_rank
+    per_worker = len_per_rank // num_workers
+    ranges = [
+        (local_start + w * per_worker, local_start + (w + 1) * per_worker)
+        for w in range(num_workers)
+    ]
+    ranges[-1] = (ranges[-1][0], local_end)
+    return ranges
+
+
+def _delivery_order(worker_lengths: list[int]) -> list[int]:
+    """
+    DataLoader worker of every batch, in the order the trainer receives them.
+
+    For an IterableDataset the DataLoader returns batches round-robin over the workers that
+    still have batches, starting at worker 0: round k holds the k-th batch of every worker with
+    more than k batches. `worker_lengths` is the number of batches of each worker.
+    """
+    return [
+        w
+        for k in range(max(worker_lengths, default=0))
+        for w, num_batches in enumerate(worker_lengths)
+        if k < num_batches
+    ]
+
+
+def worker_skip_counts(steps_to_skip: int, worker_lengths: list[int]) -> list[int]:
+    """
+    Number of its own batches each DataLoader worker skips so that the first `steps_to_skip`
+    batches the trainer receives are skipped.
+    """
+    skips = [0] * len(worker_lengths)
+    for w in _delivery_order(worker_lengths)[:steps_to_skip]:
+        skips[w] += 1
+    return skips
+
+
+def resumed_worker_assignments(
+    steps_to_skip: int, worker_lengths: list[int]
+) -> list[tuple[int, int] | None]:
+    """
+    For every DataLoader worker of a resumed run: the original worker it takes over and how
+    many of that worker's batches it skips, or None when it has nothing left to produce.
+
+    A fresh DataLoader starts its round-robin at worker 0, but the batch at step
+    `steps_to_skip` of the uninterrupted run can come from any worker. Resumed worker j thus
+    produces the batches of the j-th original worker to deliver after the skipped steps, so the
+    trainer receives the remaining batches in the uninterrupted order.
+    """
+    skips = worker_skip_counts(steps_to_skip, worker_lengths)
+    # original workers in the order they deliver their next batch after the skipped steps
+    takers = list(dict.fromkeys(_delivery_order(worker_lengths)[steps_to_skip:]))
+    return [(w, skips[w]) for w in takers] + [None] * (len(worker_lengths) - len(takers))
+
+
 @dataclasses.dataclass
 class _Stream:
     info: Config
@@ -186,6 +248,8 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self._stage = stage
 
         self.mini_epoch = 0
+        # training steps of the current mini-epoch done by an earlier job (set_resume_position)
+        self.skip_steps = 0
         self.mask_value = 0.0
         self.rank = cf.rank
         self.world_size = cf.world_size
@@ -212,9 +276,8 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # chunk of targets at a time instead. Multi-sample runs (e.g. weather-range with
         # several samples) keep the eager path so dataloader workers stay useful.
         chunk_size = forecast_cfg.get("chunk_size") or int(self.list_num_forecast_steps.max())
-        self._lazy_targets = (
-            mode_cfg.get("samples_per_mini_epoch", 0) == 1
-            and chunk_size < int(self.list_num_forecast_steps.max())
+        self._lazy_targets = mode_cfg.get("samples_per_mini_epoch", 0) == 1 and chunk_size < int(
+            self.list_num_forecast_steps.max()
         )
 
         # free-running forecast: for forecast steps beyond the dataset coverage there is no
@@ -636,6 +699,20 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         Advance mini_epoch (this is applied to the template for the worker processes)
         """
         self.mini_epoch += 1
+        # a resume position applies only to the mini-epoch it was set for
+        self.skip_steps = 0
+
+    def set_resume_position(self, mini_epoch: int, steps_done: int) -> None:
+        """
+        Continue in mini-epoch `mini_epoch` after its first `steps_done` training steps.
+
+        Like advance(), this is applied to the template for the worker processes. The next
+        iteration yields the batches an uninterrupted run yields from step `steps_done` on:
+        the skipped steps keep their place in the sample, forecast-step and spin-up sequences,
+        but their data is not loaded.
+        """
+        self.mini_epoch = mini_epoch
+        self.skip_steps = steps_done
 
     def get_sources_size(self):
         return [
@@ -969,9 +1046,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
             if rdata.is_empty():
                 time_win = self.time_window_handler.window(step_forecast_dt)
-                if self.free_running and all(
-                    isinstance(ds, DataReaderAnemoi) for ds in stream_ds
-                ):
+                if self.free_running and all(isinstance(ds, DataReaderAnemoi) for ds in stream_ds):
                     # forecast beyond the data: predict the full grid using analytic geoinfos
                     # (no ground truth exists past the dataset). Not a spoof -> outputs written.
                     rdata = collect_forecast_queries(stream_ds, time_win.start)
@@ -1425,7 +1500,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         """
         from weathergen.model.forcing import ForcingUnavailableError
 
-        iter_start, iter_end = self.worker_workset()
+        iter_start, iter_end, num_skip = self.worker_workset()
         logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
         # position of this worker's first sample in the rank's share: the same on every rank
         rank_position = iter_start - self.rank * self.len
@@ -1441,6 +1516,13 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         # (grid mismatch, wrong frequency, period not covered) hits every sample
         forcing_skips = 0
         for i, _bidx in enumerate(range(iter_start, iter_end, self.batch_size)):
+            if i < num_skip:
+                # already trained on: consume its sample without loading it, so the following
+                # batches keep the samples, forecast steps and spin-up lengths of an
+                # uninterrupted run (assumes no invalid sample was retried before it)
+                idx_raw += 1
+                continue
+
             # num_forecast_steps needs to be constant per batch
             # (amortized through data parallel training)
             num_forecast_steps = perms_num_forecast_steps[i]
@@ -1484,9 +1566,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     # ensure the batch is valid, i.e. not completely empty and no NaN values
                     # student teacher has no classical targets
                     not_valid = batch.sources_empty() or batch.is_nan()
-                    not_valid = not_valid or (
-                        batch.targets_empty() if "masking" in mode else False
-                    )
+                    not_valid = not_valid or (batch.targets_empty() if "masking" in mode else False)
 
                 # skip completely empty batch item or when all targets are empty -> no grad
                 if not_valid:
@@ -1500,39 +1580,57 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
     def __len__(self):
         return self.len
 
-    def worker_workset(self):
+    def worker_workset(self) -> tuple[int, int, int]:
+        """
+        Sample range [iter_start, iter_end) of this loader worker, and the number of its first
+        batches to skip because an earlier job trained on them (set_resume_position).
+
+        When resumed mid-mini-epoch, the worker takes over the original worker given by
+        resumed_worker_assignments: that worker's range and RNG seed, so the trainer receives
+        the remaining batches of the uninterrupted run in the same order.
+        """
         local_start, local_end = self.rank * self.len, (self.rank + 1) * self.len
 
         worker_info = torch.utils.data.get_worker_info()
-
         if worker_info is None:
             assert self.world_size == 1, self.world_size
-            iter_start = 0
-            iter_end = len(self)
-
+            worker_id, num_workers = 0, 1
         else:
+            worker_id, num_workers = worker_info.id, worker_info.num_workers
+        ranges = worker_ranges(self.rank, self.len, num_workers)
+
+        num_skip = 0
+        if self.skip_steps > 0:
+            lengths = [-(-(end - start) // self.batch_size) for start, end in ranges]
+            assignment = resumed_worker_assignments(self.skip_steps, lengths)[worker_id]
+            logger.info(
+                f"mini_epoch {self.mini_epoch} resumed at step {self.skip_steps}: loader worker "
+                f"{worker_id} takes over (worker, skipped batches) {assignment}"
+            )
+            if assignment is None:
+                # the remaining batches all come from the other workers
+                return local_end, local_end, 0
+            worker_id, num_skip = assignment
+        iter_start, iter_end = ranges[worker_id]
+
+        if worker_info is not None:
             # ensure the rng seed is fully unique across workers and mini_epochs
             # the worker processes are generated as bit-wise copy of the "template" (the actual
             # instance of the present class that is created) whenever __iter__ is started. This
             # happens for each mini_epoch, for train and validation, and independently for each DDP
             # worker. After the bit-wise copy, the rng seed needs to be made unique for
-            # DDP workers, loader process, mini_epoch.
+            # DDP workers, loader process, mini_epoch. When resumed, worker_id is the original
+            # worker taken over, whose seed reproduces its samples.
             dist = torch.distributed
             self.data_loader_rng_seed *= (
                 (((dist.get_rank() + 1) * 73) if dist.is_initialized() else 1)
-                * ((worker_info.id + 1) * 37)
+                * ((worker_id + 1) * 37)
                 * (self.mini_epoch + 13)
                 * 7
             )
-            # split workload
-            per_worker = (local_end - local_start) // worker_info.num_workers
-            iter_start = local_start + worker_info.id * per_worker
-            iter_end = iter_start + per_worker
-            if worker_info.id + 1 == worker_info.num_workers:
-                iter_end = local_end
             logger.info(
                 f"{self.rank}::{worker_info.id}"
                 + f" : dataset [{local_start},{local_end}) : [{iter_start},{iter_end})"
             )
 
-        return iter_start, iter_end
+        return iter_start, iter_end, num_skip
