@@ -14,7 +14,7 @@ from weathergen.readers_extra.fesom_mesh import (
 )
 
 MESH = Path(
-    "/work/ab0995/a270225/atmorep_data/multiverse/core2/original/cycle_1/fesom.mesh.diag.nc"
+    "/e/data1/climateai/hclimrep/data/ifs-fesom/fesom.mesh.diag.nc"
 )
 NZ1 = np.array([2.5, 7.5, 15.0, 25.0, 450.0, 2035.0])
 

@@ -9,8 +9,8 @@ from weathergen.datasets.data_reader_base import TimeWindowHandler
 from weathergen.readers_extra.fesom_mesh import bathymetry, dry_mask, read_mesh_entity
 from weathergen.readers_extra.registry import get_extra_reader
 
-ROOT = Path("/work/ab0995/a270088/Kacper/weathergenertor/AWICM3")
-MESH = "/work/ab0995/a270225/atmorep_data/multiverse/core2/original/cycle_1/fesom.mesh.diag.nc"
+ROOT = Path("/e/data1/climateai/hclimrep/data/ifs-fesom")
+MESH = "/e/data1/climateai/hclimrep/data/ifs-fesom/fesom.mesh.diag.nc"
 pytestmark = pytest.mark.skipif(not (ROOT / "ocean_node").is_dir(), reason="AWI-CM3 data absent")
 CHANNELS = ["temp_2", "temp_450", "salt_95", "salt_450"]
 

@@ -40,9 +40,9 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from paper_eval.meshtools import load_mesh, masks_and_weights  # noqa: E402
 
-ARCHIVE = Path("/work/ab0995/a270088/Kacper/weathergenertor/AWICM3")
+ARCHIVE = Path("/e/data1/climateai/hclimrep/data/ifs-fesom")
 MESH = Path(
-    "/work/ab0995/a270225/atmorep_data/multiverse/core2/original/cycle_1/fesom.mesh.diag.nc"
+    "/e/data1/climateai/hclimrep/data/ifs-fesom/fesom.mesh.diag.nc"
 )
 
 # per stream: the mesh stream name, the regex of the depth-dependent channels, and the channel

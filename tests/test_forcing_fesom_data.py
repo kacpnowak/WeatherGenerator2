@@ -11,7 +11,7 @@ from weathergen.datasets.multi_stream_data_sampler import forcing_time_window_ha
 from weathergen.model.forcing import count_snapshots, forcing_field_from_window
 from weathergen.readers_extra.registry import get_extra_reader
 
-DATA_ROOT = Path("/work/ab0995/a270088/Kacper/weathergenertor/AWICM3")
+DATA_ROOT = Path("/e/data1/climateai/hclimrep/data/ifs-fesom")
 STREAMS = Path(__file__).resolve().parents[1] / "config" / "streams" / "fesom_forced"
 HEALPIX_LEVEL, NUM_CELLS, NUM_POINTS = 5, 12 * 4**5, 76800
 
