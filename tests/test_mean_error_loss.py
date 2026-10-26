@@ -54,8 +54,30 @@ def test_point_weights_and_ensemble_mean():
     # ensemble mean of the members is [1, 3]
     pred = torch.tensor([[[0.0], [2.0]], [[2.0], [4.0]]])
     _, loss_chs = mean_error_sq(target, pred, None, torch.tensor([1.0, 0.5]))
-    # (1 * 1 + 0.5 * 3) / 2 = 1.25
-    assert loss_chs.tolist() == pytest.approx([1.25**2])
+    # weighted mean (1 * 1 + 0.5 * 3) / (1 + 0.5) = 5 / 3
+    assert loss_chs.tolist() == pytest.approx([(5 / 3) ** 2])
+
+
+def test_uniform_offset_is_independent_of_point_weights():
+    target = torch.randn(5, 2)
+    pred = (target + 0.3)[None]
+    weights = torch.tensor([0.1, 2.0, 0.7, 5.0, 0.3])
+    _, loss_chs = mean_error_sq(target, pred, None, weights)
+    assert loss_chs.tolist() == pytest.approx([0.09, 0.09], abs=1e-6)
+
+
+def test_point_weights_normalise_over_valid_points_only():
+    target = torch.tensor([[0.0], [float("nan")], [0.0]])
+    pred = torch.tensor([[1.0], [100.0], [1.0]])[None]
+    _, loss_chs = mean_error_sq(target, pred, None, torch.tensor([1.0, 50.0, 3.0]))
+    assert loss_chs.tolist() == pytest.approx([1.0])
+
+
+def test_all_nan_channel_with_point_weights_is_zero():
+    target = torch.full((2, 1), float("nan"))
+    loss, loss_chs = mean_error_sq(target, torch.ones(1, 2, 1), None, torch.tensor([1.0, 2.0]))
+    assert loss_chs.tolist() == [0.0]
+    assert loss.item() == 0.0
 
 
 def test_selectable_by_name():

@@ -236,11 +236,14 @@ def mean_error_sq(
     """
     Computes the squared mean error (bias) per channel, which penalises a systematic offset
     but not the scatter around it.
-    Arguments follow the lp_loss function above; the ensemble mean of pred is taken, NaN targets
-    are masked and the sum is normalised by the number of valid points per channel.
+    Arguments follow the lp_loss function above; the ensemble mean of pred is taken and NaN
+    targets are masked. The error is the weighted mean over the valid points of each channel, i.e.
+    the sum is normalised by the sum of the valid point weights (the number of valid points if
+    weights_points is None), so a uniform offset gives its square whatever the point weights.
 
     loss = Mean_{channels} ( weight_channels *
-                             ( Mean_{data_pts}((pred - target) * weights_points) ) ** 2 )
+                             ( Sum_{data_pts}((pred - target) * weights_points)
+                               / Sum_{data_pts}(weights_points) ) ** 2 )
 
     Params:
         target : tensor of shape ( num_data_points , num_channels )
@@ -257,9 +260,15 @@ def mean_error_sq(
     pred = pred.mean(0)
 
     diff = torch.where(mask_nan, pred, 0) - torch.where(mask_nan, target, 0)
-    if weights_points is not None:
+    if weights_points is None:
+        norm = mask_nan.sum(0).clamp(min=1)
+    else:
         diff = (diff.transpose(1, 0) * weights_points).transpose(1, 0)
-    loss_chs = torch.pow(diff.sum(0) / mask_nan.sum(0).clamp(min=1), 2)
+        # sum of the weights of the valid points; all-NaN channels have diff == 0 so any
+        # non-zero denominator gives exactly 0
+        norm = (mask_nan * weights_points[:, None]).sum(0)
+        norm = torch.where(norm > 0, norm, 1.0)
+    loss_chs = torch.pow(diff.sum(0) / norm, 2)
     loss = torch.mean(loss_chs * weights_channels if weights_channels is not None else loss_chs)
 
     return loss, loss_chs
