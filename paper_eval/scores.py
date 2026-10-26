@@ -31,10 +31,17 @@ import xarray as xr
 import zarr
 
 from paper_eval import eerie_grid
-from paper_eval.climatology import ClimLookup
-from paper_eval.config import apply_normalization_overrides, clim_dir, normalization_overrides
+from paper_eval.climatology import ChannelClimLookup, ClimLookup
+from paper_eval.config import (
+    apply_normalization_overrides,
+    clim_dir,
+    clim_paths,
+    normalization_overrides,
+    stream_entity,
+    stream_layout,
+)
 from paper_eval.merged_zarr import open_merged_ranks
-from paper_eval.meshtools import load_mesh, masks_and_weights
+from paper_eval.meshtools import PointIndex, load_mesh, masks_and_weights
 from paper_eval.metrics import METRICS, score_block
 
 #: Model index order used throughout `scores`/`map_sums`.
@@ -106,6 +113,8 @@ _clim: dict[str, ClimLookup] = {}
 _src_idx: dict[str, np.ndarray | None] = {}
 _src_mean: dict[str, np.ndarray] = {}
 _src_std: dict[str, np.ndarray] = {}
+#: stream -> its full point set (lookup for targets subsampled with `max_num_targets`)
+_points: dict[str, PointIndex] = {}
 _leads: list[int] = []
 _map_leads: list[int] = []
 #: Region name order, config order (`cfg["regions"]`), global first.
@@ -220,6 +229,17 @@ def _load_norm_stats(cfg: dict, stream: str, src_channels: list[str]) -> tuple[n
     return mean_vec, std_vec
 
 
+def full_point_coords(root, sample, stream) -> np.ndarray:
+    """(npts, 2) [lat, lon] of `stream`'s full point set: the fstep-1 target's coords
+    (as always) unless the target is a subset (`max_num_targets`), then the fstep-0
+    source's, which always covers every point in mesh order."""
+    tar_coords = root[f"{sample}/{stream}/1/target"]["coords"]
+    src_coords = root[f"{sample}/{stream}/0/source"]["coords"]
+    if tar_coords.shape[0] == src_coords.shape[0]:
+        return np.asarray(tar_coords)
+    return np.asarray(src_coords)
+
+
 def _compute_leads(cfg: dict) -> tuple[list[int], list[int]]:
     """(leads, map_leads) from cfg, honouring the CLI-subset override.
 
@@ -253,14 +273,14 @@ def _init_worker_fesom(cfg: dict) -> None:
     Runs once per worker process; idempotent (safe to call again in the same process).
     """
     global _cfg, _root, _mesh, _channels, _mask, _w, _clim
-    global _src_idx, _src_mean, _src_std, _leads, _map_leads, _regions, _region_w
+    global _src_idx, _src_mean, _src_std, _leads, _map_leads, _regions, _region_w, _points
 
     _cfg = cfg
     _root = open_merged_ranks(cfg["results_dir"], cfg["mini_epoch"])
     _mesh = load_mesh(cfg["mesh_path"])
 
     _channels, _mask, _w, _clim = {}, {}, {}, {}
-    _src_idx, _src_mean, _src_std = {}, {}, {}
+    _src_idx, _src_mean, _src_std, _points = {}, {}, {}, {}
     _regions = list(cfg["regions"])
     _region_w = {}
     s0 = _root.store.samples[0]
@@ -268,7 +288,11 @@ def _init_worker_fesom(cfg: dict) -> None:
         channels = list(_root[f"{s0}/{stream}/1/target"].attrs["channels"])
         _channels[stream] = channels
 
-        mask, w = masks_and_weights(_mesh, stream, channels)
+        # Per-variable streams (TEMP, SALT, ...) map to their mesh entity through
+        # `stream_layout`; FESOM_NODE/FESOM_ELEM resolve to node/elem as before. The
+        # mesh mask is the only wet/dry authority: dry predictions (unconstrained for
+        # a model trained on mesh-masked targets) get zero weight in every score.
+        mask, w = masks_and_weights(_mesh, stream_entity(cfg, stream), channels)
         _mask[stream] = mask
         _w[stream] = w
 
@@ -278,16 +302,19 @@ def _init_worker_fesom(cfg: dict) -> None:
         # `reduce_blocks` uses for `maps_{stream}`'s `lat` coord) rather than
         # `_mesh` directly -- this covers FESOM_ELEM (element centroids) the same
         # way as FESOM_NODE (node points) with no per-stream branching here.
-        pts = np.asarray(_root[f"{s0}/{stream}/1/target"]["coords"])
+        pts = full_point_coords(_root, s0, stream)
+        _points[stream] = PointIndex(pts)
         lat = pts[:, 0]
         _region_w[stream] = {
             region: (w * _region_mask(lat, bounds)[np.newaxis, :]).astype(np.float32)
             for region, bounds in cfg["regions"].items()
         }
 
-        y0, y1 = cfg["climatology"]["ref_start"], cfg["climatology"]["ref_end"]
-        clim_path = clim_dir(cfg) / f"clim_{stream}_{y0}-{y1}.zarr"
-        _clim[stream] = ClimLookup(clim_path, channels)
+        if stream_layout(cfg, stream) is not None:
+            # channels picked by name from the stream's climatology sources
+            _clim[stream] = ChannelClimLookup(clim_paths(cfg, stream), channels)
+        else:
+            _clim[stream] = ClimLookup(clim_paths(cfg, stream)[0], channels)
 
         # The source (model input) can carry channels the target/prediction don't --
         # observed for FESOM_ELEM, whose source has one extra column ('v_210') not
@@ -394,21 +421,37 @@ def _process_block_fesom(sample_ids: list[int]) -> BlockResult:
                     )
                 pred = pred[..., 0]
 
+                # A target subsampled with `max_num_targets` is scattered onto the full
+                # point set (NaN where not sampled); only the sampled wet points are
+                # scored. Full-size targets pass through unchanged (`mask_l is mask`).
+                mask_l = mask
+                if tar.shape[0] != _points[stream].npts:
+                    if not np.array_equal(tar_group["coords"][:], pred_group["coords"][:]):
+                        raise ValueError(
+                            f"sample {s} stream {stream} lead {lead}: target and prediction "
+                            "points differ"
+                        )
+                    tar, sampled = _points[stream].densify(tar, tar_group["coords"])
+                    pred, _ = _points[stream].densify(pred, pred_group["coords"])
+                    mask_l = mask & sampled[np.newaxis, :]
+
                 c = _clim[stream].get(init_date + np.timedelta64(lead, "D"))
 
                 # score_block's weighted sums are NaN-fragile (0 * NaN == NaN even
                 # though the point's weight is 0) -- clean copies feed the kernel,
                 # raw ones feed the (unmasked, per brief) spatial accumulators below.
-                tar_clean, pred_clean, c_clean = _clean(tar, mask), _clean(pred, mask), _clean(c, mask)
+                tar_clean, pred_clean, c_clean = (
+                    _clean(tar, mask_l), _clean(pred, mask_l), _clean(c, mask_l)
+                )
 
                 # One score_block call per (model, region): same pred/tar/clim fields
                 # and wet mask, only the weights vary (region_w[region] = w *
                 # region_mask, see init_worker) -- CPU-only, ~3x score_block calls.
                 for k, region in enumerate(_regions):
                     rw = region_w[region]
-                    scores[stream][0, k, :, i, j, :] = score_block(pred_clean, tar_clean, c_clean, mask, rw)
-                    scores[stream][1, k, :, i, j, :] = score_block(src_clean, tar_clean, c_clean, mask, rw)
-                    scores[stream][2, k, :, i, j, :] = score_block(c_clean, tar_clean, c_clean, mask, rw)
+                    scores[stream][0, k, :, i, j, :] = score_block(pred_clean, tar_clean, c_clean, mask_l, rw)
+                    scores[stream][1, k, :, i, j, :] = score_block(src_clean, tar_clean, c_clean, mask_l, rw)
+                    scores[stream][2, k, :, i, j, :] = score_block(c_clean, tar_clean, c_clean, mask_l, rw)
 
                 if lead in _map_leads:
                     sums = map_sums[(stream, lead)]
@@ -555,7 +598,7 @@ def _reduce_blocks_fesom(
         if not map_leads:
             continue
 
-        pts = np.asarray(root[f"{s0}/{stream}/1/target"]["coords"])
+        pts = full_point_coords(root, s0, stream)
         dims = ("lead", "channel", "ipoint")
         by_var = {
             name: []

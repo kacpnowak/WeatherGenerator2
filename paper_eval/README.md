@@ -213,6 +213,47 @@ with the new channel set automatically, written straight into the new cache dir.
 is a symlink (its NODE channel list is identical to `vdsqr1tp`'s), while
 `clim_FESOM_ELEM_2179-2208.zarr` is a fresh build for the 40-channel `v_210` list.
 
+### Per-variable stream layout (fesom_vars: TEMP, SALT, SURFACE, U, V)
+
+Models trained on `config/streams/fesom_vars/` (e.g. `fvars002`/`fvars003`; one-year
+rollouts `yr1fv002`/`yr1fv003`, configs `configs/yr1fv00{2,3}.yaml`) write one stream per
+variable instead of FESOM_NODE/FESOM_ELEM: TEMP/SALT (temp_2..temp_2035, 31 levels),
+SURFACE (ssh, a_ice, m_ice) on nodes, U/V (31 levels) on elements. There are no sst/sss
+channels; temp_2/salt_2 are what they were copies of, so configs name temp_2/salt_2
+wherever old configs name sst/sss (`seasons.channels`, `figures.map_channels`,
+`selfcheck.surface_channel`). The config key `stream_layout` maps each stream to its
+mesh entity and climatology sources:
+
+```
+stream_layout:
+  TEMP: {entity: node, clim: [FESOM_NODE, FESOM_NODE_extra]}
+  U:    {entity: elem, clim: [FESOM_ELEM, FESOM_ELEM_extra]}
+```
+
+`entity` picks the wet masks/area weights (`config.stream_entity`,
+`meshtools.masks_and_weights` takes "node"/"elem"); `clim` lists climatology zarrs
+whose channels are picked by name (`climatology.ChannelClimLookup`, first source holding
+a channel wins). The shared 2180-2209 FESOM_NODE/FESOM_ELEM climatologies are reused
+as they are; they stop at 450 m and lack sea ice, so `FESOM_{NODE,ELEM}_extra` hold just
+the rest (levels 535-2035 m, a_ice, m_ice), built once into the same climatology dir with
+`sbatch paper_eval/sbatch/build_clim_fvars.sbatch paper_eval/configs/yr1fv002.yaml`
+(`build_clim --channels`). `truth` needs an entry per stream (archive statistics for
+the persistence denormalization; TEMP/SALT/U/V override them with the run's wet-point
+`normalization_stats`, SURFACE keeps the archive's) and per `_extra` source. Configs
+without `stream_layout` behave exactly as before (verified bitwise on yr1sal01).
+`selfcheck.stream`/`selfcheck.surface_channel` (default FESOM_NODE/sst) point
+`selfcheck.py` at TEMP/temp_2.
+
+Subsampled targets: the fesom_vars stream configs set `max_num_targets: 32768`, so a run
+inferred with them stores only a random subset of the points per forecast step
+(re-drawn every step) in `target`/`prediction`; `source` still holds every point.
+`meshtools.PointIndex` scatters such a target back onto the full point set (NaN where
+not sampled) and only the sampled wet points are scored -- each daily score is then an
+estimate from ~26% of the nodes (~13% of the elements). Maps carry NaN wherever
+a sample did not sample a point, so with one sample they show only that lead's subset,
+and snapshots likewise. Scores of a subsampled run are not exactly comparable with a
+full-mesh run's: they include point-sampling noise.
+
 ## Data-contract notes
 
 Sharp edges worth knowing before reading cache values directly:

@@ -13,7 +13,8 @@ import numpy as np
 import xarray as xr
 
 from paper_eval import eerie_grid
-from paper_eval.scores import _load_norm_stats
+from paper_eval.meshtools import PointIndex
+from paper_eval.scores import _load_norm_stats, full_point_coords
 
 #: Above this gap between the requested `showcase.init_time` and the nearest
 #: available init, `extract` is silently substituting a very different sample --
@@ -91,7 +92,13 @@ def _extract_stream_fesom(cfg: dict, root, stream: str, sample: int, init_time) 
 
     source = src_phys.T.astype(np.float32)  # (channel, ipoint)
 
-    pred_list, tar_list, lat, lon = [], [], None, None
+    # full point set: a target subsampled with `max_num_targets` (different points every
+    # lead) is scattered onto it, NaN where not sampled
+    pts = full_point_coords(root, sample, stream)
+    points = PointIndex(pts)
+    lat, lon = pts[:, 0], pts[:, 1]
+
+    pred_list, tar_list = [], []
     for lead in leads:
         tar_group = root[f"{sample}/{stream}/{lead}/target"]
         pred_group = root[f"{sample}/{stream}/{lead}/prediction"]
@@ -100,12 +107,11 @@ def _extract_stream_fesom(cfg: dict, root, stream: str, sample: int, init_time) 
         pred = np.asarray(pred_group["data"])
         assert pred.shape[-1] == 1, f"expected ens==1, got {pred.shape[-1]}"
         pred = pred[..., 0]
+        tar, _ = points.densify(tar, tar_group["coords"])
+        pred, _ = points.densify(pred, pred_group["coords"])
 
         tar_list.append(tar.T)
         pred_list.append(pred.T)
-        if lat is None:
-            pts = np.asarray(tar_group["coords"])
-            lat, lon = pts[:, 0], pts[:, 1]
 
     return xr.Dataset(
         {

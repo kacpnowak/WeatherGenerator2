@@ -1,0 +1,92 @@
+# Paper evaluation config — one-year forced forecast from 2209-01-01, run yr1fv002
+# (inference of model fvars002: per-variable streams TEMP, SALT, SURFACE, U, V).
+# Comparable channel by channel with yr1sal01/yr1win03/yr1add04 (same cache tree,
+# same 2180-2209 climatology); temp_2 here == sst there, salt_2 == sss (the new streams
+# carry no sst/sss copies).
+run_id: yr1fv002
+results_dir: /work/ab0995/a270225/WeatherGenerator2/results/yr1fv002
+mini_epoch: 0
+mesh_path: /work/ab0995/a270225/atmorep_data/multiverse/core2/original/cycle_1/fesom.mesh.diag.nc
+streams: [TEMP, SALT, SURFACE, U, V]
+
+# Per-variable streams: mesh entity (wet masks / area weights) and the climatology zarrs
+# their channels are taken from, BY NAME, in order (first source holding a channel
+# wins). FESOM_NODE/FESOM_ELEM are the shared 2180-2209 climatologies of the old runs
+# (levels down to 450 m); FESOM_NODE_extra/FESOM_ELEM_extra hold only what those lack
+# (levels 535-2035 m, a_ice, m_ice) -- built once with
+# `sbatch paper_eval/sbatch/build_clim_fvars.sbatch paper_eval/configs/yr1fv002.yaml`.
+stream_layout:
+  TEMP:    {entity: node, clim: [FESOM_NODE, FESOM_NODE_extra]}
+  SALT:    {entity: node, clim: [FESOM_NODE, FESOM_NODE_extra]}
+  SURFACE: {entity: node, clim: [FESOM_NODE, FESOM_NODE_extra]}
+  U:       {entity: elem, clim: [FESOM_ELEM, FESOM_ELEM_extra]}
+  V:       {entity: elem, clim: [FESOM_ELEM, FESOM_ELEM_extra]}
+
+truth:   # ground-truth archives: per stream (archive normalization statistics for the
+         # persistence denormalization) and per climatology source (build_clim)
+  TEMP:    /work/ab0995/a270088/Kacper/weathergenertor/AWICM3/ocean_node
+  SALT:    /work/ab0995/a270088/Kacper/weathergenertor/AWICM3/ocean_node
+  SURFACE: /work/ab0995/a270088/Kacper/weathergenertor/AWICM3/ocean_node
+  U:       /work/ab0995/a270088/Kacper/weathergenertor/AWICM3/ocean_elem
+  V:       /work/ab0995/a270088/Kacper/weathergenertor/AWICM3/ocean_elem
+  FESOM_NODE_extra: /work/ab0995/a270088/Kacper/weathergenertor/AWICM3/ocean_node
+  FESOM_ELEM_extra: /work/ab0995/a270088/Kacper/weathergenertor/AWICM3/ocean_elem
+
+climatology:
+  ref_start: 2180      # 30-year reference window centred on the evaluation period;
+  ref_end: 2209
+
+init_filter:
+  start: "2209-01-01"
+  end: null
+
+leads:
+  max: 363             # per-sample scores computed for leads 1..max
+  map_leads: [90, 180, 363]  # leads with spatial accumulations + spectra
+
+regions:            # per-sample score aggregation regions; lat bounds [south, north]
+  global: null      # whole mesh
+  nh: [0, 90]       # lat >= 0
+  sh: [-90, 0]      # lat < 0   (boundary nodes at exactly 0 belong to nh)
+
+seasons:
+  DJF: [12, 1, 2]
+  MAM: [3, 4, 5]
+  JJA: [6, 7, 8]
+  SON: [9, 10, 11]
+  exclude_init_months: [12]
+  channels: [temp_2, salt_2, ssh]    # temp_2/salt_2 stand in for the old sst/sss
+
+showcase:
+  init_time: "2209-01-01"
+  leads: [1, 90, 180, 363]
+
+spectra:   # not run for the per-variable layout (compute_spectra.py is FESOM_NODE/ELEM only)
+  n_samples: 8
+  leads: [90, 363]
+  scalar_channels: [ssh, temp_2]
+  velocity_pairs: [[u_2, v_2]]
+  bands:
+    global: null
+  scale_min_km: 150
+  scale_max_km: 5000
+  n_scales: 20
+  filter_order: 1
+  filter_cache: /work/ab0995/a270225/WeatherGenerator2/paper_eval/cache/fesom_filter_core2.npz
+  n_workers: 12
+
+figures:
+  map_channels: [temp_2, ssh, salt_2, temp_107, salt_107, u_2, v_2]
+  curve_depths: [2, 107, 450]
+  depth_rmse_normalised: true
+
+compute:
+  n_workers: 16
+
+selfcheck:   # selfcheck.py's node stream and its all-wet surface channel (sst there)
+  stream: TEMP
+  surface_channel: temp_2
+
+output:
+  cache_dir: /work/ab0995/a270225/WeatherGenerator2/paper_eval/cache_oe3i7whz
+  fig_dir: /work/ab0995/a270225/WeatherGenerator2/paper_eval/figures

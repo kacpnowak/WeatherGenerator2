@@ -34,12 +34,18 @@ import numpy as np
 import xarray as xr
 import zarr
 
-from paper_eval.config import cache_dir, clim_dir, load_config, normalization_overrides
+from paper_eval.config import cache_dir, clim_paths, load_config, normalization_overrides
 from paper_eval.merged_zarr import open_merged_ranks
 
 #: Stream used for checks (a)-(g): the only one whose points are in mesh nod2 order,
 #: so mesh-derived wet/dry masks and area weights (nod_area, nlevels_nod2D) apply.
+#: Default for legacy configs; `cfg["selfcheck"]["stream"]` overrides it (per-variable
+#: layout: TEMP, which also carries temp_450).
 STREAM = "FESOM_NODE"
+#: Surface (mesh-wet everywhere) channel of STREAM the checks use;
+#: `cfg["selfcheck"]["surface_channel"]` overrides it (per-variable layout: temp_2,
+#: which is what sst was a copy of).
+SURFACE_CHANNEL = "sst"
 
 #: Cumulative days before each month (index 1..12) in a FIXED leap calendar (Feb
 #: always has 29 days). Independent reimplementation of the (month, day) -> 1..366
@@ -111,6 +117,26 @@ class Ctx:
     max_lead: int
     level_idx_450: int
     dry_mask_450: np.ndarray  # (nod2,) bool, mesh-derived, sample-independent
+    stream: str = STREAM  # node stream checked (must carry SURFACE_CHANNEL and temp_450)
+    sfc: str = SURFACE_CHANNEL  # its all-wet surface channel
+    #: mesh positions of the (s*, L) target's points, in stored order: arange(nod2) for
+    #: a full target, the matched subset for one written with `max_num_targets`
+    idx: np.ndarray | None = None
+
+
+def _target_positions(root, s: int, stream: str, lead: int) -> np.ndarray:
+    """Mesh positions of the (s, lead) target's points, by exact coordinate match
+    against the fstep-0 source (always the full point set in mesh order) -- an
+    independent re-derivation of `meshtools.PointIndex`'s nearest-point lookup."""
+    src = np.ascontiguousarray(np.asarray(root[f"{s}/{stream}/0/source"]["coords"]))
+    tar = np.ascontiguousarray(np.asarray(root[f"{s}/{stream}/{lead}/target"]["coords"]))
+    if tar.shape[0] == src.shape[0]:
+        return np.arange(src.shape[0])
+    key = {row.tobytes(): i for i, row in enumerate(src)}
+    idx = np.array([key.get(row.tobytes(), -1) for row in tar])
+    if (idx < 0).any():
+        raise ValueError(f"{int((idx < 0).sum())} target point(s) not in the source point set")
+    return idx
 
 
 # ── Small independent re-derivations (deliberately not the metrics.py/meshtools.py
@@ -195,39 +221,42 @@ def _norm_stats(cfg: dict, stream: str, channel: str) -> tuple[float, float]:
 def check_a(ctx: Ctx) -> str:
     """Score recompute: emulator rmse/bias/acc and persistence rmse for
     (s*, sst, lead L), vs the cached scores."""
-    s, lead, stream = ctx.s_star, ctx.lead, STREAM
+    s, lead, stream = ctx.s_star, ctx.lead, ctx.stream
     tar_g = ctx.root[f"{s}/{stream}/{lead}/target"]
     pred_g = ctx.root[f"{s}/{stream}/{lead}/prediction"]
     channels = list(tar_g.attrs["channels"])
-    ci = channels.index("sst")
+    ci = channels.index(ctx.sfc)
     tar = np.asarray(tar_g["data"])[:, ci].astype(np.float64)
     pred = np.asarray(pred_g["data"])[:, ci, 0].astype(np.float64)
-    w = ctx.mesh["nod_area0"]
+    idx = ctx.idx  # mesh positions of the stored (possibly subsampled) points
+    w = ctx.mesh["nod_area0"][idx]
 
     rmse, bias = _weighted_rmse_bias(pred - tar, w)
 
     init_time = ctx.root.store.init_times[s]
     valid_date = init_time + np.timedelta64(int(lead), "D")
     doy = _doy(valid_date)
-    y0, y1 = ctx.cfg["climatology"]["ref_start"], ctx.cfg["climatology"]["ref_end"]
-    clim_path = clim_dir(ctx.cfg) / f"clim_{stream}_{y0}-{y1}.zarr"
-    if not clim_path.exists():
-        raise SkipCheckError(f"{clim_path} not found")
-    clim_g = zarr.open_group(str(clim_path), mode="r")
-    clim_channels = list(clim_g.attrs["channels"])
-    cci = clim_channels.index("sst")
-    clim_field = np.asarray(clim_g["clim"][doy - 1])[:, cci].astype(np.float64)
+    # first climatology source holding the channel (legacy configs: the one zarr)
+    for clim_path in clim_paths(ctx.cfg, stream):
+        if not clim_path.exists():
+            raise SkipCheckError(f"{clim_path} not found")
+        clim_g = zarr.open_group(str(clim_path), mode="r")
+        clim_channels = list(clim_g.attrs["channels"])
+        if ctx.sfc in clim_channels:
+            break
+    cci = clim_channels.index(ctx.sfc)
+    clim_field = np.asarray(clim_g["clim"][doy - 1])[idx, cci].astype(np.float64)
     acc = _weighted_acc(pred - clim_field, tar - clim_field, w)
 
     src_g = ctx.root[f"{s}/{stream}/0/source"]
     src_channels = list(src_g.attrs["channels"])
-    si = src_channels.index("sst")
-    src_raw = np.asarray(src_g["data"])[:, si].astype(np.float64)
-    mean, std = _norm_stats(ctx.cfg, stream, "sst")
+    si = src_channels.index(ctx.sfc)
+    src_raw = np.asarray(src_g["data"])[idx, si].astype(np.float64)
+    mean, std = _norm_stats(ctx.cfg, stream, ctx.sfc)
     src_phys = src_raw * std + mean
     rmse_p, _ = _weighted_rmse_bias(src_phys - tar, w)
 
-    cached = ctx.scores_ds["score"].sel(sample=s, lead=lead, channel="sst")
+    cached = ctx.scores_ds["score"].sel(sample=s, lead=lead, channel=ctx.sfc)
     wanted = {
         "emulator rmse": (rmse, float(cached.sel(model="emulator", metric="rmse"))),
         "emulator bias": (bias, float(cached.sel(model="emulator", metric="bias"))),
@@ -241,8 +270,8 @@ def check_a(ctx: Ctx) -> str:
         name for name, (got, want) in wanted.items()
         if not np.isclose(got, want, rtol=_RTOL, atol=_ATOL)
     ]
-    assert not bad, f"s={s} sst lead={lead}: mismatch on {bad} -- {detail}"
-    return f"s={s} sst lead={lead}: {detail}"
+    assert not bad, f"s={s} {ctx.sfc} lead={lead}: mismatch on {bad} -- {detail}"
+    return f"s={s} {ctx.sfc} lead={lead}: {detail}"
 
 
 def check_b(ctx: Ctx) -> str:
@@ -254,13 +283,14 @@ def check_b(ctx: Ctx) -> str:
     -- see that constant's comment) and only FAILs beyond it; a NaN at a WET point
     is always a hard FAIL (the dangerous direction, never tolerated)."""
     s, lead = ctx.s_star, ctx.lead
-    tar_g = ctx.root[f"{s}/{STREAM}/{lead}/target"]
+    tar_g = ctx.root[f"{s}/{ctx.stream}/{lead}/target"]
     channels = list(tar_g.attrs["channels"])
     ci = channels.index("temp_450")
     tar = np.asarray(tar_g["data"])[:, ci]
 
-    dry, wet = ctx.dry_mask_450, ~ctx.dry_mask_450
-    dry_idx = np.nonzero(dry)[0]
+    dry = ctx.dry_mask_450[ctx.idx]  # at the stored (possibly subsampled) points
+    wet = ~dry
+    dry_idx = ctx.idx[np.nonzero(dry)[0]]
     dry_vals, wet_vals = tar[dry], tar[wet]
     n_zero = int(np.sum(dry_vals == 0.0))
     n_nan = int(np.sum(np.isnan(dry_vals)))
@@ -305,9 +335,9 @@ def check_c(ctx: Ctx) -> str:
     """Persistence ordering: sample-aggregated (sqrt(mean(rmse^2))) sst rmse at
     lead 1 < lead L, and lead-1 value < 1.0 degC."""
     ds = ctx.scores_ds
-    r1 = _agg_rmse(ds, "persistence", "sst", 1)
-    rl = _agg_rmse(ds, "persistence", "sst", ctx.lead)
-    msg = f"persistence sst rmse: lead1={r1:.4f} lead{ctx.lead}={rl:.4f} degC"
+    r1 = _agg_rmse(ds, "persistence", ctx.sfc, 1)
+    rl = _agg_rmse(ds, "persistence", ctx.sfc, ctx.lead)
+    msg = f"persistence {ctx.sfc} rmse: lead1={r1:.4f} lead{ctx.lead}={rl:.4f} degC"
     assert r1 < rl, f"{msg} -- expected lead1 < lead{ctx.lead}"
     assert r1 < 1.0, f"{msg} -- expected lead1 < 1.0 degC"
     return msg
@@ -319,9 +349,9 @@ def check_d(ctx: Ctx) -> str:
     ds = ctx.scores_ds
     avail = [int(x) for x in ds["lead"].values]
     leads = list(dict.fromkeys(lead for lead in (1, ctx.lead, ctx.max_lead) if lead in avail))
-    accs = [_mean_acc(ds, "emulator", "sst", lead) for lead in leads]
+    accs = [_mean_acc(ds, "emulator", ctx.sfc, lead) for lead in leads]
     pairs = zip(leads, accs, strict=True)
-    msg = "emulator sst acc: " + ", ".join(f"lead{lead}={a:.4f}" for lead, a in pairs)
+    msg = f"emulator {ctx.sfc} acc: " + ", ".join(f"lead{lead}={a:.4f}" for lead, a in pairs)
     decreasing = all(accs[i] > accs[i + 1] for i in range(len(accs) - 1))
     assert decreasing, f"{msg} -- not strictly decreasing"
     return msg
@@ -335,7 +365,7 @@ def check_e(ctx: Ctx) -> str:
     fsteps = list(dict.fromkeys([1, ctx.lead]))
     parts = []
     for fstep in fsteps:
-        times = ctx.root[f"{s}/{STREAM}/{fstep}/target"]["times"]
+        times = ctx.root[f"{s}/{ctx.stream}/{fstep}/target"]["times"]
         t0 = np.datetime64(times[0], "D")
         delta = int((t0 - init_d).astype("int64"))
         parts.append(f"fstep{fstep}: delta={delta}d")
@@ -362,28 +392,32 @@ def check_g(ctx: Ctx) -> str:
     """Maps wet/dry: sst rmse finite everywhere (min > 0); temp_450 rmse finite at
     every mesh-wet node (NaN, if any, confined to mesh-dry nodes). SKIP if the maps
     cache is absent or lead L isn't among its leads."""
-    maps_path = ctx.cache / f"maps_{STREAM}.nc"
+    maps_path = ctx.cache / f"maps_{ctx.stream}.nc"
     if not maps_path.exists():
         raise SkipCheckError(f"{maps_path} not found")
     with xr.open_dataset(maps_path) as ds:
         avail = [int(x) for x in ds["lead"].values]
         if ctx.lead not in avail:
             raise SkipCheckError(f"lead {ctx.lead} not in {maps_path} leads {avail}")
-        sst_rmse = ds["rmse"].sel(lead=ctx.lead, channel="sst").values
+        sst_rmse = ds["rmse"].sel(lead=ctx.lead, channel=ctx.sfc).values
         t450_rmse = ds["rmse"].sel(lead=ctx.lead, channel="temp_450").values
 
-    dry, wet = ctx.dry_mask_450, ~ctx.dry_mask_450
+    # only the points the target holds at (s*, L) (all of them unless subsampled)
+    sampled = np.zeros(ctx.dry_mask_450.size, dtype=bool)
+    sampled[ctx.idx] = True
+    dry, wet = ctx.dry_mask_450 & sampled, ~ctx.dry_mask_450 & sampled
+    sst_rmse = sst_rmse[sampled]
     sst_finite = bool(np.all(np.isfinite(sst_rmse)))
     sst_min = float(np.min(sst_rmse))
     t450_wet_nan = int(np.sum(np.isnan(t450_rmse[wet])))
     t450_dry_nan = int(np.sum(np.isnan(t450_rmse[dry])))
 
     msg = (
-        f"lead={ctx.lead}: sst rmse finite={sst_finite} min={sst_min:.3g}; "
+        f"lead={ctx.lead}: {ctx.sfc} rmse finite={sst_finite} min={sst_min:.3g}; "
         f"temp_450 nan at wet={t450_wet_nan}, at dry={t450_dry_nan}/{int(dry.sum())}"
     )
-    assert sst_finite, f"{msg} -- sst rmse has non-finite value(s)"
-    assert sst_min > 0, f"{msg} -- sst rmse global min not > 0"
+    assert sst_finite, f"{msg} -- {ctx.sfc} rmse has non-finite value(s)"
+    assert sst_min > 0, f"{msg} -- {ctx.sfc} rmse global min not > 0"
     assert t450_wet_nan == 0, f"{msg} -- temp_450 rmse NaN at a wet node"
     return msg
 
@@ -413,17 +447,17 @@ def check_h(ctx: Ctx) -> str:
     if not ran_any:
         raise SkipCheckError("no scores_*.nc found for any configured stream")
 
-    maps_path = ctx.cache / f"maps_{STREAM}.nc"
+    maps_path = ctx.cache / f"maps_{ctx.stream}.nc"
     if maps_path.exists():
         with xr.open_dataset(maps_path) as ds:
             n_samples = int(ds.attrs["n_samples"])
         assert n_samples == len(meta_ids), (
-            f"maps_{STREAM}.nc n_samples attr ({n_samples}) != "
+            f"maps_{ctx.stream}.nc n_samples attr ({n_samples}) != "
             f"scores sample count ({len(meta_ids)})"
         )
         parts.append(f"maps n_samples == {n_samples}")
     else:
-        parts.append(f"maps_{STREAM}.nc absent (n_samples cross-check skipped)")
+        parts.append(f"maps_{ctx.stream}.nc absent (n_samples cross-check skipped)")
     return "; ".join(parts)
 
 
@@ -436,7 +470,7 @@ def check_i(ctx: Ctx) -> str:
     the same lead within 5% -- the same statistic (mean over samples and points),
     computed in the opposite order. SKIP if the maps cache lacks the Task 14
     variables (older caches predate them)."""
-    maps_path = ctx.cache / f"maps_{STREAM}.nc"
+    maps_path = ctx.cache / f"maps_{ctx.stream}.nc"
     if not maps_path.exists():
         raise SkipCheckError(f"{maps_path} not found")
     with xr.open_dataset(maps_path) as ds:
@@ -446,10 +480,10 @@ def check_i(ctx: Ctx) -> str:
         avail = [int(x) for x in ds["lead"].values]
         if ctx.lead not in avail:
             raise SkipCheckError(f"lead {ctx.lead} not in {maps_path} leads {avail}")
-        acc = ds["acc"].sel(lead=ctx.lead, channel="sst").values.astype(np.float64)
-        rmse_p = ds["rmse_persistence"].sel(lead=ctx.lead, channel="sst").values.astype(
+        acc = ds["acc"].sel(lead=ctx.lead, channel=ctx.sfc).values.astype(np.float64)[ctx.idx]
+        rmse_p = ds["rmse_persistence"].sel(lead=ctx.lead, channel=ctx.sfc).values.astype(
             np.float64
-        )
+        )[ctx.idx]
 
     n_pts = acc.size
     acc_nan = np.isnan(acc)
@@ -462,17 +496,17 @@ def check_i(ctx: Ctx) -> str:
     rmse_p_bad = ~np.isfinite(rmse_p) | (rmse_p < 0)
     n_rmse_p_bad = int(rmse_p_bad.sum())
 
-    w = ctx.mesh["nod_area0"]
+    w = ctx.mesh["nod_area0"][ctx.idx]
     map_mean_rmse2 = float(np.average(rmse_p**2, weights=w))
 
     persistence_rmse = ctx.scores_ds["score"].sel(
-        model="persistence", metric="rmse", channel="sst", lead=ctx.lead
+        model="persistence", metric="rmse", channel=ctx.sfc, lead=ctx.lead
     ).values.astype(np.float64)
     sample_mean_rmse2 = float(np.mean(persistence_rmse**2))
     rel_diff = abs(map_mean_rmse2 - sample_mean_rmse2) / sample_mean_rmse2
 
     msg = (
-        f"lead={ctx.lead} sst: acc oob={n_acc_oob}/{n_pts}, non-NaN={frac_nonnan:.4%}; "
+        f"lead={ctx.lead} {ctx.sfc}: acc oob={n_acc_oob}/{n_pts}, non-NaN={frac_nonnan:.4%}; "
         f"rmse_persistence bad(neg/non-finite)={n_rmse_p_bad}/{n_pts}; area-weighted "
         f"mean(rmse_persistence^2)={map_mean_rmse2:.6g} vs sample-aggregated "
         f"persistence rmse^2={sample_mean_rmse2:.6g} (rel diff={rel_diff:.4%})"
@@ -505,8 +539,8 @@ def check_j(ctx: Ctx) -> str:
         raise SkipCheckError("cached scores have no region dim (pre-Task-20 cache)")
 
     s, lead = ctx.s_star, ctx.lead
-    lat = ctx.mesh["lat"]
-    w = ctx.mesh["nod_area0"]
+    lat = ctx.mesh["lat"][ctx.idx]
+    w = ctx.mesh["nod_area0"][ctx.idx]
 
     def region_weight(bounds) -> float:
         if bounds is None:
@@ -521,7 +555,7 @@ def check_j(ctx: Ctx) -> str:
     def rmse(region: str) -> float:
         return float(
             ctx.scores_ds_raw["score"].sel(
-                sample=s, lead=lead, channel="sst", metric="rmse", model="emulator",
+                sample=s, lead=lead, channel=ctx.sfc, metric="rmse", model="emulator",
                 region=region,
             )
         )
@@ -532,7 +566,7 @@ def check_j(ctx: Ctx) -> str:
     rel_err = abs(lhs - rhs) / abs(lhs) if lhs else abs(lhs - rhs)
 
     msg = (
-        f"s={s} sst lead={lead}: rmse(global={rmse_glob:.6g}, nh={rmse_nh:.6g}, "
+        f"s={s} {ctx.sfc} lead={lead}: rmse(global={rmse_glob:.6g}, nh={rmse_nh:.6g}, "
         f"sh={rmse_sh:.6g}); W(global={W['global']:.6g}, nh={W['nh']:.6g}, "
         f"sh={W['sh']:.6g}); glob^2*W_glob={lhs:.6g} vs nh^2*W_nh+sh^2*W_sh={rhs:.6g} "
         f"(rel_err={rel_err:.3g})"
@@ -561,7 +595,10 @@ def main(argv: list[str] | None = None) -> None:
     try:
         cfg = load_config(args.config)
         cache = Path(args.cache_dir) if args.cache_dir else cache_dir(cfg)
-        scores_path = cache / f"scores_{STREAM}.nc"
+        check_cfg = cfg.get("selfcheck") or {}
+        stream = check_cfg.get("stream", STREAM)
+        sfc = check_cfg.get("surface_channel", SURFACE_CHANNEL)
+        scores_path = cache / f"scores_{stream}.nc"
         if not scores_path.exists():
             raise FileNotFoundError(f"{scores_path} not found -- nothing to verify")
         scores_ds_raw = xr.open_dataset(scores_path)
@@ -594,6 +631,7 @@ def main(argv: list[str] | None = None) -> None:
         scores_ds_raw=scores_ds_raw,
         s_star=s_star, lead=lead, max_lead=max_lead,
         level_idx_450=level_idx_450, dry_mask_450=dry_mask_450,
+        stream=stream, sfc=sfc, idx=_target_positions(root, s_star, stream, lead),
     )
 
     results = []

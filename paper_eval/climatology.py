@@ -190,3 +190,56 @@ class ClimLookup:
         """
         doy = int(doy_index(np.datetime64(date)))
         return self._load_doy(doy)
+
+
+class ChannelClimLookup:
+    """Day-of-year climatology assembled by channel NAME from one or more climatology
+    zarrs -- the per-variable streams' counterpart of `ClimLookup` (same `get`).
+
+    Each requested channel is read from the first of `paths` whose stored channel list
+    holds it, so a stream can reuse a shared climatology (e.g. FESOM_NODE's, for
+    temp_2..temp_450) and take the rest from a supplementary one (FESOM_NODE_extra, for
+    temp_535.. and sea ice). Every source must have the same point count; a channel
+    found in none of them raises ValueError.
+    """
+
+    def __init__(self, paths: list[str | Path], channels: list[str], cache_size: int = 64):
+        channels = list(channels)
+        remaining = list(range(len(channels)))
+        self._sources: list[tuple[zarr.Array, np.ndarray, np.ndarray]] = []
+        npts = None
+        for path in paths:
+            if not remaining:
+                break
+            root = zarr.open_group(str(path), mode="r")
+            stored = list(root.attrs["channels"])
+            take = [i for i in remaining if channels[i] in stored]
+            if not take:
+                continue
+            clim = root["clim"]
+            if npts is None:
+                npts = clim.shape[1]
+            elif clim.shape[1] != npts:
+                raise ValueError(f"{path}: {clim.shape[1]} points != {npts} of the other sources")
+            src_idx = np.array([stored.index(channels[i]) for i in take])
+            self._sources.append((clim, src_idx, np.array(take)))
+            remaining = [i for i in remaining if i not in take]
+        if remaining:
+            raise ValueError(
+                f"climatology: channel(s) {[channels[i] for i in remaining]} in none of {list(map(str, paths))}"
+            )
+        self._npts = npts
+        self._nchan = len(channels)
+        self._load_doy = lru_cache(maxsize=cache_size)(self._load_doy)
+
+    def _load_doy(self, doy: int) -> np.ndarray:
+        arr = np.empty((self._npts, self._nchan), dtype=np.float32)
+        for clim, src_idx, dst_idx in self._sources:
+            arr[:, dst_idx] = np.asarray(clim[doy - 1])[:, src_idx]
+        arr.setflags(write=False)  # cached and shared, as in ClimLookup.get
+        return arr
+
+    def get(self, date: np.datetime64) -> np.ndarray:
+        """(npts, nchan) float32, read-only, shared (see `ClimLookup.get`)."""
+        doy = int(doy_index(np.datetime64(date)))
+        return self._load_doy(doy)

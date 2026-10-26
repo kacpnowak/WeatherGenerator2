@@ -82,6 +82,46 @@ def fig_dir(cfg: dict) -> Path:
     return path
 
 
+#: Mesh entity of the legacy streams (one stream per entity, every variable in it).
+_LEGACY_STREAM_ENTITY = {"FESOM_NODE": "node", "FESOM_ELEM": "elem"}
+
+
+def stream_layout(cfg: dict, stream: str) -> dict | None:
+    """`cfg["stream_layout"][stream]`, or None for a stream without an entry.
+
+    Per-variable streams (TEMP, SALT, SURFACE, U, V -- one stream per variable instead
+    of one per mesh entity) need an entry `{entity: node|elem, clim: [source, ...]}`:
+    `entity` picks the mesh points (wet masks, area weights) and `clim` the climatology
+    zarrs (`clim_<source>_<ref_start>-<ref_end>.zarr`) their channels are read from by
+    name. Legacy configs (FESOM_NODE/FESOM_ELEM) have no `stream_layout` and are
+    handled exactly as before: entity from the stream name, one climatology zarr per
+    stream whose channel list must match exactly.
+    """
+    return (cfg.get("stream_layout") or {}).get(stream)
+
+
+def stream_entity(cfg: dict, stream: str) -> str:
+    """Mesh entity ("node" or "elem") of `stream`: `stream_layout.<stream>.entity`, or
+    the legacy FESOM_NODE/FESOM_ELEM mapping. ValueError for anything else."""
+    layout = stream_layout(cfg, stream)
+    entity = layout.get("entity") if layout is not None else _LEGACY_STREAM_ENTITY.get(stream)
+    if entity not in ("node", "elem"):
+        raise ValueError(
+            f"stream {stream!r}: unknown mesh entity {entity!r} -- per-variable streams "
+            "need `stream_layout.<stream>.entity: node|elem` in the paper_eval config"
+        )
+    return entity
+
+
+def clim_paths(cfg: dict, stream: str) -> list[Path]:
+    """Climatology zarr(s) for `stream`: one per `stream_layout.<stream>.clim` source, or
+    the single legacy `clim_<stream>_<ref>.zarr`."""
+    y0, y1 = cfg["climatology"]["ref_start"], cfg["climatology"]["ref_end"]
+    layout = stream_layout(cfg, stream)
+    sources = list(layout["clim"]) if layout is not None else [stream]
+    return [clim_dir(cfg) / f"clim_{src}_{y0}-{y1}.zarr" for src in sources]
+
+
 def model_config_path(cfg: dict) -> Path:
     """Path of the evaluated run's model config JSON, as the framework writes it:
     `models/<run_id>/model_<run_id>_chkpt<mini_epoch:05d>.json` (`_latest` for
