@@ -84,6 +84,20 @@ def resume_position(
     return mini_epoch_base, 0 if world_size_changed else steps_done
 
 
+def resume_istep(
+    istep: int, steps_per_mini_epoch: int, num_mini_epochs: int, world_size_changed: bool = False
+) -> int:
+    """
+    The optimizer step counter a continued run carries on from: `istep`, unless the world size
+    changed. Then the interrupted mini-epoch restarts from its first step (resume_position) and
+    the counter restarts with it, so the run still ends at num_mini_epochs * steps_per_mini_epoch.
+    """
+    if not world_size_changed:
+        return istep
+    mini_epoch_base, _ = resume_position(istep, steps_per_mini_epoch, num_mini_epochs, True)
+    return mini_epoch_base * steps_per_mini_epoch
+
+
 class Trainer(TrainerBase):
     def __init__(self, train_logging: Config):
         TrainerBase.__init__(self)
@@ -635,6 +649,32 @@ class Trainer(TrainerBase):
             self.grad_scaler = torch.amp.GradScaler("cuda")
         assert len(self.dataset) > 0, f"No data found in {self.dataset}"
 
+        # recover mini_epoch and the steps already done in it when continuing a run; the sampler
+        # starts at mini_epoch 0, step 0 in a new process (ecmwf/WeatherGenerator#2953). Done
+        # before the lr scheduler is built, which continues from the (realigned) step counter.
+        steps_per_mini_epoch = len(self.dataset) // self.batch_size_per_gpu
+        world_size_changed = cf.world_size != self.world_size_original
+        istep_saved = self.cf.general.istep
+        mini_epoch_base, steps_done = resume_position(
+            istep_saved, steps_per_mini_epoch, self.training_cfg.num_mini_epochs, world_size_changed
+        )
+        self.cf.general.istep = resume_istep(
+            istep_saved, steps_per_mini_epoch, self.training_cfg.num_mini_epochs, world_size_changed
+        )
+        self.dataset.set_resume_position(mini_epoch_base, steps_done)
+        if is_root():
+            if world_size_changed and istep_saved > 0:
+                logger.warning(
+                    f"World size changed from {self.world_size_original} to {cf.world_size}: "
+                    f"the data order cannot be continued, mini_epoch {mini_epoch_base} restarts "
+                    f"from its first step and istep from {istep_saved} to "
+                    f"{self.cf.general.istep}."
+                )
+            logger.info(
+                f"Training starts at mini_epoch {mini_epoch_base}, step {steps_done} of "
+                f"{steps_per_mini_epoch} (istep={self.cf.general.istep})."
+            )
+
         # lr is updated after each batch so account for this
         # TODO: conf should be read-only, do not modify the conf in flight
         len_ds = len(self.dataset)
@@ -655,29 +695,6 @@ class Trainer(TrainerBase):
         self.loss_calculator = LossCalculator(cf, self.training_cfg, TRAIN, device=self.device)
         val_cfg = self.validation_cfg
         self.loss_calculator_val = LossCalculator(cf, val_cfg, VAL, device=self.device)
-
-        # recover mini_epoch and the steps already done in it when continuing a run; the sampler
-        # starts at mini_epoch 0, step 0 in a new process (ecmwf/WeatherGenerator#2953)
-        steps_per_mini_epoch = len(self.dataset) // self.batch_size_per_gpu
-        world_size_changed = cf.world_size != self.world_size_original
-        mini_epoch_base, steps_done = resume_position(
-            self.cf.general.istep,
-            steps_per_mini_epoch,
-            self.training_cfg.num_mini_epochs,
-            world_size_changed,
-        )
-        self.dataset.set_resume_position(mini_epoch_base, steps_done)
-        if is_root():
-            if world_size_changed and self.cf.general.istep > 0:
-                logger.warning(
-                    f"World size changed from {self.world_size_original} to {cf.world_size}: "
-                    f"the data order cannot be continued, mini_epoch {mini_epoch_base} restarts "
-                    "from its first step."
-                )
-            logger.info(
-                f"Training starts at mini_epoch {mini_epoch_base}, step {steps_done} of "
-                f"{steps_per_mini_epoch} (istep={self.cf.general.istep})."
-            )
 
         if is_root():
             config.save(self.cf, None)

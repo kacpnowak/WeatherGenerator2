@@ -2,7 +2,7 @@
 
 import inspect
 
-from weathergen.train.trainer import Trainer, resume_position
+from weathergen.train.trainer import Trainer, resume_istep, resume_position
 
 
 def test_fresh_run():
@@ -27,6 +27,31 @@ def test_beyond_complete():
 
 def test_world_size_changed_restarts_the_epoch():
     assert resume_position(960, 256, 10, world_size_changed=True) == (3, 0)
+
+
+def test_world_size_changed_restarts_the_step_counter():
+    # the restarted mini-epoch is counted from its first step, so the run still ends at 2560
+    assert resume_istep(960, 256, 10, world_size_changed=True) == 768
+
+
+def test_step_counter_kept_without_world_size_change():
+    assert resume_istep(960, 256, 10) == 960
+    # a completed run is not clamped
+    assert resume_istep(2688, 256, 10) == 2688
+
+
+def test_world_size_changed_after_completion():
+    for istep in (2560, 2688):
+        assert resume_position(istep, 256, 10, world_size_changed=True) == (10, 0)
+        assert resume_istep(istep, 256, 10, world_size_changed=True) == 2560
+
+
+def test_run_resumes_before_building_the_lr_scheduler():
+    # the scheduler continues from the realigned step counter
+    source = inspect.getsource(Trainer.run)
+    assert source.index("self.cf.general.istep = resume_istep(") < source.index(
+        "LearningRateScheduler("
+    )
 
 
 def test_run_sets_sampler_position_before_training():
