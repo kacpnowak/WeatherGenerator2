@@ -51,6 +51,27 @@ FORECAST_DEFAULTS = {
 }
 
 
+def resolve_data_file(
+    fname: str | pathlib.Path, data_paths: Sequence[str | pathlib.Path], what: str
+) -> pathlib.Path:
+    """
+    Return the path of a stream's data file (zarr stores may be directories).
+
+    `fname` itself if it exists (a full path overrides the data paths), else the first
+    `data_paths` entry under which it exists. The same dataset can live in several data
+    paths, so a candidate that is missing must not be picked just because it comes first.
+    `what` names the stream in the error raised when no candidate exists.
+    """
+    fname = pathlib.Path(fname)
+    if fname.exists():
+        return fname
+    candidates = [pathlib.Path(path) / fname for path in data_paths]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Did not find input data for {what}: {candidates}.")
+
+
 def collect_datasources(stream_datasets: list, idx: int, type: str, rng) -> IOReaderData:
     """
     Utility function to collect all sources / targets from streams list
@@ -429,24 +450,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             dataset = self._get_dataset_class(stream_info, stream_name)
 
             for fname in stream_info["filenames"]:
-                fname = pathlib.Path(fname)
-                # dont check if file exists since zarr stores might be directories
-                if fname.exists():
-                    # check if fname is a valid path to allow for simple overwriting
-                    filename = fname
-                else:
-                    filenames = [pathlib.Path(path) / fname for path in cf.data_paths]
-
-                    if not any(filename.exists() for filename in filenames):  # see above
-                        msg = (
-                            f"Did not find input data for {stream_info['type']} "
-                            f"stream '{stream_name}': {filenames}."
-                        )
-                        raise FileNotFoundError(msg)
-
-                    # The same dataset can exist on different locations in the filesystem,
-                    # so we need to choose here.
-                    filename = filenames[0]
+                filename = resolve_data_file(
+                    fname, cf.data_paths, f"{stream_info['type']} stream '{stream_name}'"
+                )
 
                 ds_type = stream_info["type"]
                 if is_root():
@@ -535,17 +541,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             )
             forcing_tw_handler = forcing_time_window_handler(self.time_window_handler, stream_info)
             for fname in stream_info["filenames"]:
-                fname = pathlib.Path(fname)
-                if fname.exists():
-                    filename = fname
-                else:
-                    filenames = [pathlib.Path(path) / fname for path in cf.data_paths]
-                    if not any(f.exists() for f in filenames):
-                        raise FileNotFoundError(
-                            f"Did not find input data for forcing stream '{stream_name}': "
-                            f"{filenames}."
-                        )
-                    filename = filenames[0]
+                filename = resolve_data_file(
+                    fname, cf.data_paths, f"forcing stream '{stream_name}'"
+                )
 
                 ds = dataset(
                     tw_handler=forcing_tw_handler,
