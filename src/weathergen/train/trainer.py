@@ -67,6 +67,23 @@ def prefix_length(batch) -> int:
     return 0 if first is None else first - batch.get_output_idxs()[0]
 
 
+def resume_position(
+    istep: int, steps_per_mini_epoch: int, num_mini_epochs: int, world_size_changed: bool = False
+) -> tuple[int, int]:
+    """
+    Where a run continued after `istep` optimizer steps resumes: (mini_epoch_base, steps_done),
+    with steps_done the optimizer steps already done in mini_epoch_base.
+
+    A run stopped at the end of a mini-epoch resumes at the start of the next one, a complete run
+    at (num_mini_epochs, 0). After a world-size change, the steps done no longer map to the same
+    samples, so the interrupted mini-epoch restarts from its first step.
+    """
+    mini_epoch_base, steps_done = divmod(istep, steps_per_mini_epoch)
+    if mini_epoch_base >= num_mini_epochs:
+        return num_mini_epochs, 0
+    return mini_epoch_base, 0 if world_size_changed else steps_done
+
+
 class Trainer(TrainerBase):
     def __init__(self, train_logging: Config):
         TrainerBase.__init__(self)
@@ -639,19 +656,27 @@ class Trainer(TrainerBase):
         val_cfg = self.validation_cfg
         self.loss_calculator_val = LossCalculator(cf, val_cfg, VAL, device=self.device)
 
-        # recover mini_epoch when continuing run
-        if self.world_size_original is None:
-            mini_epoch_base = int(self.cf.general.istep / len(self.data_loader))
-        else:
-            len_per_rank = (
-                max(1, len(self.dataset) // (self.world_size_original * self.batch_size_per_gpu))
-            ) * self.batch_size_per_gpu
-            mini_epoch_base = int(
-                self.cf.general.istep
-                / (
-                    min(len_per_rank, self.training_cfg.samples_per_mini_epoch)
-                    * self.world_size_original
+        # recover mini_epoch and the steps already done in it when continuing a run; the sampler
+        # starts at mini_epoch 0, step 0 in a new process (ecmwf/WeatherGenerator#2953)
+        steps_per_mini_epoch = len(self.dataset) // self.batch_size_per_gpu
+        world_size_changed = cf.world_size != self.world_size_original
+        mini_epoch_base, steps_done = resume_position(
+            self.cf.general.istep,
+            steps_per_mini_epoch,
+            self.training_cfg.num_mini_epochs,
+            world_size_changed,
+        )
+        self.dataset.set_resume_position(mini_epoch_base, steps_done)
+        if is_root():
+            if world_size_changed and self.cf.general.istep > 0:
+                logger.warning(
+                    f"World size changed from {self.world_size_original} to {cf.world_size}: "
+                    f"the data order cannot be continued, mini_epoch {mini_epoch_base} restarts "
+                    "from its first step."
                 )
+            logger.info(
+                f"Training starts at mini_epoch {mini_epoch_base}, step {steps_done} of "
+                f"{steps_per_mini_epoch} (istep={self.cf.general.istep})."
             )
 
         if is_root():
@@ -682,6 +707,8 @@ class Trainer(TrainerBase):
                     f"Mini_epoch {mini_epoch} of {self.training_cfg.num_mini_epochs}: save_model."
                 )
             self.save_model(mini_epoch)
+            # keep _latest no older than the last completed mini_epoch
+            self.save_model(-1)
 
         # log final model
         self.save_model(self.training_cfg.num_mini_epochs)
@@ -735,7 +762,7 @@ class Trainer(TrainerBase):
                     batch = batch.pin_memory()
 
                 batch.to_device(self.device)
-            
+
             with torch.autocast(
                 device_type=f"cuda:{cf.local_rank}",
                 dtype=self.mixed_precision_dtype,
@@ -847,11 +874,12 @@ class Trainer(TrainerBase):
                 if self.collapse_monitor.should_log(self.cf.general.istep):
                     self._log_collapse_metrics(TRAIN)
 
-            # save model checkpoint (with designation _latest)
+            self.cf.general.istep += 1
+
+            # save model checkpoint (with designation _latest), after the increment so that its
+            # istep is the number of completed optimizer steps
             if bidx % self.train_logging.checkpoint == 0 and bidx > 0:
                 self.save_model(-1)
-
-            self.cf.general.istep += 1
 
             # release this step's batch and outputs before the next forward pass: the model output
             # holds the batch, including every forecast step's target coordinates (~2.3 GB for the
