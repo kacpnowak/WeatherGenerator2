@@ -58,8 +58,17 @@ def label(run):
 
 
 # ── compute ──────────────────────────────────────────────────────────────────────────
-def compute(run, workers, tmp):
-    m = run[3]
+def compute(run, workers, tmp, model=None, data=DATA, max_lead=None, extra=None):
+    """Daily series of `run` -> data/part1_daily_<run>.nc.
+
+    The paper_eval config of yr1fv00<model> (model default: the 4th character of the run id)
+    is the template; only run_id/results_dir change, so any rollout of that model works,
+    whatever its initial date. The initial time is read from the output (lead-1 target time
+    minus one day) and the truth is the rollout's own target, i.e. the FESOM archive at the
+    valid dates. `max_lead` caps the leads; `extra(lead)` (optional, run in the workers after
+    dfy's worker init) returns a dict of extra per-lead scalars stored as variables.
+    """
+    m = model or run[3]
     cfg = yaml.safe_load((WT / f"paper_eval/configs/yr1fv00{m}.yaml").read_text())
     cfg["run_id"], cfg["results_dir"] = run, str(MAIN / "results" / run)
     cfg_path = Path(tmp) / f"{run}.yaml"
@@ -68,6 +77,8 @@ def compute(run, workers, tmp):
     s = root.store.samples[0]
     init = np.datetime64(root[f"{s}/TEMP/1/target/times"][0]) - np.timedelta64(1, "D")
     leads = sorted(int(k) for k in root[f"{s}/TEMP"].group_keys() if int(k) > 0)
+    if max_lead is not None:
+        leads = [L for L in leads if L <= max_lead]
     pred = truth = rmse = None
     nonfinite = np.zeros(len(leads), np.int64)
     with ProcessPoolExecutor(workers, initializer=dfy._init_worker,
@@ -86,11 +97,22 @@ def compute(run, workers, tmp):
          "rmse": (("lead", "channel"), rmse), "n_nonfinite_pred_wet": (("lead",), nonfinite)},
         coords={"lead": leads, "quantity": qnames, "channel": rnames,
                 "valid_time": ("lead", valid)},
-        attrs={"run": run, "init_time": str(init), "definitions": dfy.DEFINITIONS},
+        attrs={"run": run, "model": f"fvars00{m}", "init_time": str(init),
+               "definitions": dfy.DEFINITIONS.replace(
+                   "valid 2209-01-01T23:30 + L days (= truth archive day index L of 2209)",
+                   "valid init_time + L days (init_time attribute; truth = archive at that date)")},
     )
-    DATA.mkdir(parents=True, exist_ok=True)
-    ds.to_netcdf(DATA / f"part1_daily_{run}.nc")
-    print(f"{run}: {len(leads)} leads -> {DATA / f'part1_daily_{run}.nc'}", flush=True)
+    if extra is not None:
+        with ProcessPoolExecutor(workers, initializer=dfy._init_worker,
+                                 initargs=(str(cfg_path),)) as ex:
+            rows = list(ex.map(extra, leads))
+        for k in rows[0]:
+            ds[k] = ("lead", np.array([r[k] for r in rows], np.float64))
+    data.mkdir(parents=True, exist_ok=True)
+    out = data / f"part1_daily_{run}.nc"
+    ds.to_netcdf(out)
+    print(f"{run}: {len(leads)} leads, init {init} -> {out}", flush=True)
+    return out
 
 
 # ── report ───────────────────────────────────────────────────────────────────────────
