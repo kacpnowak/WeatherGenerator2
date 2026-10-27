@@ -28,6 +28,7 @@ from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.ema import EMAModel
 from weathergen.model.engines import LatentState
+from weathergen.model.latent_filter import LatentFilter
 from weathergen.model.model import ModelOutput
 from weathergen.model.model_interface import (
     init_model_and_shard,
@@ -283,7 +284,14 @@ class Trainer(TrainerBase):
         """File where the resumable rollout state (carried latent + progress) is stored."""
         return config.get_path_results(self.cf) / "rollout_state.pt"
 
-    def _save_rollout_state(self, latent_state: LatentState, done_steps: int, idx: int):
+    def _save_rollout_state(
+        self,
+        latent_state: LatentState,
+        done_steps: int,
+        idx: int,
+        latent_filter: LatentFilter | None = None,
+        latent_filter_prev: torch.Tensor | None = None,
+    ):
         """
         Persist the state needed to resume a long rollout after this chunk.
 
@@ -291,7 +299,9 @@ class Trainer(TrainerBase):
         number of completed forecast steps (and the initial-condition index) is sufficient to
         continue exactly. Written atomically (tmp + replace) so a crash mid-save cannot corrupt
         an existing checkpoint. Completed forecast steps are already persisted in the output
-        store, so only the continuation state lives here.
+        store, so only the continuation state lives here. With a latent filter
+        (forecast.latent_filter) its configuration and, for a two-level filter, the previous
+        carried latent are saved too, so the resumed rollout continues the filtered one.
         """
 
         def to_cpu(t):
@@ -306,15 +316,16 @@ class Trainer(TrainerBase):
         path = self._rollout_state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".pt.tmp")
-        torch.save(
-            {
-                "latent_state": cpu_state,
-                "done_steps": int(done_steps),
-                "idx": int(idx),
-                "run_id": self.cf.general.run_id,
-            },
-            tmp,
-        )
+        state = {
+            "latent_state": cpu_state,
+            "done_steps": int(done_steps),
+            "idx": int(idx),
+            "run_id": self.cf.general.run_id,
+        }
+        if latent_filter is not None:
+            state["latent_filter"] = latent_filter.as_dict()
+            state["latent_filter_prev"] = to_cpu(latent_filter_prev)
+        torch.save(state, tmp)
         tmp.replace(path)
 
     def _load_rollout_state(self):
@@ -332,6 +343,8 @@ class Trainer(TrainerBase):
             patch_tokens=ls.patch_tokens.to(self.device) if ls.patch_tokens is not None else None,
             z_pre_norm=ls.z_pre_norm.to(self.device),
         )
+        if state.get("latent_filter_prev") is not None:
+            state["latent_filter_prev"] = state["latent_filter_prev"].to(self.device)
         return state
 
     def _process_validation_chunks(
@@ -372,6 +385,11 @@ class Trainer(TrainerBase):
         forecast_cfg = mode_cfg.get("forecast", {})
         save_state = lazy and forecast_cfg.get("checkpoint_rollout", True)
         rollout_idx = self.dataset_val._materialize_ctx["idx"] if lazy else None
+        # optional inference-time latent filter; unset leaves the model call unchanged
+        latent_filter = LatentFilter.from_config(forecast_cfg.get("latent_filter"))
+        filter_kwargs = {} if latent_filter is None else {"latent_filter": latent_filter}
+        if latent_filter is not None:
+            logger.info(f"Latent filter for this rollout: {latent_filter.as_dict()}")
 
         cum_steps = 0
         chunk_start = 0
@@ -389,11 +407,19 @@ class Trainer(TrainerBase):
                     acc += chunks[chunk_start]
                     chunk_start += 1
                 assert acc == done, f"saved done_steps={done} not on a chunk boundary"
+                saved_filter = resumed.get("latent_filter")
+                current_filter = latent_filter.as_dict() if latent_filter is not None else None
+                if saved_filter != current_filter:
+                    raise ValueError(
+                        f"resume latent_filter mismatch: saved {saved_filter} vs current "
+                        f"{current_filter}; refusing to resume."
+                    )
                 cum_steps = done
                 # seed the rollout from the saved latent at the completed step offset; an empty
                 # physical list makes the model resume at exactly `done` steps
                 seed = ModelOutput(0, batch=batch.get_source_samples(), step_offset=done)
                 seed.latent = [{"latent_state": resumed["latent_state"]}]
+                seed.latent_filter_prev = resumed.get("latent_filter_prev")
                 source_samples = seed
                 logger.info(
                     f"Resuming rollout from step {done} (skipping {chunk_start}/{len(chunks)} "
@@ -434,12 +460,14 @@ class Trainer(TrainerBase):
                         self.model_params,
                         source_samples,
                         chunk_size,
+                        **filter_kwargs,
                     )
                 else:
                     source_samples = self.ema_model.forward_eval(
                         self.model_params,
                         source_samples,
                         chunk_size,
+                        **filter_kwargs,
                     )
 
                 chunk_step_offset = forecast_step_offset + source_samples.step_offset
@@ -492,7 +520,11 @@ class Trainer(TrainerBase):
                 # Kept on completion so a finished rollout stays continuable.
                 if save_state:
                     self._save_rollout_state(
-                        source_samples.get_last_latent_state(), cum_steps, rollout_idx
+                        source_samples.get_last_latent_state(),
+                        cum_steps,
+                        rollout_idx,
+                        latent_filter=latent_filter,
+                        latent_filter_prev=source_samples.latent_filter_prev,
                     )
 
                 chunk_pbar.update(1)

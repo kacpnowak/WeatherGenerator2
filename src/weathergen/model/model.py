@@ -43,6 +43,7 @@ from weathergen.model.forcing import (
     forcing_field_is_empty,
     forcing_num_vars_from_cfg,
 )
+from weathergen.model.latent_filter import LatentFilter
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.norms import AdaLayerNorm
 from weathergen.model.utils import get_num_parameters
@@ -70,6 +71,10 @@ class ModelOutput:
         self.latent = [{} for _ in range(len_output)]
         self.batch = batch
         self.step_offset = step_offset
+        # carried latent one step before the last latent_state, kept for a latent filter
+        # that needs two time levels (forecast.latent_filter, see latent_filter.py); None
+        # without such a filter and before the second forecast step
+        self.latent_filter_prev = None
 
     def add_physical_prediction(
         self, fstep: int, stream_name: StreamName, pred: torch.Tensor
@@ -787,6 +792,7 @@ class Model(torch.nn.Module):
         model_params: ModelParams,
         batch: BatchSamples | ModelOutput,
         rollout_steps: int,
+        latent_filter: LatentFilter | None = None,
     ) -> ModelOutput:
         """Forward pass of the model
 
@@ -794,11 +800,19 @@ class Model(torch.nn.Module):
         Args:
             model_params : Query and embedding parameters
             batch
+            latent_filter : optional inference-time filter applied to the latent after every
+                forecast-engine step (forecast.latent_filter, see latent_filter.py); None
+                (the default) runs the unfiltered rollout. Not allowed in training mode.
         Returns:
             A list containing all prediction results
         """
 
+        if latent_filter is not None and self.training:
+            raise ValueError("forecast.latent_filter is an inference-time filter, not for training")
+
         output = ModelOutput(rollout_steps)
+        # previous carried latent z_{n-1} for a two-level latent filter
+        z_prev = None
         if isinstance(batch, BatchSamples):
             step_offset = 0
             batch_ctx = batch
@@ -812,6 +826,9 @@ class Model(torch.nn.Module):
             batch_ctx = batch.batch
             tokens = latent_state.z_pre_norm
             output.add_latent_prediction(0, "posteriors", latent_state)
+            if latent_filter is not None and latent_filter.needs_prev:
+                # continue the filter across a chunk boundary / resumed rollout
+                z_prev = getattr(batch, "latent_filter_prev", None)
         output.batch = batch_ctx
         output.step_offset = step_offset
         first_step, batch_step_offset = rollout_step_range(batch_ctx, rollout_steps, step_offset)
@@ -865,6 +882,8 @@ class Model(torch.nn.Module):
                     # them and lose the weights' gradients
                     torch.clear_autocast_cache()
                     continue
+                # carried latent z_n (before the forcing injection), for the latent filter
+                z_cur = tokens
                 # Supervised steps: apply forcing with checkpoint, then forecast engine with grad
                 if self.forcing_module is not None:
                     # checkpointed like the FE blocks: otherwise the forcing embedding keeps
@@ -889,6 +908,10 @@ class Model(torch.nn.Module):
                         "cos_sim_to_prev",
                         compute_cos_sim_to_prev(tokens, prev_tokens, self.num_aux_tokens),
                     )
+
+                if latent_filter is not None:
+                    tokens = latent_filter(tokens, z_cur, z_prev)
+                    z_prev = z_cur if latent_filter.needs_prev else None
             # decoder predictions
             output = self.predict_decoders(
                 model_params, step, step + batch_step_offset, tokens, batch_ctx, output
@@ -896,6 +919,7 @@ class Model(torch.nn.Module):
             # latent predictions (raw and with SSL heads)
             output = self.predict_latent(model_params, step, tokens, batch_ctx, output)
 
+        output.latent_filter_prev = z_prev
         return output
 
     def predict_latent(
