@@ -261,7 +261,7 @@ def test_iter_skips_sample_without_forcing():
         return good
 
     stub = types.SimpleNamespace(
-        worker_workset=lambda: (0, 2),
+        worker_workset=lambda: (0, 2, 0),
         len=2,
         reset=lambda: (np.array([0, 1, 2]), np.array([1, 1])),
         batch_size=1,
@@ -332,7 +332,7 @@ def test_release_target_chunk_frees_the_chunks_forcing():
 
 def _iter_stub(get_batch, perms):
     return types.SimpleNamespace(
-        worker_workset=lambda: (0, 2),
+        worker_workset=lambda: (0, 2, 0),
         len=2,
         reset=lambda: (np.array(perms), np.array([1, 1])),
         batch_size=1,
@@ -501,7 +501,7 @@ def _prefix_iter_stub(rank, prefix_range=(1, 90), get_prefix_batch=None):
         return _GOOD
 
     stub = types.SimpleNamespace(
-        worker_workset=lambda: (rank * 4, rank * 4 + 4),
+        worker_workset=lambda: (rank * 4, rank * 4 + 4, 0),
         len=4,
         rank=rank,
         mini_epoch=0,

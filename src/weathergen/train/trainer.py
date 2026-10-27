@@ -67,6 +67,49 @@ def prefix_length(batch) -> int:
     return 0 if first is None else first - batch.get_output_idxs()[0]
 
 
+def resume_position(
+    istep: int,
+    len_dataset: int,
+    batch_size: int,
+    samples_per_mini_epoch: int,
+    world_size_original: int | None,
+    world_size: int,
+) -> tuple[int, int]:
+    """
+    Where a continued run resumes: the mini-epoch, and the number of its batches (per rank)
+    the checkpoint has already trained.
+
+    `istep` counts the training steps in the checkpoint. A `_latest` checkpoint is saved within
+    a mini-epoch, so the run resumes within it and must train only its remaining batches. The
+    position in the mini-epoch is known only when the world size is unchanged and the steps per
+    mini-epoch below are the batches a rank trains per mini-epoch; otherwise the mini-epoch is
+    trained from its first batch again, as before.
+    """
+    if world_size_original is None:
+        # len(DataLoader) == len(dataset) for the training loader (batch_size=None)
+        steps_per_mini_epoch = len_dataset
+    else:
+        len_per_rank = max(1, len_dataset // (world_size_original * batch_size)) * batch_size
+        steps_per_mini_epoch = min(len_per_rank, samples_per_mini_epoch) * world_size_original
+    mini_epoch_base, num_trained = divmod(istep, steps_per_mini_epoch)
+
+    if num_trained > 0 and world_size_original not in (None, world_size):
+        logger.warning(
+            f"Resuming at step {istep} with world size {world_size}, the run started with "
+            f"world size {world_size_original}: mini_epoch {mini_epoch_base} is trained from "
+            "its first batch, without skipping the batches already trained."
+        )
+        num_trained = 0
+    elif num_trained > 0 and steps_per_mini_epoch != len_dataset // batch_size:
+        logger.warning(
+            f"Resuming at step {istep}: {steps_per_mini_epoch} steps per mini-epoch, but "
+            f"{len_dataset // batch_size} batches per rank; mini_epoch {mini_epoch_base} is "
+            "trained from its first batch, without skipping the batches already trained."
+        )
+        num_trained = 0
+    return mini_epoch_base, num_trained
+
+
 class Trainer(TrainerBase):
     def __init__(self, train_logging: Config):
         TrainerBase.__init__(self)
@@ -640,19 +683,7 @@ class Trainer(TrainerBase):
         self.loss_calculator_val = LossCalculator(cf, val_cfg, VAL, device=self.device)
 
         # recover mini_epoch when continuing run
-        if self.world_size_original is None:
-            mini_epoch_base = int(self.cf.general.istep / len(self.data_loader))
-        else:
-            len_per_rank = (
-                max(1, len(self.dataset) // (self.world_size_original * self.batch_size_per_gpu))
-            ) * self.batch_size_per_gpu
-            mini_epoch_base = int(
-                self.cf.general.istep
-                / (
-                    min(len_per_rank, self.training_cfg.samples_per_mini_epoch)
-                    * self.world_size_original
-                )
-            )
+        mini_epoch_base = self._align_sampler_with_resume()
 
         if is_root():
             config.save(self.cf, None)
@@ -691,6 +722,34 @@ class Trainer(TrainerBase):
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 
+    def _align_sampler_with_resume(self) -> int:
+        """
+        Set the training sampler to where a continued run resumes; return that mini-epoch.
+
+        The sampler starts at mini_epoch 0 in every process, but its worker seed, the
+        forecast-step curriculum and the spin-up draw depend on the mini-epoch, and
+        train_continue reuses the run's rng seed: without this, every continued run would
+        replay the first mini-epochs (ecmwf/WeatherGenerator#2953). A run resumed from a
+        mid-epoch checkpoint also skips the batches of that mini-epoch the checkpoint has
+        trained, so it trains each step of the planned schedule once.
+        """
+        mini_epoch_base, num_trained = resume_position(
+            self.cf.general.istep,
+            len(self.dataset),
+            self.batch_size_per_gpu,
+            self.training_cfg.samples_per_mini_epoch,
+            self.world_size_original,
+            self.cf.world_size,
+        )
+        self.dataset.mini_epoch = mini_epoch_base
+        self.dataset.skip_batches = num_trained
+        if num_trained > 0 and is_root():
+            logger.info(
+                f"Resuming at step {self.cf.general.istep}: mini_epoch {mini_epoch_base}, "
+                f"after its first {num_trained} batches."
+            )
+        return mini_epoch_base
+
     def validate_before_training(self):
         """
         Perform validation before training (eg. to check validation pipeline or data normalization)
@@ -723,12 +782,15 @@ class Trainer(TrainerBase):
         apply_fct_to_blocks(self.model, cf.freeze_modules, set_to_eval)
 
         dataset_iter = iter(self.data_loader)
+        # a run resumed within this mini-epoch starts at the first batch it has not trained;
+        # bidx is the position in the mini-epoch (logging, checkpoint cadence)
+        bidx_start = self.dataset.skip_batches
 
         self.optimizer.zero_grad()
 
         # training loop
         self.t_start = time.time()
-        for bidx, batch in enumerate(dataset_iter):
+        for bidx, batch in enumerate(dataset_iter, start=bidx_start):
             with self.training_loop_annotation_context(f"batch_{bidx}"):
                 if cf.data_loading.get("memory_pinning", False):
                     # pin memory for faster CPU-GPU transfer
@@ -847,11 +909,13 @@ class Trainer(TrainerBase):
                 if self.collapse_monitor.should_log(self.cf.general.istep):
                     self._log_collapse_metrics(TRAIN)
 
-            # save model checkpoint (with designation _latest)
+            self.cf.general.istep += 1
+
+            # save model checkpoint (with designation _latest), after the step counter has been
+            # advanced: the saved istep counts the steps in the saved model, as for the checkpoint
+            # at the end of a mini-epoch, so a run resumed from it continues with the next batch
             if bidx % self.train_logging.checkpoint == 0 and bidx > 0:
                 self.save_model(-1)
-
-            self.cf.general.istep += 1
 
             # release this step's batch and outputs before the next forward pass: the model output
             # holds the batch, including every forecast step's target coordinates (~2.3 GB for the

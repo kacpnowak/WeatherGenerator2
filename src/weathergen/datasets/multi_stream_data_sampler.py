@@ -8,6 +8,7 @@
 # nor does it submit to any jurisdiction.
 
 import dataclasses
+import itertools
 import logging
 import pathlib
 from collections.abc import Sequence
@@ -172,6 +173,35 @@ def draw_prefix_steps(
     return int(rng.integers(low, high + 1))
 
 
+def resume_worker_skips(batches_per_worker: Sequence[int], num_skip: int) -> tuple[list[int], int]:
+    """
+    Split the first `num_skip` batches of a mini-epoch over the loader workers that yield them.
+
+    torch's DataLoader (with in_order=True, the default) sends one task per round to every
+    worker whose iterator is not exhausted, cycling through the workers from worker 0 at every
+    iter(), and returns the results in task order. Worker w's j-th batch is therefore returned
+    in round j, and the batches of a mini-epoch come as round 0 (workers 0, 1, ...), round 1,
+    ..., with only the workers that have more than j batches in round j (the last worker can
+    have more batches than the others).
+
+    Returns the number of each worker's batches among the first `num_skip`, and the worker
+    that yields the batch after them (0 when there is no skip or no batch left).
+    """
+    num_workers = len(batches_per_worker)
+    consumed = [0] * num_workers
+    if num_skip <= 0:
+        return consumed, 0
+    order = (
+        w
+        for j in range(max(batches_per_worker, default=0))
+        for w in range(num_workers)
+        if j < batches_per_worker[w]
+    )
+    for w in itertools.islice(order, num_skip):
+        consumed[w] += 1
+    return consumed, next(order, 0)
+
+
 @dataclasses.dataclass
 class _Stream:
     info: Config
@@ -186,6 +216,10 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self._stage = stage
 
         self.mini_epoch = 0
+        # batches (per rank) at the start of the current mini-epoch to skip: those a run
+        # resumed from a mid-epoch checkpoint has already trained (set by the trainer, reset
+        # by advance())
+        self.skip_batches = 0
         self.mask_value = 0.0
         self.rank = cf.rank
         self.world_size = cf.world_size
@@ -636,6 +670,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         Advance mini_epoch (this is applied to the template for the worker processes)
         """
         self.mini_epoch += 1
+        # a resumed run skips trained batches only in the mini-epoch it resumes in
+        self.skip_batches = 0
 
     def get_sources_size(self):
         return [
@@ -1425,8 +1461,10 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         """
         from weathergen.model.forcing import ForcingUnavailableError
 
-        iter_start, iter_end = self.worker_workset()
-        logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
+        iter_start, iter_end, num_skip = self.worker_workset()
+        logger.info(
+            f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}, skip={num_skip}"
+        )
         # position of this worker's first sample in the rank's share: the same on every rank
         rank_position = iter_start - self.rank * self.len
 
@@ -1441,6 +1479,19 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         # (grid mismatch, wrong frequency, period not covered) hits every sample
         forcing_skips = 0
         for i, _bidx in enumerate(range(iter_start, iter_end, self.batch_size)):
+            if i < num_skip:
+                # a run resumed within this mini-epoch has trained this batch already (see
+                # worker_workset): advance the loop index (which selects the forecast steps and
+                # the spin-up draw) and idx_raw as if the batch had used one sample, without
+                # loading data. The sample index, forecast steps and spin-up length of the
+                # batches that follow are those of an uninterrupted run, except that
+                # (a) a skipped batch that originally skipped invalid samples (empty, NaN,
+                #     missing forcing) used more than one, which shifts idx_raw after it, and
+                # (b) self.rng, which the tokenizer/masking and the target subsampling draw
+                #     from, is not advanced for the skipped batches, so their draws after a
+                #     mid-epoch resume differ from those of an uninterrupted run.
+                idx_raw += 1
+                continue
             # num_forecast_steps needs to be constant per batch
             # (amortized through data parallel training)
             num_forecast_steps = perms_num_forecast_steps[i]
@@ -1500,7 +1551,21 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
     def __len__(self):
         return self.len
 
+    def _worker_range(self, worker_id: int, num_workers: int) -> tuple[int, int]:
+        """Samples [iter_start, iter_end) of loader worker `worker_id` in the rank's share."""
+        local_start, local_end = self.rank * self.len, (self.rank + 1) * self.len
+        per_worker = (local_end - local_start) // num_workers
+        iter_start = local_start + worker_id * per_worker
+        # the last worker takes the remainder
+        iter_end = local_end if worker_id + 1 == num_workers else iter_start + per_worker
+        return iter_start, iter_end
+
     def worker_workset(self):
+        """
+        Share of this loader worker in the current mini-epoch: its samples [iter_start,
+        iter_end) and the number of its first batches to skip (those a resumed run has
+        already trained, see `skip_batches`).
+        """
         local_start, local_end = self.rank * self.len, (self.rank + 1) * self.len
 
         worker_info = torch.utils.data.get_worker_info()
@@ -1509,8 +1574,23 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             assert self.world_size == 1, self.world_size
             iter_start = 0
             iter_end = len(self)
+            num_skip = min(self.skip_batches, len(range(iter_start, iter_end, self.batch_size)))
 
         else:
+            num_workers = worker_info.num_workers
+            # resuming within the mini-epoch: the trained batches came from the workers in
+            # round robin (see resume_worker_skips), so each worker skips its own share of
+            # them. The loader starts its round robin at worker 0 again, so loader worker 0
+            # takes the role (share, seed) of the worker that yields the next batch, and the
+            # others follow in order: the batches then come in the uninterrupted order.
+            batches_per_worker = [
+                len(range(*self._worker_range(w, num_workers), self.batch_size))
+                for w in range(num_workers)
+            ]
+            consumed, next_worker = resume_worker_skips(batches_per_worker, self.skip_batches)
+            worker_id = (worker_info.id + next_worker) % num_workers
+            num_skip = consumed[worker_id]
+
             # ensure the rng seed is fully unique across workers and mini_epochs
             # the worker processes are generated as bit-wise copy of the "template" (the actual
             # instance of the present class that is created) whenever __iter__ is started. This
@@ -1520,19 +1600,16 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             dist = torch.distributed
             self.data_loader_rng_seed *= (
                 (((dist.get_rank() + 1) * 73) if dist.is_initialized() else 1)
-                * ((worker_info.id + 1) * 37)
+                * ((worker_id + 1) * 37)
                 * (self.mini_epoch + 13)
                 * 7
             )
             # split workload
-            per_worker = (local_end - local_start) // worker_info.num_workers
-            iter_start = local_start + worker_info.id * per_worker
-            iter_end = iter_start + per_worker
-            if worker_info.id + 1 == worker_info.num_workers:
-                iter_end = local_end
+            iter_start, iter_end = self._worker_range(worker_id, num_workers)
             logger.info(
                 f"{self.rank}::{worker_info.id}"
                 + f" : dataset [{local_start},{local_end}) : [{iter_start},{iter_end})"
+                + (f" (worker {worker_id}'s share, skip {num_skip})" if self.skip_batches else "")
             )
 
-        return iter_start, iter_end
+        return iter_start, iter_end, num_skip
