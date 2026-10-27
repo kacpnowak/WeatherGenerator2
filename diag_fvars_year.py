@@ -400,7 +400,7 @@ def table(run):
     lines = [f"Part 1, run {run}: prediction - truth of daily global means/integrals "
              f"(init {ds.attrs['init_time'][:16]})", ""]
     lines += [DEFINITIONS]
-    head = f"{'quantity':<15}{'unit':>7}" + "".join(f"{'d' + str(d):>9}" for d in days)
+    head = f"{'quantity':<18}{'unit':>7}" + "".join(f"{'d' + str(d):>9}" for d in days)
     head += f"{'truth_d1':>11}{'truthD363-1':>12}{'truthRange':>11}"
     lines += [head, "-" * len(head)]
     for q in ds.quantity.values:
@@ -410,7 +410,7 @@ def table(run):
         scale, fmt, unit = _display(q)
         d = (ds.pred.sel(quantity=q) - ds.truth.sel(quantity=q)) * scale
         tr = ds.truth.sel(quantity=q) * scale
-        row = f"{q:<15}{unit:>7}" + "".join(f"{fmt.format(float(d.sel(lead=x))):>9}" for x in days)
+        row = f"{q:<18}{unit:>7}" + "".join(f"{fmt.format(float(d.sel(lead=x))):>9}" for x in days)
         t1 = float(tr.sel(lead=days[0]))
         absfmt = "{:.3f}" if abs(t1) < 1e4 else "{:.4g}"
         row += f"{absfmt.format(t1):>11}{fmt.format(float(tr.sel(lead=days[-1])) - t1):>12}"
