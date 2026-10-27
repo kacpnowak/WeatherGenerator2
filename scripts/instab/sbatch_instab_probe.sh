@@ -18,7 +18,7 @@
 # free rollout from 2209-01-01. Text/data go to $INSTAB_OUT.
 MODE=${1:?mode}; FROM_RUN=${2:?from run}; RUN_ID=${3:?run id}; LIST=${4:?dates or days}
 shift 4
-WT=/work/ab0995/a270225/WeatherGenerator2-instab
+WT=${WT:-/work/ab0995/a270225/WeatherGenerator2}
 OUT=${INSTAB_OUT:-/home/a/a270225/claude_api_tools/instab_tests/data}
 module purge
 module load git gcc/11.2.0-gcc-11.2.0 nvhpc/24.7-gcc-11.2.0

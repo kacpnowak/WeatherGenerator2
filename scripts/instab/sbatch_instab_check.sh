@@ -18,7 +18,7 @@
 #   inschk2  second_difference 0.25, chunk 2    } boundaries
 #   inschk3  second_difference 0.25, 4 steps chunk 2, then resumed to 6 steps (rollout_state.pt)
 #   inschk3  resumed again with relax 0.25      -> must refuse (filter mismatch)
-WT=/work/ab0995/a270225/WeatherGenerator2-instab
+WT=${WT:-/work/ab0995/a270225/WeatherGenerator2}
 module purge
 module load git gcc/11.2.0-gcc-11.2.0 nvhpc/24.7-gcc-11.2.0
 export CUDA_HOME=/sw/spack-levante/nvhpc-24.7-py26uc/Linux_x86_64/24.7/cuda/12.5/

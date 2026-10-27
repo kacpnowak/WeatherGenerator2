@@ -32,7 +32,7 @@ FROM_RUN=${1:?usage: sbatch sbatch_instab_rollout.sh FROM_RUN FROM_EPOCH RUN_ID 
 FROM_EPOCH=${2:?missing FROM_EPOCH}
 RUN_ID=${3:?missing RUN_ID}
 NUM_STEPS=${4:?missing NUM_STEPS}
-WT=/work/ab0995/a270225/WeatherGenerator2-instab
+WT=${WT:-/work/ab0995/a270225/WeatherGenerator2}
 
 module purge
 module load git gcc/11.2.0-gcc-11.2.0 nvhpc/24.7-gcc-11.2.0
