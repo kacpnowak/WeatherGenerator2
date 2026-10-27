@@ -454,6 +454,7 @@ class ForcingInjection(nn.Module):
         condition: torch.Tensor,
         forcing_field: torch.Tensor,
         num_aux: int,
+        scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
@@ -467,6 +468,10 @@ class ForcingInjection(nn.Module):
             cell_valid]; empty when no forcing is available (then this is a no-op).
         num_aux :
             Number of leading auxiliary tokens to leave untouched.
+        scale :
+            Multiplier of the gate, i.e. of the injected residual (inference-time
+            ``forecast.forcing_scale``, see forcing_scale.py). 1.0 (the default) uses the gate
+            parameter itself, so the result is exactly the unscaled one.
 
         Returns
         -------
@@ -476,19 +481,20 @@ class ForcingInjection(nn.Module):
             return tokens, condition
 
         cell_emb = self._cell_emb(forcing_field, tokens.dtype)  # (num_cells, dim)
+        gate = self.gate if scale == 1.0 else self.gate * scale
 
         if self.mode == "additive":
-            patch = tokens[:, num_aux:] + self.gate * cell_emb
+            patch = tokens[:, num_aux:] + gate * cell_emb
             tokens = torch.cat([tokens[:, :num_aux], patch], dim=1)
         elif self.mode == "cross_attn":
             q = self.norm_q(tokens[:, num_aux:])  # (B, num_cells, dim)
             kv = cell_emb.unsqueeze(0).expand(q.shape[0], -1, -1)
             delta, _ = self.cross_attn(q, kv, kv, need_weights=False)
-            patch = tokens[:, num_aux:] + self.gate * delta
+            patch = tokens[:, num_aux:] + gate * delta
             tokens = torch.cat([tokens[:, :num_aux], patch], dim=1)
         elif self.mode == "global":
             g = self.cond_proj(cell_emb.mean(dim=0))  # (dim_aux,)
-            condition = condition + self.gate * g
+            condition = condition + gate * g
         elif self.mode == "adaln_local":
             # per-cell conditioning: broadcast the global daytime condition, add per-cell forcing
             base = (
@@ -496,7 +502,7 @@ class ForcingInjection(nn.Module):
                 if condition.numel() > 0
                 else torch.zeros(1, self.dim_aux, dtype=cell_emb.dtype, device=cell_emb.device)
             )
-            per_cell = base + self.gate * self.cond_proj(cell_emb)  # (num_cells, dim_aux)
+            per_cell = base + gate * self.cond_proj(cell_emb)  # (num_cells, dim_aux)
             # register/class tokens carry no forcing: they keep the global condition, so the
             # condition has one row per token and broadcasts in the FE's AdaLN
             aux = base.expand(num_aux, -1).to(per_cell.dtype)

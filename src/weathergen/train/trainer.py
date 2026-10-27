@@ -28,6 +28,7 @@ from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.ema import EMAModel
 from weathergen.model.engines import LatentState
+from weathergen.model.forcing_scale import ForcingScale
 from weathergen.model.land_cells import LandCells
 from weathergen.model.latent_filter import LatentFilter
 from weathergen.model.model import ModelOutput
@@ -294,6 +295,7 @@ class Trainer(TrainerBase):
         latent_filter_prev: torch.Tensor | None = None,
         land_cells: LandCells | None = None,
         land_cells_init: torch.Tensor | None = None,
+        forcing_scale: ForcingScale | None = None,
     ):
         """
         Persist the state needed to resume a long rollout after this chunk.
@@ -306,7 +308,7 @@ class Trainer(TrainerBase):
         (forecast.latent_filter) its configuration and, for a two-level filter, the previous
         carried latent are saved too, so the resumed rollout continues the filtered one.
         Likewise with forecast.land_cells: its setting and, for freeze, the land tokens of the
-        initial latent.
+        initial latent; and with forecast.forcing_scale: its setting.
         """
 
         def to_cpu(t):
@@ -333,6 +335,8 @@ class Trainer(TrainerBase):
         if land_cells is not None:
             state["land_cells"] = land_cells.as_dict()
             state["land_cells_init"] = to_cpu(land_cells_init)
+        if forcing_scale is not None:
+            state["forcing_scale"] = forcing_scale.as_dict()
         torch.save(state, tmp)
         tmp.replace(path)
 
@@ -417,6 +421,11 @@ class Trainer(TrainerBase):
         if land_cells is not None:
             rollout_kwargs["land_cells"] = land_cells
             logger.info(f"Land cells for this rollout: {land_cells.as_dict()}")
+        # optional inference-time scale of the forcing injection; unset / 1.0 leaves it unchanged
+        forcing_scale = ForcingScale.from_config(forecast_cfg.get("forcing_scale"))
+        if forcing_scale is not None:
+            rollout_kwargs["forcing_scale"] = forcing_scale
+            logger.info(f"Forcing scale for this rollout: {forcing_scale.as_dict()}")
 
         cum_steps = 0
         chunk_start = 0
@@ -436,6 +445,7 @@ class Trainer(TrainerBase):
                 assert acc == done, f"saved done_steps={done} not on a chunk boundary"
                 self._check_resume_setting(resumed, "latent_filter", latent_filter)
                 self._check_resume_setting(resumed, "land_cells", land_cells)
+                self._check_resume_setting(resumed, "forcing_scale", forcing_scale)
                 cum_steps = done
                 # seed the rollout from the saved latent at the completed step offset; an empty
                 # physical list makes the model resume at exactly `done` steps
@@ -550,6 +560,7 @@ class Trainer(TrainerBase):
                         latent_filter_prev=source_samples.latent_filter_prev,
                         land_cells=land_cells,
                         land_cells_init=source_samples.land_cells_init,
+                        forcing_scale=forcing_scale,
                     )
 
                 chunk_pbar.update(1)

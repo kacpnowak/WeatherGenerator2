@@ -43,6 +43,7 @@ from weathergen.model.forcing import (
     forcing_field_is_empty,
     forcing_num_vars_from_cfg,
 )
+from weathergen.model.forcing_scale import ForcingScale
 from weathergen.model.land_cells import TOKEN_FORCING_MODES, LandCells
 from weathergen.model.latent_filter import LatentFilter
 from weathergen.model.layers import MLP, NamedLinear
@@ -798,6 +799,7 @@ class Model(torch.nn.Module):
         rollout_steps: int,
         latent_filter: LatentFilter | None = None,
         land_cells: LandCells | None = None,
+        forcing_scale: ForcingScale | None = None,
     ) -> ModelOutput:
         """Forward pass of the model
 
@@ -811,6 +813,9 @@ class Model(torch.nn.Module):
             land_cells : optional inference-time treatment of the latent land cells
                 (forecast.land_cells, see land_cells.py); None (the default) runs the
                 default rollout. Not allowed in training mode.
+            forcing_scale : optional inference-time scale of the per-step forcing injection
+                (forecast.forcing_scale, see forcing_scale.py); None (the default) runs the
+                unscaled rollout. Not allowed in training mode.
         Returns:
             A list containing all prediction results
         """
@@ -828,6 +833,15 @@ class Model(torch.nn.Module):
                     "forecast.land_cells no_forcing needs a forcing injection that acts on the "
                     f"cell tokens ({TOKEN_FORCING_MODES})"
                 )
+        # extra positional argument of the forcing module (its `scale`); empty by default, so
+        # the default call is unchanged
+        forcing_args = ()
+        if forcing_scale is not None:
+            if self.training:
+                raise ValueError("forecast.forcing_scale is an inference-time option, not training")
+            if self.forcing_module is None or getattr(self.forcing_module, "mode", None) == "none":
+                raise ValueError("forecast.forcing_scale needs a forcing injection to scale")
+            forcing_args = (forcing_scale.alpha,)
 
         output = ModelOutput(rollout_steps)
         # previous carried latent z_{n-1} for a two-level latent filter
@@ -904,7 +918,7 @@ class Model(torch.nn.Module):
                         if self.forcing_module is not None:
                             z_in = tokens
                             tokens, condition = self.forcing_module(
-                                tokens, condition, forcing_field, self.num_aux_tokens
+                                tokens, condition, forcing_field, self.num_aux_tokens, *forcing_args
                             )
                             if land_cells is not None:
                                 tokens = land_cells.after_forcing(z_in, tokens, self.num_aux_tokens)
@@ -931,6 +945,7 @@ class Model(torch.nn.Module):
                         condition,
                         forcing_field,
                         self.num_aux_tokens,
+                        *forcing_args,
                         use_reentrant=False,
                     )
                     if land_cells is not None:
