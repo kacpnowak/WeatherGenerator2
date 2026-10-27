@@ -43,6 +43,7 @@ from weathergen.model.forcing import (
     forcing_field_is_empty,
     forcing_num_vars_from_cfg,
 )
+from weathergen.model.land_cells import TOKEN_FORCING_MODES, LandCells
 from weathergen.model.latent_filter import LatentFilter
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.norms import AdaLayerNorm
@@ -75,6 +76,9 @@ class ModelOutput:
         # that needs two time levels (forecast.latent_filter, see latent_filter.py); None
         # without such a filter and before the second forecast step
         self.latent_filter_prev = None
+        # land tokens of the rollout's initial latent, kept for forecast.land_cells freeze (see
+        # land_cells.py); None without it
+        self.land_cells_init = None
 
     def add_physical_prediction(
         self, fstep: int, stream_name: StreamName, pred: torch.Tensor
@@ -793,6 +797,7 @@ class Model(torch.nn.Module):
         batch: BatchSamples | ModelOutput,
         rollout_steps: int,
         latent_filter: LatentFilter | None = None,
+        land_cells: LandCells | None = None,
     ) -> ModelOutput:
         """Forward pass of the model
 
@@ -803,16 +808,32 @@ class Model(torch.nn.Module):
             latent_filter : optional inference-time filter applied to the latent after every
                 forecast-engine step (forecast.latent_filter, see latent_filter.py); None
                 (the default) runs the unfiltered rollout. Not allowed in training mode.
+            land_cells : optional inference-time treatment of the latent land cells
+                (forecast.land_cells, see land_cells.py); None (the default) runs the
+                default rollout. Not allowed in training mode.
         Returns:
             A list containing all prediction results
         """
 
         if latent_filter is not None and self.training:
             raise ValueError("forecast.latent_filter is an inference-time filter, not for training")
+        if land_cells is not None:
+            if self.training:
+                raise ValueError("forecast.land_cells is an inference-time option, not training")
+            if land_cells.mode == "no_forcing" and (
+                self.forcing_module is None
+                or getattr(self.forcing_module, "mode", "additive") not in TOKEN_FORCING_MODES
+            ):
+                raise ValueError(
+                    "forecast.land_cells no_forcing needs a forcing injection that acts on the "
+                    f"cell tokens ({TOKEN_FORCING_MODES})"
+                )
 
         output = ModelOutput(rollout_steps)
         # previous carried latent z_{n-1} for a two-level latent filter
         z_prev = None
+        # land tokens of the initial latent for forecast.land_cells freeze
+        land_init = None
         if isinstance(batch, BatchSamples):
             step_offset = 0
             batch_ctx = batch
@@ -820,6 +841,8 @@ class Model(torch.nn.Module):
             output.add_latent_prediction(0, "posteriors", posteriors)
             shape = (len(batch), batch.get_num_source_steps(), *tokens.shape[1:])
             tokens = tokens.reshape(shape).sum(axis=1)
+            if land_cells is not None:
+                land_init = land_cells.initial_tokens(tokens, self.num_aux_tokens)
         else:
             step_offset = batch.step_offset + len(batch.physical)
             latent_state = batch.get_last_latent_state()
@@ -829,6 +852,14 @@ class Model(torch.nn.Module):
             if latent_filter is not None and latent_filter.needs_prev:
                 # continue the filter across a chunk boundary / resumed rollout
                 z_prev = getattr(batch, "latent_filter_prev", None)
+            if land_cells is not None and land_cells.needs_init:
+                # continue a frozen-land rollout across a chunk boundary / resumed rollout
+                land_init = getattr(batch, "land_cells_init", None)
+                if land_init is None:
+                    raise ValueError(
+                        "forecast.land_cells freeze: the continued rollout carries no initial "
+                        "land tokens"
+                    )
         output.batch = batch_ctx
         output.step_offset = step_offset
         first_step, batch_step_offset = rollout_step_range(batch_ctx, rollout_steps, step_offset)
@@ -871,12 +902,17 @@ class Model(torch.nn.Module):
                     # spin-up / pushforward: advance tokens without grad; no decoding
                     with torch.no_grad():
                         if self.forcing_module is not None:
+                            z_in = tokens
                             tokens, condition = self.forcing_module(
                                 tokens, condition, forcing_field, self.num_aux_tokens
                             )
+                            if land_cells is not None:
+                                tokens = land_cells.after_forcing(z_in, tokens, self.num_aux_tokens)
                         tokens = self.forecast_engine(
                             tokens, condition, coords=model_params.rope_coords
                         )
+                        if land_cells is not None:
+                            tokens = land_cells.after_step(tokens, land_init, self.num_aux_tokens)
                     # autocast caches the low-precision copies of fp32 weights it casts; cast
                     # under no_grad they are detached, and a later step with grad would reuse
                     # them and lose the weights' gradients
@@ -897,6 +933,8 @@ class Model(torch.nn.Module):
                         self.num_aux_tokens,
                         use_reentrant=False,
                     )
+                    if land_cells is not None:
+                        tokens = land_cells.after_forcing(z_cur, tokens, self.num_aux_tokens)
                 prev_tokens = tokens if self.compute_cos_sim_to_prev else None
                 tokens = self.forecast_engine(tokens, condition, coords=model_params.rope_coords)
 
@@ -912,6 +950,8 @@ class Model(torch.nn.Module):
                 if latent_filter is not None:
                     tokens = latent_filter(tokens, z_cur, z_prev)
                     z_prev = z_cur if latent_filter.needs_prev else None
+                if land_cells is not None:
+                    tokens = land_cells.after_step(tokens, land_init, self.num_aux_tokens)
             # decoder predictions
             output = self.predict_decoders(
                 model_params, step, step + batch_step_offset, tokens, batch_ctx, output
@@ -920,6 +960,7 @@ class Model(torch.nn.Module):
             output = self.predict_latent(model_params, step, tokens, batch_ctx, output)
 
         output.latent_filter_prev = z_prev
+        output.land_cells_init = land_init
         return output
 
     def predict_latent(

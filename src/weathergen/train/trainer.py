@@ -28,6 +28,7 @@ from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.ema import EMAModel
 from weathergen.model.engines import LatentState
+from weathergen.model.land_cells import LandCells
 from weathergen.model.latent_filter import LatentFilter
 from weathergen.model.model import ModelOutput
 from weathergen.model.model_interface import (
@@ -291,6 +292,8 @@ class Trainer(TrainerBase):
         idx: int,
         latent_filter: LatentFilter | None = None,
         latent_filter_prev: torch.Tensor | None = None,
+        land_cells: LandCells | None = None,
+        land_cells_init: torch.Tensor | None = None,
     ):
         """
         Persist the state needed to resume a long rollout after this chunk.
@@ -302,6 +305,8 @@ class Trainer(TrainerBase):
         store, so only the continuation state lives here. With a latent filter
         (forecast.latent_filter) its configuration and, for a two-level filter, the previous
         carried latent are saved too, so the resumed rollout continues the filtered one.
+        Likewise with forecast.land_cells: its setting and, for freeze, the land tokens of the
+        initial latent.
         """
 
         def to_cpu(t):
@@ -325,8 +330,21 @@ class Trainer(TrainerBase):
         if latent_filter is not None:
             state["latent_filter"] = latent_filter.as_dict()
             state["latent_filter_prev"] = to_cpu(latent_filter_prev)
+        if land_cells is not None:
+            state["land_cells"] = land_cells.as_dict()
+            state["land_cells_init"] = to_cpu(land_cells_init)
         torch.save(state, tmp)
         tmp.replace(path)
+
+    @staticmethod
+    def _check_resume_setting(resumed: dict, key: str, current) -> None:
+        """Refuse to resume a rollout whose saved `key` setting (as_dict) differs from `current`."""
+        saved = resumed.get(key)
+        current = current.as_dict() if current is not None else None
+        if saved != current:
+            raise ValueError(
+                f"resume {key} mismatch: saved {saved} vs current {current}; refusing to resume."
+            )
 
     def _load_rollout_state(self):
         """Load a previously saved rollout state, or None if there is nothing to resume."""
@@ -345,6 +363,8 @@ class Trainer(TrainerBase):
         )
         if state.get("latent_filter_prev") is not None:
             state["latent_filter_prev"] = state["latent_filter_prev"].to(self.device)
+        if state.get("land_cells_init") is not None:
+            state["land_cells_init"] = state["land_cells_init"].to(self.device)
         return state
 
     def _process_validation_chunks(
@@ -387,9 +407,16 @@ class Trainer(TrainerBase):
         rollout_idx = self.dataset_val._materialize_ctx["idx"] if lazy else None
         # optional inference-time latent filter; unset leaves the model call unchanged
         latent_filter = LatentFilter.from_config(forecast_cfg.get("latent_filter"))
-        filter_kwargs = {} if latent_filter is None else {"latent_filter": latent_filter}
+        rollout_kwargs = {} if latent_filter is None else {"latent_filter": latent_filter}
         if latent_filter is not None:
             logger.info(f"Latent filter for this rollout: {latent_filter.as_dict()}")
+        # optional inference-time treatment of the latent land cells; unset leaves it unchanged
+        land_cells = LandCells.from_config(
+            forecast_cfg.get("land_cells"), self.cf.streams, self.cf.healpix_level
+        )
+        if land_cells is not None:
+            rollout_kwargs["land_cells"] = land_cells
+            logger.info(f"Land cells for this rollout: {land_cells.as_dict()}")
 
         cum_steps = 0
         chunk_start = 0
@@ -407,19 +434,15 @@ class Trainer(TrainerBase):
                     acc += chunks[chunk_start]
                     chunk_start += 1
                 assert acc == done, f"saved done_steps={done} not on a chunk boundary"
-                saved_filter = resumed.get("latent_filter")
-                current_filter = latent_filter.as_dict() if latent_filter is not None else None
-                if saved_filter != current_filter:
-                    raise ValueError(
-                        f"resume latent_filter mismatch: saved {saved_filter} vs current "
-                        f"{current_filter}; refusing to resume."
-                    )
+                self._check_resume_setting(resumed, "latent_filter", latent_filter)
+                self._check_resume_setting(resumed, "land_cells", land_cells)
                 cum_steps = done
                 # seed the rollout from the saved latent at the completed step offset; an empty
                 # physical list makes the model resume at exactly `done` steps
                 seed = ModelOutput(0, batch=batch.get_source_samples(), step_offset=done)
                 seed.latent = [{"latent_state": resumed["latent_state"]}]
                 seed.latent_filter_prev = resumed.get("latent_filter_prev")
+                seed.land_cells_init = resumed.get("land_cells_init")
                 source_samples = seed
                 logger.info(
                     f"Resuming rollout from step {done} (skipping {chunk_start}/{len(chunks)} "
@@ -460,14 +483,14 @@ class Trainer(TrainerBase):
                         self.model_params,
                         source_samples,
                         chunk_size,
-                        **filter_kwargs,
+                        **rollout_kwargs,
                     )
                 else:
                     source_samples = self.ema_model.forward_eval(
                         self.model_params,
                         source_samples,
                         chunk_size,
-                        **filter_kwargs,
+                        **rollout_kwargs,
                     )
 
                 chunk_step_offset = forecast_step_offset + source_samples.step_offset
@@ -525,6 +548,8 @@ class Trainer(TrainerBase):
                         rollout_idx,
                         latent_filter=latent_filter,
                         latent_filter_prev=source_samples.latent_filter_prev,
+                        land_cells=land_cells,
+                        land_cells_init=source_samples.land_cells_init,
                     )
 
                 chunk_pbar.update(1)
