@@ -29,6 +29,20 @@ linear  (TEST 2) free rollout (bf16 autocast, as the inference) to day N, then t
         Leading eigenvectors are mapped to latent cells and decoded:
         (D(z + a v) - D(z - a v)) / 2a.
         -> OUT/linear_TAG_dN.json, OUT/linear_TAG_dN.npz
+
+traj    free rollout (bf16 autocast) for --day D days, latent only; per day n: |z_n|, the
+        relative first/second differences, the cosine of consecutive increments (all cells,
+        ocean cells, land cells), the forcing injection |F_in(z_n) - z_n| / |z_n| of the
+        step n -> n+1, and the per-cell token RMS on land vs ocean cells (HEALPix cells
+        without vs with a mesh node). -> OUT/traj_TAG.json, OUT/traj_TAG.npz (cell maps)
+        With test_config.forecast.land_cells set (freeze | no_forcing, see
+        weathergen/model/land_cells.py) the rollout applies it, and the forcing statistics
+        are those of the forcing as applied (no_forcing: zero on land cells).
+
+Stream layouts: the fesom_vars layout (TEMP, SALT, U, V, SURFACE) and the older
+FESOM_NODE / FESOM_ELEM layout (e.g. frcwin03, levels to 450 m). gain and traj (latent
+only) work with both; encdec needs the fesom_vars layout (31 levels, mesh wet mask); linear
+and baseline select the node stream(s) of the layout but were run only on fesom_vars models.
 """
 
 import argparse
@@ -48,12 +62,15 @@ import weathergen.common.config as config  # noqa: E402
 import weathergen.model.attention as att_mod  # noqa: E402
 import weathergen.utils.cli as cli  # noqa: E402
 from weathergen.common.logger import init_loggers  # noqa: E402
+from weathergen.model.land_cells import LandCells  # noqa: E402
 from weathergen.model.model import ModelOutput  # noqa: E402
 from weathergen.train.trainer import Trainer  # noqa: E402
 
 logger = logging.getLogger("instab_probe")
 
-STREAMS = ("TEMP", "SALT", "SURFACE")
+STREAMS = ("TEMP", "SALT", "SURFACE")  # node streams of the fesom_vars layout
+OLD_STREAMS = ("FESOM_NODE",)  # node stream of the FESOM_NODE / FESOM_ELEM layout
+MESH_PATH = "/work/ab0995/a270225/atmorep_data/multiverse/core2/original/cycle_1/fesom.mesh.diag.nc"
 MAP_CHANNELS = ("temp_2", "temp_75", "temp_125", "temp_450", "temp_975", "temp_2035",
                 "salt_2", "salt_75", "salt_125", "salt_450", "ssh")
 EIG_MAP_CHANNELS = ("salt_75", "salt_125", "temp_75", "temp_2", "temp_450", "ssh")
@@ -97,7 +114,35 @@ def set_fe_attention_dtype(model, dtype):
     return n
 
 
-# ── geometry ─────────────────────────────────────────────────────────────────────────
+# ── layout and geometry ──────────────────────────────────────────────────────────────
+def node_streams(cf):
+    """Decoded node streams of the model's stream layout."""
+    if "TEMP" in cf.streams:
+        return STREAMS
+    if "FESOM_NODE" in cf.streams:
+        return OLD_STREAMS
+    raise ValueError(f"unknown stream layout: {list(cf.streams)}")
+
+
+def mesh_path(cf):
+    return cf.streams[node_streams(cf)[0]].get("mesh_path", MESH_PATH)
+
+
+def ocean_cells(level, path=MESH_PATH):
+    """True for the HEALPix cells (nested) holding at least one mesh node; the others are
+    land cells without ocean data (same definition as report_test2.ocean_cells)."""
+    from astropy_healpix import healpy as ahp
+    from paper_eval.meshtools import load_mesh
+
+    mesh = load_mesh(path)
+    theta = np.radians(90.0 - mesh.lat)
+    phi = np.radians(180.0 + mesh.lon)
+    pix = ahp.ang2pix(2**level, theta, phi, nest=True)
+    has = np.zeros(12 * 4**level, bool)
+    has[pix] = True
+    return has
+
+
 def geometry(mesh_path):
     import diag_fvars_year as dfy
 
@@ -163,7 +208,7 @@ def to_node_order(batch, step, stream, pred):
             target.float().cpu().numpy().astype(np.float64), coords)
 
 
-def decode(model, model_params, z, src, step, streams=STREAMS, autocast=True):
+def decode(model, model_params, z, src, step, streams, autocast=True):
     out = ModelOutput(1, batch=src)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast):
         model.predict_decoders(model_params, 0, step, z, src, out)
@@ -233,6 +278,8 @@ def column_stats(geo, f):
 def probe_encdec(tr, batch, args):
     ds, model, mp, dev = tr.dataset_val, tr.model, tr.model_params, tr.device
     K = args.steps
+    if node_streams(tr.cf) != STREAMS:
+        raise ValueError("encdec needs the fesom_vars stream layout")
     geo, _ = geometry(tr.cf.streams["TEMP"]["mesh_path"])
     materialize_targets(ds, batch, (0, 1), dev)
     materialize_targets(ds, batch, (1, K + 1), dev)
@@ -242,7 +289,7 @@ def probe_encdec(tr, batch, args):
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         tokens, _ = model.encoder(mp, src)
         tokens = tokens.reshape((len(src), src.get_num_source_steps(), *tokens.shape[1:])).sum(1)
-    preds = [decode(model, mp, tokens, src, 0)]
+    preds = [decode(model, mp, tokens, src, 0, STREAMS)]
     latents = [tokens]
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         out = model(mp, src, K)
@@ -454,15 +501,16 @@ def probe_linear(tr, batch, args):
         (stem.with_suffix(".json")).write_text(json.dumps(res, indent=1, default=float))
 
     # residuals and sensitivity of the eigenpairs; latent and decoded structure
-    geo, dfy = geometry(tr.cf.streams["TEMP"]["mesh_path"])
+    streams = node_streams(tr.cf)
+    geo, dfy = geometry(mesh_path(tr.cf))
     cell_lat, cell_lon = healpix_cell_latlon(tr.cf.healpix_level)
     n_cells = 12 * 4**tr.cf.healpix_level
     materialize_targets(ds, batch, (day, day + 1), dev)
-    stats = {s: stream_stats(ds, s) for s in STREAMS}
-    base = decode(model, mp, z, src, day)
+    stats = {s: stream_stats(ds, s) for s in streams}
+    base = decode(model, mp, z, src, day, streams)
     npz = {"cell_lat": cell_lat, "cell_lon": cell_lon}
     # decoded state at day N (node order), for the comparison with the stored rollout output
-    for s in STREAMS:
+    for s in streams:
         chans, mean, std = stats[s]
         pn, tn, _ = to_node_order(batch, day, s, base[s])
         for c in ("salt_75", "temp_2", "ssh"):
@@ -519,10 +567,10 @@ def probe_linear(tr, batch, args):
         resp_first = None
         for alpha in args.alphas:
             a = alpha * float(znorm)
-            dp = decode(model, mp, z + a * vrn, src, day)
-            dm = decode(model, mp, z - a * vrn, src, day)
+            dp = decode(model, mp, z + a * vrn, src, day, streams)
+            dm = decode(model, mp, z - a * vrn, src, day, streams)
             resp = {}
-            for s in STREAMS:
+            for s in streams:
                 chans, mean, std = stats[s]
                 rp, _, _ = to_node_order(batch, day, s, dp[s])
                 rm, _, _ = to_node_order(batch, day, s, dm[s])
@@ -587,12 +635,13 @@ def probe_baseline(tr, batch, args):
     del zs
     torch.cuda.empty_cache()
     src = batch.get_source_samples()
-    geo, dfy = geometry(tr.cf.streams["TEMP"]["mesh_path"])
+    streams = node_streams(tr.cf)
+    geo, dfy = geometry(mesh_path(tr.cf))
     basin = dfy.basins(geo.lon, geo.lat)
     cell_lat, _ = healpix_cell_latlon(tr.cf.healpix_level)
     n_cells = 12 * 4**tr.cf.healpix_level
     materialize_targets(ds, batch, (day, day + 1), dev)
-    stats = {s: stream_stats(ds, s) for s in STREAMS}
+    stats = {s: stream_stats(ds, s) for s in streams}
     znorm = float(z.norm())
     res = {"tag": args.tag, "day": day, "z_norm": znorm, "directions": {}}
     for name, v in dirs.items():
@@ -604,10 +653,10 @@ def probe_baseline(tr, batch, args):
         info["decoded"] = {}
         for alpha in args.alphas:
             a = alpha * znorm
-            dp = decode(model, mp, z + a * vn, src, day)
-            dm = decode(model, mp, z - a * vn, src, day)
+            dp = decode(model, mp, z + a * vn, src, day, streams)
+            dm = decode(model, mp, z - a * vn, src, day, streams)
             per_ch, regions = {}, {}
-            for s in STREAMS:
+            for s in streams:
                 chans, mean, std = stats[s]
                 rp, _, _ = to_node_order(batch, day, s, dp[s])
                 rm, _, _ = to_node_order(batch, day, s, dm[s])
@@ -647,6 +696,13 @@ def probe_gain(tr, batch, args):
     out_dir.mkdir(parents=True, exist_ok=True)
     zs = rollout_to_day(tr, batch, day + 1)
     z = zs[day].float()
+    traj = {"n": [], "d1_rel": [], "cos_consecutive_increments": []}
+    for k in range(max(3, day - 3), day + 2):
+        inc1, inc0 = (zs[k] - zs[k - 1]).float(), (zs[k - 1] - zs[k - 2]).float()
+        traj["n"].append(k)
+        traj["d1_rel"].append(float(inc1.norm() / zs[k].float().norm()))
+        traj["cos_consecutive_increments"].append(
+            float((inc1 * inc0).sum() / (inc1.norm() * inc0.norm())))
     dirs = {"second_difference": (zs[day + 1] - 2 * zs[day] + zs[day - 1]).float(),
             "increment": (zs[day + 1] - zs[day]).float()}
     for seed in range(3):
@@ -658,7 +714,7 @@ def probe_gain(tr, batch, args):
     src = batch.get_source_samples()
     F = StepMap(model, mp, src, day + 1)
     znorm = float(z.norm())
-    res = {"tag": args.tag, "day": day, "z_norm": znorm}
+    res = {"tag": args.tag, "day": day, "z_norm": znorm, "trajectory": traj}
     with torch.no_grad():
         zin, _ = model.forcing_module(z, F.condition, F.forcing, model.num_aux_tokens)
         res["forcing_injection_rel"] = float((zin - z).norm()) / znorm
@@ -720,6 +776,133 @@ def probe_gain(tr, batch, args):
     (out_dir / f"gain_{args.tag}_d{day:03d}.json").write_text(json.dumps(res, indent=1))
 
 
+def probe_traj(tr, batch, args, chunk=10):
+    """Latent statistics along the free rollout, days 1..D (see the module docstring)."""
+    ds, model, mp, dev = tr.dataset_val, tr.model, tr.model_params, tr.device
+    D = args.day
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    level = tr.cf.healpix_level
+    n_cells = 12 * 4**level
+    ocean_np = ocean_cells(level, mesh_path(tr.cf))
+    ocean = torch.from_numpy(ocean_np).to(dev)
+    land = ~ocean
+    materialize_forcing(ds, batch, (1, D + 2), dev)
+    src = batch.get_source_samples()
+    n_forcing = len(src.forcing) if getattr(src, "forcing", None) is not None else 0
+    save_days = sorted({d for d in (1, 10, 40, 58, 70, 78, 100, 150, 200, 300, 360) if d <= D}
+                       | {D})
+    keys = ("n", "z_norm", "z_rms", "cell_rms_ocean", "cell_rms_land", "cell_meannorm_ocean",
+            "cell_meannorm_land", "d1_rel", "d1_cell_rms_ocean", "d1_cell_rms_land",
+            "d1_land_energy_share", "d2_rel", "d2_land_energy_share", "cos_inc", "cos_inc_ocean",
+            "cos_inc_land", "forcing_rel", "forcing_cell_rms_ocean", "forcing_cell_rms_land",
+            "forcing_land_energy_share")
+    T = {k: [] for k in keys}
+    land_cells = getattr(tr, "land_cells", None)
+    lc_kwargs = {} if land_cells is None else {"land_cells": land_cells}
+    if land_cells is not None:
+        if not np.array_equal(land_cells.land_mask.numpy(), ~ocean_np):
+            raise ValueError("forecast.land_cells mask differs from the probe's land cells")
+        logger.info(f"traj {args.tag}: land cells {land_cells.as_dict()}")
+    npz = {"ocean_cells": ocean_np, "cell_lat": healpix_cell_latlon(level)[0],
+           "cell_lon": healpix_cell_latlon(level)[1]}
+    sum_cell = torch.zeros(n_cells, dtype=torch.float64, device=dev)
+
+    def cell_ms(x):  # per-cell mean square over the token dimension
+        return x.reshape(n_cells, -1).pow(2).mean(-1)
+
+    def cos(a, b):
+        return float((a * b).sum() / (a.norm() * b.norm()))
+
+    def stats(n, z, zm1, zm2):
+        z = z.float()
+        c = cell_ms(z)
+        T["n"].append(n)
+        T["z_norm"].append(float(z.norm()))
+        T["z_rms"].append(float(z.pow(2).mean().sqrt()))
+        T["cell_rms_ocean"].append(float(c[ocean].mean().sqrt()))
+        T["cell_rms_land"].append(float(c[land].mean().sqrt()))
+        T["cell_meannorm_ocean"].append(float(c[ocean].sqrt().mean()))
+        T["cell_meannorm_land"].append(float(c[land].sqrt().mean()))
+        sum_cell.add_(c.sqrt().double())
+        if n in save_days:
+            npz[f"cell_rms_d{n:03d}"] = c.sqrt().cpu().numpy().astype(np.float32)
+        nan = float("nan")
+        if zm1 is not None:
+            i1 = (z - zm1.float())
+            ci = cell_ms(i1)
+            T["d1_rel"].append(float(i1.norm() / z.norm()))
+            T["d1_cell_rms_ocean"].append(float(ci[ocean].mean().sqrt()))
+            T["d1_cell_rms_land"].append(float(ci[land].mean().sqrt()))
+            T["d1_land_energy_share"].append(float(ci[land].sum() / ci.sum()))
+        else:
+            for k in ("d1_rel", "d1_cell_rms_ocean", "d1_cell_rms_land", "d1_land_energy_share"):
+                T[k].append(nan)
+        if zm2 is not None:
+            i0 = (zm1 - zm2).float()
+            d2 = i1 - i0
+            c2 = cell_ms(d2)
+            T["d2_rel"].append(float(d2.norm() / z.norm()))
+            T["d2_land_energy_share"].append(float(c2[land].sum() / c2.sum()))
+            T["cos_inc"].append(cos(i1, i0))
+            a1, a0 = i1.reshape(n_cells, -1), i0.reshape(n_cells, -1)
+            T["cos_inc_ocean"].append(cos(a1[ocean], a0[ocean]))
+            T["cos_inc_land"].append(cos(a1[land], a0[land]))
+            if n in save_days:
+                npz[f"d2_cell_rms_d{n:03d}"] = c2.sqrt().cpu().numpy().astype(np.float32)
+        else:
+            for k in ("d2_rel", "d2_land_energy_share", "cos_inc", "cos_inc_ocean",
+                      "cos_inc_land"):
+                T[k].append(nan)
+        # forcing injection of the step n -> n+1 (forcing / condition index n + 1)
+        fidx = n + 1
+        if fidx < n_forcing and model.forcing_module is not None:
+            # fp32, as forcing_injection_rel of the gain mode
+            with torch.autocast(device_type="cuda", enabled=False):
+                zin, _ = model.forcing_module(z, src.conditions[fidx], src.forcing[fidx],
+                                              model.num_aux_tokens)
+                if land_cells is not None:  # the forcing as applied in the rollout
+                    zin = land_cells.after_forcing(z, zin, model.num_aux_tokens)
+            fi = zin.float() - z
+            cf_ = cell_ms(fi)
+            T["forcing_rel"].append(float(fi.norm() / z.norm()))
+            T["forcing_cell_rms_ocean"].append(float(cf_[ocean].mean().sqrt()))
+            T["forcing_cell_rms_land"].append(float(cf_[land].mean().sqrt()))
+            T["forcing_land_energy_share"].append(float(cf_[land].sum() / cf_.sum()))
+        else:
+            for k in ("forcing_rel", "forcing_cell_rms_ocean", "forcing_cell_rms_land",
+                      "forcing_land_energy_share"):
+                T[k].append(nan)
+
+    t0 = time.time()
+    hist = []  # z_(n-2), z_(n-1)
+    source, done = src, 0
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        while done < D:
+            n = min(chunk, D - done)
+            source = model(mp, source, n, **lc_kwargs)
+            for i in range(n):
+                z = source.latent[i]["latent_state"].z_pre_norm.detach()
+                zm1 = hist[-1] if len(hist) >= 1 else None
+                zm2 = hist[-2] if len(hist) >= 2 else None
+                stats(done + i + 1, z, zm1, zm2)
+                hist = (hist + [z])[-2:]
+            done += n
+            logger.info(f"traj {args.tag}: day {done}, |z| {T['z_norm'][-1]:.1f}, "
+                        f"d1 {T['d1_rel'][-1]:.3f}, cos {T['cos_inc'][-1]:.3f}, "
+                        f"forcing {T['forcing_rel'][-1]:.3f}")
+    npz["cell_rms_mean"] = (sum_cell / D).cpu().numpy().astype(np.float32)
+    res = {"tag": args.tag, "days": D, "seconds": time.time() - t0,
+           "n_cells": n_cells, "n_ocean_cells": int(ocean_np.sum()),
+           "n_land_cells": int((~ocean_np).sum()), "token_dim": int(z.shape[-1]),
+           "z_shape": list(z.shape),
+           "land_cells": None if land_cells is None else land_cells.as_dict(),
+           "trajectory": T}
+    (out_dir / f"traj_{args.tag}.json").write_text(json.dumps(res, indent=1))
+    np.savez_compressed(out_dir / f"traj_{args.tag}.npz", **npz)
+    logger.info(f"traj {args.tag}: written to {out_dir}")
+
+
 class ProbeTrainer(Trainer):
     probe_args = None
 
@@ -728,6 +911,10 @@ class ProbeTrainer(Trainer):
         batch = next(iter(self.data_loader_validation))
         batch.to_device(self.device, include_targets=False)
         args = self.probe_args
+        self.land_cells = LandCells.from_config(
+            mode_cfg.get("forecast", {}).get("land_cells"), self.cf.streams, self.cf.healpix_level)
+        if self.land_cells is not None and args.mode != "traj":
+            raise ValueError("forecast.land_cells is only supported by the traj probe")
         with torch.no_grad():
             if args.mode == "encdec":
                 probe_encdec(self, batch, args)
@@ -735,6 +922,8 @@ class ProbeTrainer(Trainer):
                 probe_baseline(self, batch, args)
             elif args.mode == "gain":
                 probe_gain(self, batch, args)
+            elif args.mode == "traj":
+                probe_traj(self, batch, args)
             else:
                 logger.info(f"FE attention blocks: {set_fe_attention_dtype(self.model, torch.bfloat16)}")
                 probe_linear(self, batch, args)
@@ -742,7 +931,7 @@ class ProbeTrainer(Trainer):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", required=True, choices=["encdec", "linear", "baseline", "gain"])
+    p.add_argument("--mode", required=True, choices=["encdec", "linear", "baseline", "gain", "traj"])
     p.add_argument("--out", required=True)
     p.add_argument("--tag", required=True)
     p.add_argument("--steps", type=int, default=5)

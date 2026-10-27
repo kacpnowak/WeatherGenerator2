@@ -14,8 +14,16 @@
 # Instability probes (scripts/instab/instab_probe.py) with the worktree code, from the main tree.
 #   sbatch --job-name=insenc3 sbatch_instab_probe.sh encdec fvars003 insenc3 "2150-01-01 2209-01-01"
 #   sbatch --job-name=inslin3 sbatch_instab_probe.sh linear fvars003 inslin3 "10 40 70" [probe args]
-# encdec: one probe per initial date (5 decoded steps); linear: one probe per day N of the
-# free rollout from 2209-01-01. Text/data go to $INSTAB_OUT.
+#   sbatch --job-name=instraj sbatch_instab_probe.sh traj frcwin03 instraj "360"
+# encdec: one probe per initial date (5 decoded steps); linear/gain/baseline: one probe per
+# day N of the free rollout from 2209-01-01; traj: one probe per rollout length D (days).
+# Text/data go to $INSTAB_OUT.
+# TGT_STREAMS (space-separated, default "TEMP SALT SURFACE") are the streams whose targets are
+# set to all points; set it empty for the FESOM_NODE/FESOM_ELEM layout (already -1 there).
+# The script also runs with plain `bash` inside an allocation (several probes in one job).
+# WG_EXTRA_OPTS (space-separated, through the environment) appends --options overrides, e.g.
+#   WG_EXTRA_OPTS="test_config.forecast.land_cells.mode=freeze" ... traj fvars003 ... "60" --tag T
+# (probe arguments after the list, here --tag, override the defaults).
 MODE=${1:?mode}; FROM_RUN=${2:?from run}; RUN_ID=${3:?run id}; LIST=${4:?dates or days}
 shift 4
 WT=${WT:-/work/ab0995/a270225/WeatherGenerator2}
@@ -31,7 +39,8 @@ export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True SRUN_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK}
 export PYTHONPATH=$WT/src:$WT/packages/common/src:$WT/packages/readers_extra/src:$WT/packages/evaluate/src:$WT/packages/metrics/src
 echo "Worktree commit: $(git -C $WT rev-parse --short HEAD)"
-TGT=(streams.TEMP.max_num_targets=-1 streams.SALT.max_num_targets=-1 streams.SURFACE.max_num_targets=-1)
+TGT=()
+for s in ${TGT_STREAMS-TEMP SALT SURFACE}; do TGT+=("streams.${s}.max_num_targets=-1"); done
 
 for item in $LIST; do
   if [ "$MODE" = encdec ]; then
@@ -41,6 +50,12 @@ for item in $LIST; do
     opts=(test_config.start_date=${start}T00:00 test_config.end_date=${end}T00:00
           test_config.forecast.num_steps=5 test_config.forecast.chunk_size=1)
     pargs=(--mode encdec --out "$OUT" --tag "$tag" --steps 5)
+  elif [ "$MODE" = traj ]; then
+    day=$item
+    tag=${FROM_RUN}_d${day}
+    opts=(test_config.start_date=2209-01-01T00:00 test_config.end_date=2210-01-02T00:00
+          test_config.forecast.num_steps=$((day + 3)) test_config.forecast.chunk_size=1)
+    pargs=(--mode traj --out "$OUT" --tag "$tag" --day "$day")
   else
     day=$item
     tag=${FROM_RUN}
@@ -50,6 +65,10 @@ for item in $LIST; do
   fi
   opts+=(test_config.samples_per_mini_epoch=1 test_config.output.num_samples=0
          test_config.compute_loss=false "${TGT[@]}")
+  if [ -n "${WG_EXTRA_OPTS:-}" ]; then
+    read -r -a EXTRA <<< "$WG_EXTRA_OPTS"
+    opts+=("${EXTRA[@]}")
+  fi
   date; echo "== $MODE $FROM_RUN $item"
   srun --label .venv/bin/python "$WT/scripts/instab/instab_probe.py" "${pargs[@]}" "$@" -- \
     --from-run-id "$FROM_RUN" -e -1 --run-id "$RUN_ID" --options "${opts[@]}" \
