@@ -43,7 +43,9 @@ from weathergen.model.forcing import (
     forcing_field_is_empty,
     forcing_num_vars_from_cfg,
 )
+from weathergen.model.fe_noise import FeNoise
 from weathergen.model.forcing_scale import ForcingScale
+from weathergen.model.forcing_split import ForcingSplit
 from weathergen.model.land_cells import TOKEN_FORCING_MODES, LandCells
 from weathergen.model.latent_filter import LatentFilter
 from weathergen.model.layers import MLP, NamedLinear
@@ -138,6 +140,13 @@ def rollout_step_range(
     if rollout_steps == batch.get_output_len():
         return first_output_idx, step_offset
     return 0, step_offset + first_output_idx
+
+
+def noisy_forecast_step(forecast_engine, tokens, condition, coords, fe_noise: FeNoise, n: int):
+    """One forecast-engine step with forecast.fe_noise at rollout step n (see fe_noise.py)."""
+    tokens = fe_noise.perturb(tokens, n)
+    with fe_noise.dropout_context(forecast_engine, n, tokens.device):
+        return forecast_engine(tokens, condition, coords=coords)
 
 
 class ModelParams(torch.nn.Module):
@@ -800,6 +809,8 @@ class Model(torch.nn.Module):
         latent_filter: LatentFilter | None = None,
         land_cells: LandCells | None = None,
         forcing_scale: ForcingScale | None = None,
+        forcing_split: ForcingSplit | None = None,
+        fe_noise: FeNoise | None = None,
     ) -> ModelOutput:
         """Forward pass of the model
 
@@ -816,6 +827,13 @@ class Model(torch.nn.Module):
             forcing_scale : optional inference-time scale of the per-step forcing injection
                 (forecast.forcing_scale, see forcing_scale.py); None (the default) runs the
                 unscaled rollout. Not allowed in training mode.
+            forcing_split : optional inference-time split of the additive forcing injection
+                into a constant and an anomaly part, scaled separately (forecast.forcing_split,
+                see forcing_split.py); None (the default) runs the default injection. Not
+                allowed in training mode nor together with forcing_scale.
+            fe_noise : optional inference-time latent noise / dropout at the forecast-engine
+                input (forecast.fe_noise, see fe_noise.py); None (the default) runs the
+                deterministic rollout. Not allowed in training mode.
         Returns:
             A list containing all prediction results
         """
@@ -842,6 +860,20 @@ class Model(torch.nn.Module):
             if self.forcing_module is None or getattr(self.forcing_module, "mode", None) == "none":
                 raise ValueError("forecast.forcing_scale needs a forcing injection to scale")
             forcing_args = (forcing_scale.alpha,)
+        if forcing_split is not None:
+            if self.training:
+                raise ValueError("forecast.forcing_split is an inference-time option, not training")
+            if forcing_scale is not None:
+                raise ValueError(
+                    "forecast.forcing_split and forecast.forcing_scale cannot be combined"
+                )
+            if self.forcing_module is None or getattr(self.forcing_module, "mode", None) != (
+                "additive"
+            ):
+                raise ValueError("forecast.forcing_split needs the additive forcing injection")
+            forcing_args = (1.0, forcing_split)
+        if fe_noise is not None and self.training:
+            raise ValueError("forecast.fe_noise is an inference-time option, not training")
 
         output = ModelOutput(rollout_steps)
         # previous carried latent z_{n-1} for a two-level latent filter
@@ -877,6 +909,10 @@ class Model(torch.nn.Module):
         output.batch = batch_ctx
         output.step_offset = step_offset
         first_step, batch_step_offset = rollout_step_range(batch_ctx, rollout_steps, step_offset)
+        if fe_noise is not None:
+            # rollout step n = step + noise_step_offset, n = 0 for the rollout's first step
+            out_idxs = batch_ctx.get_output_idxs() if batch_ctx is not None else []
+            noise_step_offset = batch_step_offset - (out_idxs[0] if len(out_idxs) > 0 else 0)
 
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
@@ -922,9 +958,19 @@ class Model(torch.nn.Module):
                             )
                             if land_cells is not None:
                                 tokens = land_cells.after_forcing(z_in, tokens, self.num_aux_tokens)
-                        tokens = self.forecast_engine(
-                            tokens, condition, coords=model_params.rope_coords
-                        )
+                        if fe_noise is None:
+                            tokens = self.forecast_engine(
+                                tokens, condition, coords=model_params.rope_coords
+                            )
+                        else:
+                            tokens = noisy_forecast_step(
+                                self.forecast_engine,
+                                tokens,
+                                condition,
+                                model_params.rope_coords,
+                                fe_noise,
+                                step + noise_step_offset,
+                            )
                         if land_cells is not None:
                             tokens = land_cells.after_step(tokens, land_init, self.num_aux_tokens)
                     # autocast caches the low-precision copies of fp32 weights it casts; cast
@@ -951,7 +997,19 @@ class Model(torch.nn.Module):
                     if land_cells is not None:
                         tokens = land_cells.after_forcing(z_cur, tokens, self.num_aux_tokens)
                 prev_tokens = tokens if self.compute_cos_sim_to_prev else None
-                tokens = self.forecast_engine(tokens, condition, coords=model_params.rope_coords)
+                if fe_noise is None:
+                    tokens = self.forecast_engine(
+                        tokens, condition, coords=model_params.rope_coords
+                    )
+                else:
+                    tokens = noisy_forecast_step(
+                        self.forecast_engine,
+                        tokens,
+                        condition,
+                        model_params.rope_coords,
+                        fe_noise,
+                        step + noise_step_offset,
+                    )
 
                 # per-token cosine similarity between current and previous patch tokens,
                 # consumed by LossLatent (cosine-band regulariser)

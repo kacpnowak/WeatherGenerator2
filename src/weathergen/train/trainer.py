@@ -28,7 +28,9 @@ from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.ema import EMAModel
 from weathergen.model.engines import LatentState
+from weathergen.model.fe_noise import FeNoise
 from weathergen.model.forcing_scale import ForcingScale
+from weathergen.model.forcing_split import ForcingSplit
 from weathergen.model.land_cells import LandCells
 from weathergen.model.latent_filter import LatentFilter
 from weathergen.model.model import ModelOutput
@@ -296,6 +298,8 @@ class Trainer(TrainerBase):
         land_cells: LandCells | None = None,
         land_cells_init: torch.Tensor | None = None,
         forcing_scale: ForcingScale | None = None,
+        forcing_split: ForcingSplit | None = None,
+        fe_noise: FeNoise | None = None,
     ):
         """
         Persist the state needed to resume a long rollout after this chunk.
@@ -308,7 +312,8 @@ class Trainer(TrainerBase):
         (forecast.latent_filter) its configuration and, for a two-level filter, the previous
         carried latent are saved too, so the resumed rollout continues the filtered one.
         Likewise with forecast.land_cells: its setting and, for freeze, the land tokens of the
-        initial latent; and with forecast.forcing_scale: its setting.
+        initial latent; and with forecast.forcing_scale, forecast.forcing_split and
+        forecast.fe_noise: their settings.
         """
 
         def to_cpu(t):
@@ -337,6 +342,10 @@ class Trainer(TrainerBase):
             state["land_cells_init"] = to_cpu(land_cells_init)
         if forcing_scale is not None:
             state["forcing_scale"] = forcing_scale.as_dict()
+        if forcing_split is not None:
+            state["forcing_split"] = forcing_split.as_dict()
+        if fe_noise is not None:
+            state["fe_noise"] = fe_noise.as_dict()
         torch.save(state, tmp)
         tmp.replace(path)
 
@@ -426,6 +435,20 @@ class Trainer(TrainerBase):
         if forcing_scale is not None:
             rollout_kwargs["forcing_scale"] = forcing_scale
             logger.info(f"Forcing scale for this rollout: {forcing_scale.as_dict()}")
+        # optional inference-time split of the forcing injection; unset leaves it unchanged
+        forcing_split = ForcingSplit.from_config(forecast_cfg.get("forcing_split"))
+        if forcing_split is not None:
+            if forcing_scale is not None:
+                raise ValueError(
+                    "forecast.forcing_split and forecast.forcing_scale cannot be combined"
+                )
+            rollout_kwargs["forcing_split"] = forcing_split
+            logger.info(f"Forcing split for this rollout: {forcing_split.as_dict()}")
+        # optional inference-time noise / dropout at the FE input; unset leaves it unchanged
+        fe_noise = FeNoise.from_config(forecast_cfg.get("fe_noise"))
+        if fe_noise is not None:
+            rollout_kwargs["fe_noise"] = fe_noise
+            logger.info(f"FE noise for this rollout: {fe_noise.as_dict()}")
 
         cum_steps = 0
         chunk_start = 0
@@ -446,6 +469,8 @@ class Trainer(TrainerBase):
                 self._check_resume_setting(resumed, "latent_filter", latent_filter)
                 self._check_resume_setting(resumed, "land_cells", land_cells)
                 self._check_resume_setting(resumed, "forcing_scale", forcing_scale)
+                self._check_resume_setting(resumed, "forcing_split", forcing_split)
+                self._check_resume_setting(resumed, "fe_noise", fe_noise)
                 cum_steps = done
                 # seed the rollout from the saved latent at the completed step offset; an empty
                 # physical list makes the model resume at exactly `done` steps
@@ -561,6 +586,8 @@ class Trainer(TrainerBase):
                         land_cells=land_cells,
                         land_cells_init=source_samples.land_cells_init,
                         forcing_scale=forcing_scale,
+                        forcing_split=forcing_split,
+                        fe_noise=fe_noise,
                     )
 
                 chunk_pbar.update(1)

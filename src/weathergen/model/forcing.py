@@ -455,6 +455,7 @@ class ForcingInjection(nn.Module):
         forcing_field: torch.Tensor,
         num_aux: int,
         scale: float = 1.0,
+        split=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
@@ -472,6 +473,11 @@ class ForcingInjection(nn.Module):
             Multiplier of the gate, i.e. of the injected residual (inference-time
             ``forecast.forcing_scale``, see forcing_scale.py). 1.0 (the default) uses the gate
             parameter itself, so the result is exactly the unscaled one.
+        split :
+            Optional `ForcingSplit` (inference-time ``forecast.forcing_split``, see
+            forcing_split.py): the additive injection ``f = gate * emb`` is replaced by
+            ``alpha_const * C + alpha_anom * (f - C)``. Additive mode only. None (the default)
+            leaves the injection unchanged.
 
         Returns
         -------
@@ -483,8 +489,16 @@ class ForcingInjection(nn.Module):
         cell_emb = self._cell_emb(forcing_field, tokens.dtype)  # (num_cells, dim)
         gate = self.gate if scale == 1.0 else self.gate * scale
 
+        if split is not None and self.mode != "additive":
+            raise ValueError(
+                f"forecast.forcing_split needs the additive forcing injection, not {self.mode!r}"
+            )
+
         if self.mode == "additive":
-            patch = tokens[:, num_aux:] + gate * cell_emb
+            injection = gate * cell_emb
+            if split is not None:
+                injection = split.apply(injection)
+            patch = tokens[:, num_aux:] + injection
             tokens = torch.cat([tokens[:, :num_aux], patch], dim=1)
         elif self.mode == "cross_attn":
             q = self.norm_q(tokens[:, num_aux:])  # (B, num_cells, dim)
