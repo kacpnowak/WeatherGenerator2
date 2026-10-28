@@ -78,14 +78,21 @@ class DecompTrainer(Trainer):
         out_dir = Path(args.out)
         out_dir.mkdir(parents=True, exist_ok=True)
         level = self.cf.healpix_level
-        land = land_cell_mask(self.cf.streams, level)
+        try:
+            land = land_cell_mask(self.cf.streams, level)
+            res_mask = "land_cells.land_cell_mask"
+        except ValueError:
+            # old-lineage stream layout (FESOM_NODE / FESOM_ELEM) without mesh_path: the
+            # CORE2 mesh of instab_probe (the same 2863 land cells at level 5)
+            land = ~ip.ocean_cells(level, ip.mesh_path(self.cf))
+            res_mask = "instab_probe.ocean_cells"
         n_cells = len(land)
         masks = {"all": np.ones(n_cells, bool), "land": land, "ocean": ~land}
         masks_t = {c: torch.from_numpy(m).to(dev) for c, m in masks.items()}
         na = model.num_aux_tokens
         res = {"tag": args.tag, "days": D, "roll_days": R, "num_cells": n_cells,
                "num_land": int(land.sum()), "num_aux": int(na),
-               "gate": float(fm.gate.detach().float().cpu())}
+               "gate": float(fm.gate.detach().float().cpu()), "land_mask_from": res_mask}
         logger.info(f"{args.tag}: gate {res['gate']:+.5f}, land cells {res['num_land']}")
         t0 = time.time()
         with torch.no_grad():
