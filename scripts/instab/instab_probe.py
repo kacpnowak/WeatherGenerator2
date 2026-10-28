@@ -38,6 +38,10 @@ traj    free rollout (bf16 autocast) for --day D days, latent only; per day n: |
         With test_config.forecast.land_cells set (freeze | no_forcing, see
         weathergen/model/land_cells.py) the rollout applies it, and the forcing statistics
         are those of the forcing as applied (no_forcing: zero on land cells).
+        Cumulative forcing F_n = sum_{k<=n} f_k (f_k: injection of the step k-1 -> k; f_1 is
+        taken at z_1, exact for the additive mode, whose f does not depend on z): |f_n|,
+        |F_n|, |F_n| / |z_n|, the coherence |F_n| / sum_k |f_k| (1: one fixed direction,
+        ~n^-1/2: independent steps), cos(f_n, F_(n-1)) and the land share of |F_n|^2.
 
 Stream layouts: the fesom_vars layout (TEMP, SALT, U, V, SURFACE) and the older
 FESOM_NODE / FESOM_ELEM layout (e.g. frcwin03, levels to 450 m). gain and traj (latent
@@ -796,8 +800,10 @@ def probe_traj(tr, batch, args, chunk=10):
             "cell_meannorm_land", "d1_rel", "d1_cell_rms_ocean", "d1_cell_rms_land",
             "d1_land_energy_share", "d2_rel", "d2_land_energy_share", "cos_inc", "cos_inc_ocean",
             "cos_inc_land", "forcing_rel", "forcing_cell_rms_ocean", "forcing_cell_rms_land",
-            "forcing_land_energy_share")
+            "forcing_land_energy_share", "f_norm", "F_cum_norm", "F_cum_rel", "F_coherence",
+            "cos_f_Fprev", "F_cum_land_energy_share")
     T = {k: [] for k in keys}
+    cum = {"F": None, "f_sum": 0.0, "f_next": None}  # F_n, sum_k |f_k|, f_(n+1)
     land_cells = getattr(tr, "land_cells", None)
     lc_kwargs = {} if land_cells is None else {"land_cells": land_cells}
     if land_cells is not None:
@@ -854,16 +860,39 @@ def probe_traj(tr, batch, args, chunk=10):
             for k in ("d2_rel", "d2_land_energy_share", "cos_inc", "cos_inc_ocean",
                       "cos_inc_land"):
                 T[k].append(nan)
-        # forcing injection of the step n -> n+1 (forcing / condition index n + 1)
-        fidx = n + 1
-        if fidx < n_forcing and model.forcing_module is not None:
-            # fp32, as forcing_injection_rel of the gain mode
+        def injection(fidx):  # fp32, as forcing_injection_rel of the gain mode
             with torch.autocast(device_type="cuda", enabled=False):
                 zin, _ = model.forcing_module(z, src.conditions[fidx], src.forcing[fidx],
                                               model.num_aux_tokens)
                 if land_cells is not None:  # the forcing as applied in the rollout
                     zin = land_cells.after_forcing(z, zin, model.num_aux_tokens)
-            fi = zin.float() - z
+            return zin.float() - z
+
+        # cumulative forcing F_n = F_(n-1) + f_n, f_n of the step n-1 -> n
+        has_forcing = model.forcing_module is not None and n_forcing > 1
+        f_n = (injection(1) if n == 1 else cum["f_next"]) if has_forcing else None
+        if f_n is not None:
+            F_prev = cum["F"]
+            T["cos_f_Fprev"].append(nan if F_prev is None else cos(f_n, F_prev))
+            cum["F"] = f_n.clone() if F_prev is None else F_prev + f_n
+            cum["f_sum"] += float(f_n.norm())
+            Fn = cum["F"]
+            cF = cell_ms(Fn)
+            T["f_norm"].append(float(f_n.norm()))
+            T["F_cum_norm"].append(float(Fn.norm()))
+            T["F_cum_rel"].append(float(Fn.norm() / z.norm()))
+            T["F_coherence"].append(float(Fn.norm()) / cum["f_sum"])
+            T["F_cum_land_energy_share"].append(float(cF[land].sum() / cF.sum()))
+        else:
+            for k in ("f_norm", "F_cum_norm", "F_cum_rel", "F_coherence", "cos_f_Fprev",
+                      "F_cum_land_energy_share"):
+                T[k].append(nan)
+        cum["f_next"] = None
+        # forcing injection of the step n -> n+1 (forcing / condition index n + 1)
+        fidx = n + 1
+        if fidx < n_forcing and model.forcing_module is not None:
+            fi = injection(fidx)
+            cum["f_next"] = fi
             cf_ = cell_ms(fi)
             T["forcing_rel"].append(float(fi.norm() / z.norm()))
             T["forcing_cell_rms_ocean"].append(float(cf_[ocean].mean().sqrt()))
