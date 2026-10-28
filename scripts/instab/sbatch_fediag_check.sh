@@ -27,7 +27,10 @@
 #   fdchk7  freeze, fe_noise token_rms 1e-3 steps first, chunk 2 (runs, differs from lcfz003)
 #   fdchk8  freeze, forcing_split + forcing_scale            -> must refuse
 #   fdchk9  no_forcing, forcing_split (1, 0.5), 2 steps      (runs)
-# CONST: the forcing_split constant (C of fvars003). WT selects the code.
+# CONST: the forcing_split constant (C of fvars003). WT selects the code. Each srun writes
+# output/fediag_check_ID_STEPS_N_JOBID.txt, N its position in the job (two refused resumes of a
+# run share ID and STEPS). ONLY_REFUSALS=1 runs only the four refused resumes and fdchk8, on
+# the rollout states left by a full check.
 WT=${WT:-/work/ab0995/a270225/WeatherGenerator2}
 CONST=${CONST:-/home/a/a270225/claude_api_tools/fable_diag/D1/data/C_fvars003_2209-01-01.pt}
 module purge
@@ -45,6 +48,7 @@ echo "Worktree commit: $(git -C $WT rev-parse --short HEAD)"
 split() { echo "test_config.forecast.forcing_split.const_path=$CONST test_config.forecast.forcing_split.alpha_const=$1 test_config.forecast.forcing_split.alpha_anom=$2"; }
 noise() { echo "test_config.forecast.fe_noise.mode=$1 test_config.forecast.fe_noise.std=$2 test_config.forecast.fe_noise.dropout=$3 test_config.forecast.fe_noise.seed=$4 test_config.forecast.fe_noise.steps=$5"; }
 
+N=0
 run() {  # RUN_ID NUM_STEPS CHUNK LAND(freeze | no_forcing | none) [EXTRA OPTIONS...]
   local id=$1 steps=$2 chunk=$3 land=$4
   shift 4
@@ -61,11 +65,22 @@ run() {  # RUN_ID NUM_STEPS CHUNK LAND(freeze | no_forcing | none) [EXTRA OPTION
            "test_config.forecast.land_cells.expected_num_land_cells=2863")
   fi
   opts+=($@)
+  N=$((N + 1))
   date; echo "== $id steps=$steps chunk=$chunk land_cells=$land extra: $*"
   srun --label .venv/bin/inference --from-run-id fvars003 -e -1 --run-id "$id" \
-    --options "${opts[@]}" > "output/fediag_check_${id}_${steps}_${SLURM_JOBID}.txt" 2>&1 < /dev/null
+    --options "${opts[@]}" > "output/fediag_check_${id}_${steps}_${N}_${SLURM_JOBID}.txt" 2>&1 < /dev/null
   echo "srun exit code: $?"
 }
+
+if [ "${ONLY_REFUSALS:-0}" = 1 ]; then
+  run fdchk3 8 2 freeze $(split 1.0 1.5)
+  run fdchk3 8 2 freeze
+  run fdchk6 8 2 none $(noise train_like 0.0001 true 1 all)
+  run fdchk6 8 2 none
+  run fdchk8 2 2 freeze $(split 1.0 0.5) test_config.forecast.forcing_scale=0.5
+  date
+  exit 0
+fi
 
 run fdchk0 6 2 none
 run fdchk1 6 2 freeze
