@@ -1,0 +1,36 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Continue fvars003 with stage 3's recipe unchanged except for the latent noise of the forecast
+# engine, which is switched off. ForecastingEngine.forward adds
+# randn * torch.norm(tokens) * fe_impute_latent_noise_std in training only; torch.norm is the norm
+# of the whole latent (~5e3), so 1e-4 gave a per-entry std of ~0.5 x the token RMS. fvars003 is
+# stable in training-mode rollouts and with that noise at inference, and blows up after ~78 days
+# in deterministic inference. Fresh schedule (general.istep=0 on the command line).
+
+fe_impute_latent_noise_std: 0.0
+
+training_config:
+  num_mini_epochs: 10
+  samples_per_mini_epoch: 2048
+  learning_rate_scheduling:
+    lr_start: 1e-6
+    lr_max: 1e-5
+    lr_final_decay: 2e-6
+    lr_final: 0.0
+    num_steps_warmup: 256
+    num_steps_cooldown: 512
+  forecast:
+    num_steps: 15
+    prefix_steps: [0, 90]
+
+freeze_modules: ""
+
+validation_config:
+  samples_per_mini_epoch: 256
