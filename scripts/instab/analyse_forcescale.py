@@ -58,10 +58,16 @@ def path(run):
     return PATHS.get(run, DATA) / f"part1_daily_{run}.nc"
 
 
-def compute(runs, workers):
-    ams.DATA = DATA
-    DATA.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=DATA) as tmp:
+def ext_dir(max_lead):
+    """Series of runs extended beyond 150 days (capped at `max_lead`)."""
+    return DATA / f"lead{max_lead}"
+
+
+def compute(runs, workers, max_lead=150):
+    ams.DATA = DATA if max_lead == 150 else ext_dir(max_lead)
+    ams.MAX_LEAD = max_lead
+    ams.DATA.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=ams.DATA) as tmp:
         for r in runs:
             ams.compute(r, workers, tmp)
 
@@ -125,7 +131,8 @@ def readout(ms, dss, lines):
                          + f" | {max(rel) - min(rel):.3f} | - | {monotonic(np.array(rel))} |")
         on = rows["onset salt_75>0.5"][0]
         ef = rows["e-fold 30-80"][0]
-        big = [n for n in ("onset salt_75>0.5", "e-fold (20-0.3 crossing)", "e-fold 30-80")
+        big = [n for n in ("onset salt_75>0.5", "onset temp_2>2", "e-fold (20-0.3 crossing)",
+                           "e-fold 30-80")
                if monotonic(rows[n][0]) and np.ptp(rows[n][0]) > 30]
         d15_ok = all(abs(r - 1) <= 0.10 for c in ("salt_75", "temp_2") for r in d15[c])
         verdict[s] = (big, d15_ok, on, ef)
@@ -135,6 +142,30 @@ def readout(ms, dss, lines):
             "smaller alpha -> earlier onset" if on[0] < on[-1] else "no change")
         lines.append(f"- {s}: monotonic changes > 30 d: {big or 'none'}; day-15 salt_75/temp_2 "
                      f"RMSE within 10 % of alpha=1 for all alpha: {d15_ok}; onset trend: {sign}.")
+    lines.append("")
+
+
+def extension(lines, max_lead=363):
+    """RMSE and onset of the runs extended to `max_lead` days, if any."""
+    files = sorted(ext_dir(max_lead).glob("part1_daily_*.nc"))
+    if not files:
+        return
+    days = (150, 180, 240, 300, max_lead)
+    lines += [f"## Runs extended to {max_lead} days", "",
+              "| run | max lead | onset salt_75>0.5 | onset temp_2>2 | e-fold (window) | "
+              + " | ".join(f"salt_75 d{d}" for d in days) + " | "
+              + " | ".join(f"temp_2 d{d}" for d in days) + " |",
+              "|---|---|---|---|---|" + "---|" * (2 * len(days))]
+    for f in files:
+        ds = xr.open_dataset(f)
+        x = ams.metrics(ds)
+        top = int(ds.lead.max())
+        cells = [f"{float(ds.rmse.sel(channel=c, lead=d)):.3g}" if d <= top else "-"
+                 for c in ("salt_75", "temp_2") for d in days]
+        on = {k: str(x[k]) if x[k] is not None else f"none<={top}" for k in ("on_s75", "on_t2")}
+        lines.append(f"| {f.stem.removeprefix('part1_daily_')} | {top} | {on['on_s75']} "
+                     f"| {on['on_t2']} | {x['efold']:.1f} d (20-{x['ef_win'][1]}) | "
+                     + " | ".join(cells) + " |")
     lines.append("")
 
 
@@ -204,6 +235,7 @@ def report():
                                  + " | ".join(f.format(v) for v in ms[(a, s)][key]) + " |")
         lines.append("")
     readout(ms, dss, lines)
+    extension(lines)
     figures(dss, ms, ref)
     txt = "\n".join(lines) + "\n"
     (OUT / "tables.md").write_text(txt)
@@ -277,9 +309,10 @@ def main():
     p.add_argument("cmd", choices=["compute", "report"])
     p.add_argument("runs", nargs="*")
     p.add_argument("--workers", type=int, default=12)
+    p.add_argument("--max-lead", type=int, default=150)
     a = p.parse_args()
     if a.cmd == "compute":
-        compute(a.runs, a.workers)
+        compute(a.runs, a.workers, a.max_lead)
     else:
         report()
 
