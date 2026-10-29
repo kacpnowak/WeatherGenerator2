@@ -12,6 +12,13 @@ analyse_forcescale.py does.
 
 compute  daily series of a run (analyse_multistart.compute) -> OUT/data/part1_daily_RUN.nc
 report   tables -> OUT/{D1,D2,D9}/tables.md, figures -> paper_eval/figures/fable_diag/
+
+Year-long runs (YEAR: train_like-noise runs from 2209 / 2150 / 2200, 363 days):
+    ... analyse_fediag.py compute nztl09 nztl50 nztl00 --max-lead 363
+    ... analyse_fediag.py report YEAR
+compute --max-lead N writes OUT/data/leadN/ and stores the climatology RMSE every 5 days up to
+N (and at N); report YEAR -> OUT/YEAR_NOISE/tables.md and figure year_noise_rmse.png.
+The climatology is the 2180-2209 day-of-year climatology, looked up at each valid date.
 References: lcfz003 (freeze, landcells/data), yr1fv003 (default, multistart/data) and the
 forcing_scale runs fs050y09 / fs075y09 / fs125y09 (forcescale/data).
 """
@@ -69,6 +76,20 @@ REF_DIRS = {"lcfz003": Path("/home/a/a270225/claude_api_tools/landcells/data"),
             "yr1fv003": ams.DATA,
             **{r: Path("/home/a/a270225/claude_api_tools/forcescale/data")
                for r in ("fs050y09", "fs075y09", "fs125y09")}}
+#: year-long train_like-noise runs: run -> (start, deterministic reference of that start)
+YEAR = {"nztl09": ("2209-01-01", "yr1fv003"),
+        "nztl50": ("2150-01-01", "ms3a2150"),
+        "nztl00": ("2200-01-01", "ms3a2200")}
+YEAR_LEAD = 363
+YEAR_DAYS = (1, 15, 30, 60, 90, 150, 240, 363)
+YEAR_CLIM_DAYS = (30, 60, 90, 150, 240, 363)
+#: 363-day series of the deterministic 2209 run (diag_yr1; no climatology columns) and of the
+#: old lineage's year (oldlineage_series.py; rmse only)
+YEAR_REF = {"yr1fv003": Path("/home/a/a270225/claude_api_tools/diag_yr1/part1_daily_yr1fv003.nc"),
+            "yr1win03": Path("/home/a/a270225/claude_api_tools/oldlineage/data/"
+                             "series_yr1win03.nc")}
+for _r, (_s, _) in YEAR.items():
+    ams.RUNS.setdefault(_r, ("3", _s, "real"))
 _ALL = [r for r, _ in D1 + D2] + [r for v in D9.values() for r, _ in v]
 for _r in _ALL:
     ams.RUNS.setdefault(_r, ("3", START, "real"))
@@ -78,11 +99,14 @@ def path(run):
     return REF_DIRS.get(run, DATA) / f"part1_daily_{run}.nc"
 
 
-def compute(runs, workers):
-    ams.DATA = DATA
-    ams.MAX_LEAD = 150
-    DATA.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=DATA) as tmp:
+def compute(runs, workers, max_lead=150):
+    ams.DATA = DATA if max_lead == 150 else DATA / f"lead{max_lead}"
+    ams.MAX_LEAD = max_lead
+    if max_lead > 150:
+        # read by clim_extra in the (forked) workers
+        ams.CLIM_LEADS = {1} | set(range(5, max_lead + 1, 5)) | {max_lead}
+    ams.DATA.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=ams.DATA) as tmp:
         for r in runs:
             if r in REF_DIRS:
                 raise ValueError(f"{r} is a reference run, scored elsewhere")
@@ -295,27 +319,180 @@ def report_d9(lines):
            "D9: fvars003, token_rms 1e-3 noise at the first forecast step, 3 seeds")
 
 
+def _fmt_on(v, top):
+    return f"none<={top}" if v is None else str(int(v))
+
+
+def report_year(lines):
+    """Year-long train_like-noise runs vs the deterministic runs of the same start and yr1win03."""
+    top = YEAR_LEAD
+    ydir = DATA / f"lead{top}"
+    dss, ms = {}, {}
+    for r in YEAR:
+        p = ydir / f"part1_daily_{r}.nc"
+        if p.exists():
+            dss[r] = xr.open_dataset(p)
+            ms[r] = ams.metrics(dss[r])
+    for r, p in YEAR_REF.items():
+        if p.exists():
+            dss[r] = xr.open_dataset(p)
+    for _, (_, ref) in YEAR.items():
+        if ref not in dss and (REF_DIRS["yr1fv003"] / f"part1_daily_{ref}.nc").exists():
+            dss[ref] = xr.open_dataset(REF_DIRS["yr1fv003"] / f"part1_daily_{ref}.nc")
+    if "yr1fv003" in dss:
+        ms["yr1fv003"] = ams.metrics(dss["yr1fv003"])
+    for _, ref in YEAR.values():
+        if ref in dss and ref not in ms:
+            ms[ref] = ams.metrics(dss[ref])
+    clim_src = {"yr1fv003": "nztl09", "yr1win03": "nztl09", "nztl09": "nztl09",
+                "ms3a2150": "ms3a2150", "ms3a2200": "ms3a2200", "nztl50": "nztl50",
+                "nztl00": "nztl00"}
+    order = []
+    for r, (st, ref) in YEAR.items():
+        order += [(r, st, "train_like 1e-4, no dropout"), (ref, st, "deterministic default [ref]")]
+    order.append(("yr1win03", "2209-01-01", "old lineage (frcwin03), deterministic [ref]"))
+
+    def val(r, c, d):
+        ds = dss.get(r)
+        if ds is None or d > int(ds.lead.max()):
+            return np.nan
+        return float(ds.rmse.sel(channel=c, lead=d)) * (1e3 if c == "ssh" else 1.0)
+
+    def clim(r, c, d):
+        ds = dss.get(clim_src[r])
+        if ds is None or f"clim_rmse_{c}" not in ds or d > int(ds.lead.max()):
+            return np.nan
+        return float(ds[f"clim_rmse_{c}"].sel(lead=d)) * (1e3 if c == "ssh" else 1.0)
+
+    # truth identity of the references that borrow nztl09's climatology RMSE
+    chk = []
+    for r in ("yr1fv003",):
+        if r in dss and "nztl09" in dss:
+            a, b = dss[r], dss["nztl09"]
+            n = min(int(a.lead.max()), int(b.lead.max()))
+            ta = a.truth.sel(lead=slice(1, n)).values
+            tb = b.truth.sel(lead=slice(1, n), quantity=a.quantity).values
+            chk.append(f"{r} vs nztl09 truth (global means, leads 1-{n}): max |diff| = "
+                       f"{float(np.nanmax(np.abs(ta - tb))):.3g}")
+    lines += [f"# Year-long inference with train_like latent noise (fvars003, {top} days)", "",
+              "forecast.fe_noise mode train_like, std 1e-4, no dropout, every step, seed 0, no "
+              "land freeze. Deterministic references: yr1fv003 (2209, 363 d), ms3a2150 / ms3a2200 "
+              "(150 d only). Old lineage: yr1win03 (frcwin03, 2209, 363 d, series from "
+              "oldlineage_series.py). Climatology = 2180-2209 day-of-year climatology vs the "
+              "same truth; references from 2209 use nztl09's climatology RMSE (same truth).", ""]
+    if chk:
+        lines += [f"- {x}" for x in chk] + [""]
+    lines += ["## Onset, growth, alternation", "",
+              "| run | start | setting | max lead | onset salt_75>0.5 | onset temp_2>2 "
+              "| e-fold 20-0.3 (R2) | e-fold 30-80 | ac1 salt_75 err (window) | ac1 hc err "
+              "| hp hc (ZJ) | n non-finite |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for r, st, lab in order:
+        if r not in dss:
+            continue
+        ds = dss[r]
+        ml = int(ds.lead.max())
+        if r in ms:
+            x = ms[r]
+            ef = (f"{x['efold']:.1f}{'' if x['d03'] else ' (no 0.3 crossing)'} "
+                  f"({x['ef_r2']:.2f})")
+            nnf = int(np.nansum(ds.n_nonfinite_pred_wet.values))
+            lines.append(f"| {r} | {st} | {lab} | {ml} | {_fmt_on(x['on_s75'], ml)} "
+                         f"| {_fmt_on(x['on_t2'], ml)} | {ef} | {x['efold3080']:.1f} "
+                         f"| {x['ac1_s75']:.2f} ({x['pre_win'][0]}-{x['pre_win'][1]}) "
+                         f"| {x['ac1_hc']:.2f} | {x['hp_hc']:.3g} | {nnf} |")
+        else:
+            lead = ds.lead.values
+            o75 = af.first_exceed(ds.rmse.sel(channel="salt_75").values, lead, 0.5)
+            ot2 = af.first_exceed(ds.rmse.sel(channel="temp_2").values, lead, 2.0)
+            lines.append(f"| {r} | {st} | {lab} | {ml} | {_fmt_on(o75, ml)} | {_fmt_on(ot2, ml)} "
+                         "| - | - | - | - | - | - |")
+    lines.append("")
+    for c in CH:
+        unit = "mm" if c == "ssh" else ("K" if c.startswith("temp") else "psu")
+        lines += [f"## RMSE {c} ({unit})", "",
+                  "| run | start | " + " | ".join(f"d{d}" for d in YEAR_DAYS) + " |",
+                  "|---|---|" + "---|" * len(YEAR_DAYS)]
+        for r, st, _ in order:
+            if r in dss and c in dss[r].channel.values:
+                lines.append(f"| {r} | {st} | " + " | ".join(
+                    ams.fmt(val(r, c, d)) for d in YEAR_DAYS) + " |")
+        for st, src in (("2209-01-01", "nztl09"), ("2150-01-01", "nztl50"),
+                        ("2200-01-01", "nztl00")):
+            if src in dss:
+                lines.append(f"| (clim) | {st} | " + " | ".join(
+                    ams.fmt(clim(src, c, d)) for d in YEAR_DAYS) + " |")
+        lines.append("")
+    lines += ["## RMSE / climatology RMSE", ""]
+    for c in ("salt_75", "temp_2", "ssh", "salt_2"):
+        lines += [f"### {c}", "", "| run | start | " + " | ".join(
+            f"d{d}" for d in YEAR_CLIM_DAYS) + " |", "|---|---|" + "---|" * len(YEAR_CLIM_DAYS)]
+        for r, st, _ in order:
+            if r in dss and c in dss[r].channel.values:
+                q = [val(r, c, d) / clim(r, c, d) for d in YEAR_CLIM_DAYS]
+                lines.append(f"| {r} | {st} | " + " | ".join(
+                    f"{v:.2f}" if np.isfinite(v) else "-" for v in q) + " |")
+        lines.append("")
+    # figure: RMSE vs lead with the climatology level
+    cols = {"2209-01-01": "tab:purple", "2150-01-01": "tab:green", "2200-01-01": "tab:orange"}
+    fig, axs = plt.subplots(1, 3, figsize=(17, 4.6), constrained_layout=True)
+    for ax, c in zip(axs, ("salt_75", "temp_2", "ssh"), strict=True):
+        sc = 1e3 if c == "ssh" else 1.0
+        for r, st, lab in order:
+            if r not in dss or c not in dss[r].channel.values:
+                continue
+            ds = dss[r]
+            if r == "yr1win03":
+                sty = {"color": "0.35", "lw": 1.1, "ls": "-."}
+            elif r in YEAR:
+                sty = {"color": cols[st], "lw": 1.6}
+            else:
+                sty = {"color": cols[st], "lw": 1.0, "ls": "--"}
+            ax.semilogy(ds.lead, ds.rmse.sel(channel=c) * sc, label=f"{r} ({st[:4]}): {lab}",
+                        **sty)
+        for st, src in (("2209-01-01", "nztl09"), ("2150-01-01", "nztl50"),
+                        ("2200-01-01", "nztl00")):
+            if src in dss:
+                cl = dss[src][f"clim_rmse_{c}"].dropna("lead")
+                ax.plot(cl.lead, cl * sc, color=cols[st], lw=0.9, ls=":",
+                        label=f"climatology ({st[:4]})")
+        ax.set_title(f"RMSE {c}" + (" (mm)" if c == "ssh" else " (psu)" if "salt" in c
+                                    else " (K)"))
+        ax.set_xlabel("lead (days)")
+        ax.grid(alpha=0.3)
+    axs[0].legend(fontsize=7)
+    fig.suptitle("fvars003, train_like latent noise 1e-4 (solid) vs deterministic (dashed), "
+                 "old lineage yr1win03 (dash-dot); dotted: 2180-2209 day-of-year climatology")
+    fig.savefig(FIG / "year_noise_rmse.png", dpi=120)
+    plt.close(fig)
+
+
 def report(which):
     FIG.mkdir(parents=True, exist_ok=True)
-    for name, fn in (("D1", report_d1), ("D2", report_d2), ("D9", report_d9)):
+    for name, fn in (("D1", report_d1), ("D2", report_d2), ("D9", report_d9),
+                     ("YEAR", report_year)):
+        if name == "YEAR" and name not in (which or []):
+            continue
         if which and name not in which:
             continue
         lines = []
         fn(lines)
         txt = "\n".join(lines) + "\n"
-        (OUT / name).mkdir(parents=True, exist_ok=True)
-        (OUT / name / "tables.md").write_text(txt)
+        d = OUT / ("YEAR_NOISE" if name == "YEAR" else name)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "tables.md").write_text(txt)
         print(txt)  # noqa: T201
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("cmd", choices=["compute", "report"])
-    p.add_argument("runs", nargs="*", help="compute: run ids; report: D1 / D2 / D9 (default all)")
+    p.add_argument("runs", nargs="*",
+                   help="compute: run ids; report: D1 / D2 / D9 (default all) / YEAR")
     p.add_argument("--workers", type=int, default=12)
+    p.add_argument("--max-lead", type=int, default=150)
     a = p.parse_args()
     if a.cmd == "compute":
-        compute(a.runs, a.workers)
+        compute(a.runs, a.workers, a.max_lead)
     else:
         report(a.runs)
 
