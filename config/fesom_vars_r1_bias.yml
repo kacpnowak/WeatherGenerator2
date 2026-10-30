@@ -13,10 +13,10 @@
 # mean_error_sq penalises the squared error of the weighted mean of each channel over the valid
 # points, so a systematic drift of the field mean (the slow component of a long rollout) is
 # punished directly, where MSE sees it only as a small part of the pointwise error. The weight
-# is meant to make the term about 10 % of the MSE term; R is the ratio
-# sum_c w_c * mean_error_sq_c / sum_c w_c * mse_c measured with weight 1.0 in a 20-step probe,
-# and weight = 0.1 / R.
-# PLACEHOLDER: weight 1.0 until the probe has run (R not measured yet).
+# makes the term about 10 % of the MSE term: R, the ratio
+# sum_c w_c * mean_error_sq_c / sum_c w_c * mse_c, was 4.6e-3 in a 20-step probe with weight 1.0,
+# and weight = 0.1 / R. That share is an overall one, dominated by U and V: per stream the term
+# is about 108 % of the MSE term of TEMP, 36 % of SURFACE, 21 % of SALT, 14 % of U and 2 % of V.
 
 training_config:
   losses:
@@ -27,4 +27,4 @@ training_config:
           window: 128
           L: 20.0
         mean_error_sq:
-          weight: 1.0
+          weight: 22.0
