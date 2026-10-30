@@ -1,0 +1,18 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Run A of long-rollout round 1 (fvdrop01), layered on fesom_vars_stage3.yml and
+# fesom_vars_r1_base.yml: forecasting-engine dropout off. Everything else is run C's stage 3.
+#
+# With the latent noise off (base overlay), dropout is the last train-only perturbation on the
+# rollout path: it is active on every forecast step, also in the no-grad spin-up, and absent at
+# inference. Without it the training forward pass matches inference, so the states the model
+# learns to roll out are the states it meets in a free rollout.
+
+fe_dropout_rate: 0.0

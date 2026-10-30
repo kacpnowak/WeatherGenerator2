@@ -1,0 +1,26 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Run B of long-rollout round 1 (fvspin01): spin-up of up to a year, i.e. 0-365 days without
+# gradients before each 15-day supervised window (stage 3 has 0-90). Applied on a fork of run C:
+#   train_continue --from-run-id fvctrl01 -e 1 --run-id fvspin01 \
+#       --config <mesh overlay> config/fesom_vars_r1_spin.yml
+# so the saved config it inherits already has the latent noise off, and this file does not
+# repeat the base overlay.
+#
+# Why a fork and not a run from fvars002: fvars002's weights are unstable in clean rollouts, so
+# a spin-up from the first step would supervise blown-up states. B branches from C's chkpt00001
+# (istep 512, two mini-epochs done) once C has passed the rollout stability gate, keeping the
+# step counter, schedule and optimizer state. It shares C's first two mini-epochs and differs
+# from C from then on. Its sample order also differs slightly, because start dates must leave
+# room for the longer spin-up.
+
+training_config:
+  forecast:
+    prefix_steps: [0, 365]

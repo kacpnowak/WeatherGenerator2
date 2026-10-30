@@ -1,0 +1,30 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Run D of long-rollout round 1 (fvbias01), layered on fesom_vars_stage3.yml and
+# fesom_vars_r1_base.yml: a squared mean-error (bias) term next to the MSE.
+#
+# mean_error_sq penalises the squared error of the weighted mean of each channel over the valid
+# points, so a systematic drift of the field mean (the slow component of a long rollout) is
+# punished directly, where MSE sees it only as a small part of the pointwise error. The weight
+# is meant to make the term about 10 % of the MSE term; R is the ratio
+# sum_c w_c * mean_error_sq_c / sum_c w_c * mse_c measured with weight 1.0 in a 20-step probe,
+# and weight = 0.1 / R.
+# PLACEHOLDER: weight 1.0 until the probe has run (R not measured yet).
+
+training_config:
+  losses:
+    physical:
+      loss_fcts:
+        mse: {}
+        dynamic_loss:
+          window: 128
+          L: 20.0
+        mean_error_sq:
+          weight: 1.0
