@@ -10,7 +10,9 @@ error by area over the wet points (`meshtools`).
     python -m paper_eval.rollout_gate --results-dir <dir> --mini-epoch 0 \
         --archive <ifs-fesom>/ocean_node --mesh <ifs-fesom>/fesom.mesh.diag.nc --every 10
 
-Exit status 0 when the gate passes, 1 when it fails.
+Exit status 0 when the gate passes, 1 when it fails. A rollout that stops before
+`--min-lead` (default 120 days, past the days 50-80 blow-up window) fails, so a crashed run
+cannot pass. Finiteness is checked at every lead, the SST RMSE at every `--every`-th.
 """
 
 import argparse
@@ -31,21 +33,39 @@ STREAMS = ("TEMP", "SALT", "SURFACE", "U", "V")
 
 
 def gate_verdict(
-    leads: NDArray, sst_rmse: NDArray, all_finite: bool, max_sst_rmse: float = 3.0
+    leads: NDArray,
+    sst_rmse: NDArray,
+    all_finite: bool,
+    max_sst_rmse: float = 3.0,
+    min_lead: int = 120,
+    nonfinite: str = "",
 ) -> tuple[bool, str]:
-    """Pass iff every output is finite and every SST RMSE is finite and below `max_sst_rmse`.
+    """Pass iff the rollout reaches `min_lead`, every output is finite and every SST RMSE is
+    finite and below `max_sst_rmse`.
 
-    The message names the first failing lead (an RMSE at exactly the threshold fails).
+    A short (crashed or killed) rollout must not pass vacuously, so an empty series or one
+    whose last lead is below `min_lead` fails first. The message names the first failing
+    lead (an RMSE at exactly the threshold fails); `nonfinite` says where a prediction was
+    not finite (e.g. "stream SALT, lead 7").
     """
     leads = np.asarray(leads)
     rmse = np.asarray(sst_rmse, dtype=np.float64)
+    if leads.size == 0:
+        return False, f"FAIL: no leads checked (a rollout of at least {min_lead} leads is required)"
+    if int(leads.max()) < min_lead:
+        short = min_lead - int(leads.max())
+        return False, (
+            f"FAIL: rollout stops at lead {int(leads.max())}, {short} short of the required "
+            f"{min_lead}"
+        )
     bad = ~(np.isfinite(rmse) & (rmse < max_sst_rmse))
     if bad.any():
         i = int(np.argmax(bad))
         what = "not finite" if not np.isfinite(rmse[i]) else f"not below {max_sst_rmse:g}"
         return False, f"FAIL: SST RMSE {rmse[i]:.3g} {what} at lead {int(leads[i])}"
     if not all_finite:
-        return False, "FAIL: a prediction is not finite"
+        where = f" ({nonfinite})" if nonfinite else ""
+        return False, f"FAIL: a prediction is not finite{where}"
     return True, f"PASS: all outputs finite, SST RMSE below {max_sst_rmse:g} at every lead"
 
 
@@ -111,7 +131,8 @@ def _available_leads(root, sample: int, stream: str) -> list[int]:
 
 
 def run_gate(args: argparse.Namespace) -> tuple[bool, list[str]]:
-    """Open the rollout, score the selected leads, return (passed, report lines)."""
+    """Open the rollout, check finiteness at every lead and the SST RMSE at the selected
+    leads, return (passed, report lines)."""
     root = open_merged_ranks(args.results_dir, args.mini_epoch)
     store = root.store
     samples = list(store.samples) if args.samples is None else list(args.samples)
@@ -119,23 +140,32 @@ def run_gate(args: argparse.Namespace) -> tuple[bool, list[str]]:
     truth = TruthArchive(args.archive)
     channel = args.channel
 
-    leads = select_leads(_available_leads(root, samples[0], args.stream), args.every)
-    if not leads:
-        raise ValueError(f"no predictions for stream {args.stream!r} in {args.results_dir}")
+    # Leads every sample has: a rollout that died early leaves fewer, and the gate says so.
+    common = set.intersection(*(set(_available_leads(root, s, args.stream)) for s in samples))
+    all_leads = sorted(common)
+    leads = select_leads(all_leads, args.every)
 
     # The mesh decides wet and dry, as everywhere in paper_eval.
     mask, w = masks_and_weights(mesh, "node", [channel])
     wet, area = mask[0], w[0]
     points = PointIndex(full_point_coords(root, samples[0], args.stream))
 
+    # Finite at every lead, not only the scored ones: a blow-up can fall between them.
+    nonfinite = ""
+    bad_lead: dict[int, bool] = {}
+    for lead in all_leads:
+        for s in samples:
+            for stream in args.streams:
+                data = np.asarray(root[f"{s}/{stream}/{lead}/prediction"]["data"])
+                if not np.isfinite(data).all():
+                    bad_lead[lead] = True
+                    nonfinite = nonfinite or f"stream {stream}, lead {lead}, sample {s}"
+        if nonfinite:
+            break  # the first non-finite lead is enough
+
     sst_rmse = np.full(len(leads), -np.inf)
-    finite = np.ones(len(leads), dtype=bool)
     for s in samples:
         for j, lead in enumerate(leads):
-            for stream in args.streams:
-                pred = root[f"{s}/{stream}/{lead}/prediction"]
-                if not np.isfinite(np.asarray(pred["data"])).all():
-                    finite[j] = False
             group = root[f"{s}/{args.stream}/{lead}/prediction"]
             ch = list(group.attrs["channels"]).index(channel)
             field = np.asarray(group["data"][:, ch, 0])
@@ -147,10 +177,18 @@ def run_gate(args: argparse.Namespace) -> tuple[bool, list[str]]:
             sst_rmse[j] = r if np.isnan(r) or np.isnan(sst_rmse[j]) else max(sst_rmse[j], r)
 
     lines = [
-        f"lead {lead:4d}  {channel} RMSE {sst_rmse[j]:8.4f}  all streams finite: {bool(finite[j])}"
+        f"lead {lead:4d}  {channel} RMSE {sst_rmse[j]:8.4f}"
+        f"  streams finite: {not bad_lead.get(lead, False)}"
         for j, lead in enumerate(leads)
     ]
-    ok, msg = gate_verdict(np.array(leads), sst_rmse, bool(finite.all()), args.max_sst_rmse)
+    ok, msg = gate_verdict(
+        np.array(leads),
+        sst_rmse,
+        not nonfinite,
+        args.max_sst_rmse,
+        args.min_lead,
+        nonfinite,
+    )
     return ok, [*lines, msg]
 
 
@@ -174,6 +212,9 @@ def main(argv: list[str] | None = None) -> int:
         "--samples", type=int, nargs="+", default=None, help="global sample ids (default all)"
     )
     p.add_argument("--max-sst-rmse", type=float, default=3.0)
+    p.add_argument(
+        "--min-lead", type=int, default=120, help="fail if the rollout stops before this lead"
+    )
     args = p.parse_args(argv)
 
     ok, lines = run_gate(args)

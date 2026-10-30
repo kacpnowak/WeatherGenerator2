@@ -127,9 +127,9 @@ exact (<1e-9).
 
 For every `--every`-th lead (and the last) it prints the area-weighted wet-point RMSE of
 `temp_2` (TEMP stream) against the ocean_node archive at `init + lead` days, and whether
-every prediction of TEMP, SALT, SURFACE, U and V is finite. Exits nonzero unless all are
-finite and every RMSE is below `--max-sst-rmse` (3.0). Run it on a rollout long enough to
-pass the days 50-80 window in which the earlier fvars models blew up (120 days).
+every prediction of TEMP, SALT, SURFACE, U and V is finite. Finiteness is checked at every lead. Exits nonzero unless all are
+finite, every RMSE is below `--max-sst-rmse` (3.0) and the rollout reaches `--min-lead`
+(120: past the days 50-80 window in which the earlier fvars models blew up).
 
 ### d. Stage-1 full run
 
