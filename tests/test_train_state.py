@@ -3,6 +3,7 @@
 import inspect
 from pathlib import Path
 
+import numpy as np
 import torch
 from omegaconf import OmegaConf
 
@@ -78,6 +79,14 @@ def test_optimizer_round_trip(tmp_path):
         for key in ("exp_avg", "exp_avg_sq", "step"):
             assert torch.equal(restored[key], saved[key]), key
     assert not list(tmp_path.glob("*_tmp*"))
+
+
+def test_scheduler_numpy_hyperparameters_load(tmp_path):
+    # the lr scheduler leaves numpy scalars in the param groups, and they get saved with them
+    model, optimizer = _stepped_optimizer(lr=np.float64(1e-3))
+    path = train_state_path(tmp_path, "run", -1)
+    save_train_state(path, gather_optimizer_state(model, optimizer), {}, 7)
+    assert load_train_state(path)["istep"] == 7
 
 
 def test_restore_keeps_hyperparameters_of_the_new_run(tmp_path):

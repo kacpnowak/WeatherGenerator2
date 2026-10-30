@@ -89,4 +89,5 @@ def load_train_state(path: Path) -> dict | None:
             f"No training state at {path}: the optimizer and dynamic-loss state start afresh."
         )
         return None
-    return torch.load(path, map_location=torch.device("cpu"), mmap=True, weights_only=True)
+    # not weights_only: the param groups hold the numpy scalars the lr scheduler left there
+    return torch.load(path, map_location=torch.device("cpu"), mmap=True, weights_only=False)
