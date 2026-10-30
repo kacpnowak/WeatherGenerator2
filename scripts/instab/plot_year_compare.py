@@ -2,7 +2,8 @@
 layout of paper_eval/figures/f363_compare (12 channel panels + channel-mean RMSE ratio).
 
 Compares fvars003 with training-like latent noise at inference (nztl09/nztl50/nztl00),
-fvars003 deterministic (yr1fv003) and the old lineage (yr1win03). Old-lineage channels
+fvars003 deterministic (yr1fv003), the no-noise fine-tune fvnn003 (fvnn1y09) and the old
+lineage (yr1win03). Old-lineage channels
 are looked up by name, sst/sss standing in for temp_2/salt_2 where missing. Curves that
 blow up are clipped to the axes of the bounded runs.
 
@@ -31,6 +32,7 @@ C = style._CATEGORICAL
 YEAR_RUNS = {
     "nztl09": ("fvars003 + training-like latent noise (nztl09)", C[0], 2209),
     "yr1fv003": ("fvars003, deterministic (yr1fv003)", C[1], 2209),
+    "fvnn1y09": ("no-noise fine-tune, mini-epoch 1, deterministic (fvnn1y09)", C[4], 2209),
     "yr1win03": ("old lineage, frcwin03 (yr1win03)", C[3], 2209),
 }
 START_RUNS = {
@@ -91,7 +93,7 @@ def channel_figure(runs: dict, scores: dict, title: str, per_run_clim: bool, out
     if per_run_clim:
         handles.append(plt.Line2D([], [], color="#3d3c38", ls="--", lw=1.0))
         labels.append("climatology 2180–2209 (dashed, run colour)")
-    labels = [l + " — off scale after blow-up" if "deterministic" in l else l for l in labels]
+    labels = [l + " — off scale after blow-up" if "yr1fv003" in l else l for l in labels]
     fig.legend(handles, labels, loc="lower center", ncol=2, bbox_to_anchor=(0.5, -0.05))
     fig.suptitle(title, x=0.01, ha="left")
     for ext in ("png", "pdf"):
@@ -123,7 +125,7 @@ def ratio_figure(runs: dict, scores: dict, out: Path):
         ax.set_title(f"{desc}, levels to 450 m ({len(common)} channels)", loc="left")
     axes[0].set_ylabel("RMSE / climatology RMSE")
     handles, labels = axes[0].get_legend_handles_labels()
-    labels = [l + " — off scale after blow-up" if "deterministic" in l else l for l in labels]
+    labels = [l + " — off scale after blow-up" if "yr1fv003" in l else l for l in labels]
     fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.12))
     fig.suptitle("RMSE relative to climatology, channel mean (below 1 = better than climatology)",
                  x=0.01, ha="left")

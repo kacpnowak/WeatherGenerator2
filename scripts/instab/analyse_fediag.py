@@ -91,7 +91,8 @@ YEAR_REF = {"yr1fv003": Path("/home/a/a270225/claude_api_tools/diag_yr1/part1_da
 for _r, (_s, _) in YEAR.items():
     ams.RUNS.setdefault(_r, ("3", _s, "real"))
 #: deterministic 2209 rollouts of the no-noise fine-tune fvnn003 (fe_impute_latent_noise_std 0)
-NONOISE = [("fvnn0e0", "fvnn003 mini-epoch 0, deterministic")]
+NONOISE = [("fvnn0e0", "fvnn003 mini-epoch 0, deterministic"),
+           ("fvnn1y09", "fvnn003 mini-epoch 1, deterministic, 363 d")]
 _ALL = [r for r, _ in D1 + D2 + NONOISE] + [r for v in D9.values() for r, _ in v]
 for _r in _ALL:
     ams.RUNS.setdefault(_r, ("3", START, "real"))
