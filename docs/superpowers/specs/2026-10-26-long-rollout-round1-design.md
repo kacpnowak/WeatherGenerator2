@@ -2,6 +2,46 @@
 
 Date: 2026-10-26. Branch base: `kacpnowak/develop/forcings` (never rebase onto develop).
 
+## Amendment 2026-10-30: latent-noise blow-up
+
+This section overrides anything below that disagrees with it.
+
+**What happened on Levante:** free rollouts of the fvars models blew up at about days 50-80.
+Cause: `fe_impute_latent_noise_std: 1e-4` adds `randn * ||tokens|| * std` per forecast step in
+training only (`src/weathergen/model/engines.py`). The norm is over the whole latent, so this
+is about 50 % of each token's RMS: the model learned to work on heavily noised latents and ran
+in an untrained state once the noise was gone. Fix on Levante: `fvnn003`, fvars003 fine-tuned
+with the noise off (same 15-day rollouts, 0-90-day spin-up, lr 1e-5) for two mini-epochs of
+about 2,048 samples; its one-year deterministic rollout from 2209 (`fvnn1y09`) stayed stable.
+
+**Audit of this code base:** on each forecast step exactly two things differ between training
+and inference: that noise, and forecasting-engine dropout (`fe_dropout_rate`, also active
+during no-grad spin-up). The forcing module has no dropout; `pushforward` is off.
+
+**Consequences for this round:**
+
+1. Every run has the noise off (`config/fesom_vars_r1_base.yml`:
+   `fe_impute_latent_noise_std: 0.0`). Without this all four would inherit 1e-4 from fvars002.
+2. fvars003 is no longer a reference: it blows up. The stable reference is `fvnn003`, and its
+   9-year rollout replaces fvars003's. Run C stays the pairwise baseline for A, B and D.
+3. Run A's case is stronger: with the noise gone, dropout is the last train-only perturbation
+   on the rollout path, so A is the first run whose training forward pass matches inference.
+4. Run B forks from run C. fvars002's weights are unstable in clean rollouts, so a 0-365-day
+   spin-up from the first step would supervise blown-up states. B instead branches from C's
+   `chkpt00001` (`istep` 512, two mini-epochs done) once C has passed the stability gate:
+   `train_continue --from-run-id fvctrl01 -e 1 --run-id fvspin01 --config
+   config/fesom_vars_r1_spin.yml`, keeping the step counter, schedule and optimizer state.
+   It shares C's first two mini-epochs and differs from C from then on. Its sample order also
+   differs slightly, because start dates must leave room for the longer spin-up.
+5. Stability gate: 15-day training and validation windows did not reveal the blow-up, so no
+   model counts until a clean free rollout passes. The gate is a 120-day rollout, past the
+   blow-up window: every output finite and SST RMSE against truth below 3 degC at every lead.
+   C is gated at `chkpt00001` before B is started; every model is gated at the end, before its
+   9-year rollout.
+6. Rollouts and starts from Levante-era configs need the JUPITER mesh path: `mesh_path` in a
+   saved run config survives `train_continue` and `inference` (the private config replaces
+   the data paths only). A private overlay `hpc/jupiter/config/fesom_mesh_jupiter.yml` sets it.
+
 ## Intent
 
 fvars003 (per-variable FESOM streams, IFS-forced, three-stage from-scratch retrain) is not

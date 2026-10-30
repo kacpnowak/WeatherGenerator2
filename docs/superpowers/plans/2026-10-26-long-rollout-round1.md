@@ -35,6 +35,17 @@
 - Resume exactly at a mini-epoch boundary and resume after the last mini-epoch: expected no skip / no training and a clean exit. Test in Task 2.
 - Run D's term on targets with NaN (dry points) and on a channel whose targets are all NaN: expected NaNs ignored, an all-NaN channel contributes 0 and never NaN. Test in Task 4.
 
+## Amendment 2026-10-30 (latent-noise blow-up; see the spec's amendment)
+
+Overrides the task text below where they disagree.
+
+- `config/fesom_vars_r1_base.yml` (`fe_impute_latent_noise_std: 0.0`) goes on every run, after `config/fesom_vars_stage3.yml` and before the run's own overlay.
+- `../WeatherGenerator-private/hpc/jupiter/config/fesom_mesh_jupiter.yml` sets `streams.{TEMP,SALT,U,V,SURFACE}.mesh_path` to the JUPITER mesh; the training start and the rollout both pass it with `--config`.
+- Task 5: `NCCL_DEBUG=WARN`; the smoke runs with the base overlay. New script mode `WG_FORK_FROM="<run> <mini_epoch>"`: `train_continue --from-run-id <run> -e <mini_epoch> --run-id $WG_RUN_ID --config <mesh overlay> $WG_OVERLAY`, without `general.istep=0`.
+- Task 6: bias overlay and `fesom_vars_r1_spin.yml` are checked against stage 3 + base. New `paper_eval/rollout_gate.py`: the gate of the spec's amendment, with a unit test on synthetic data.
+- Task 7: start A, C and D from fvars002. Gate C at `chkpt00001` (`-e 1`, istep 512: file names count from 0, the file after two mini-epochs is `chkpt00001`). Only then fork B. No fvars003 rollout.
+- Task 8-9: the 9-year reference is `fvnn003` (`r9nn003`), not fvars003; each model passes the end-of-training gate before its 9-year rollout. Needs Levante: the fvnn003 checkpoint and the climatology zarrs.
+
 ---
 
 ### Task 0: Branch, Levante commits and JUPITER paths
