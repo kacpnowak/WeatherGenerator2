@@ -89,6 +89,32 @@ def test_scheduler_numpy_hyperparameters_load(tmp_path):
     assert load_train_state(path)["istep"] == 7
 
 
+def test_restore_parameters_that_never_had_a_gradient(tmp_path):
+    # no AdamW state to save for those: the encoder after a spin-up, parameters nothing uses
+    def build():
+        torch.manual_seed(0)
+        layers = {"used": torch.nn.Linear(3, 2), "unused": torch.nn.Linear(3, 2)}
+        model = torch.nn.ModuleDict(layers)
+        return model, torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    model, optimizer = build()
+    model["used"](torch.randn(4, 3)).square().sum().backward()
+    optimizer.step()
+    path = train_state_path(tmp_path, "run", -1)
+    save_train_state(path, gather_optimizer_state(model, optimizer), {}, 7)
+    assert len(optimizer.state) == 2
+
+    fresh_model, fresh = build()
+    load_optimizer_state(fresh_model, fresh, load_train_state(path)["optimizer"])
+
+    saved, restored = optimizer.state[model["used"].weight], fresh.state[fresh_model["used"].weight]
+    for key in ("exp_avg", "exp_avg_sq", "step"):
+        assert torch.equal(restored[key], saved[key]), key
+    unused = fresh.state[fresh_model["unused"].weight]
+    assert unused["step"] == 0
+    assert not unused["exp_avg"].any() and not unused["exp_avg_sq"].any()
+
+
 def test_restore_keeps_hyperparameters_of_the_new_run(tmp_path):
     # lr comes from the scheduler and betas from the total batch size of the continued run
     model, optimizer = _stepped_optimizer(lr=1e-3, betas=(0.9, 0.95))

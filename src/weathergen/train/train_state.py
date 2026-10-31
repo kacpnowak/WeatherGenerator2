@@ -48,6 +48,23 @@ def gather_optimizer_state(model: torch.nn.Module, optimizer: torch.optim.Optimi
     return get_optimizer_state_dict(model, optimizer, options=options)
 
 
+def _with_all_parameters(model: torch.nn.Module, optimizer_state: dict) -> dict:
+    """
+    AdamW has state only for parameters that have had a gradient (with a spin-up the encoder gets
+    one only in batches without spin-up), but set_optimizer_state_dict asks for every trainable
+    parameter. The others get the state AdamW would start them with.
+    """
+    state = dict(optimizer_state["state"])
+    for name, param in model.named_parameters():
+        if param.requires_grad and name not in state:
+            state[name] = {
+                "step": torch.tensor(0.0),
+                "exp_avg": torch.zeros(param.shape, dtype=param.dtype),
+                "exp_avg_sq": torch.zeros(param.shape, dtype=param.dtype),
+            }
+    return {**optimizer_state, "state": state}
+
+
 def load_optimizer_state(
     model: torch.nn.Module, optimizer: torch.optim.Optimizer, optimizer_state: dict
 ) -> None:
@@ -64,6 +81,8 @@ def load_optimizer_state(
         {key: value for key, value in group.items() if key != "params"}
         for group in optimizer.param_groups
     ]
+    if optimizer_state:
+        optimizer_state = _with_all_parameters(model, optimizer_state)
     options = StateDictOptions(
         full_state_dict=True, broadcast_from_rank0=torch.distributed.is_initialized()
     )
