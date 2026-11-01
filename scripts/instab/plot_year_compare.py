@@ -2,8 +2,8 @@
 layout of paper_eval/figures/f363_compare (12 channel panels + channel-mean RMSE ratio).
 
 Compares fvars003 with training-like latent noise at inference (nztl09/nztl50/nztl00),
-fvars003 deterministic (yr1fv003), the no-noise fine-tune fvnn003 (fvnn1y09) and the old
-lineage (yr1win03). Old-lineage channels
+fvars003 deterministic (yr1fv003), the no-noise fine-tune fvnn003 (fvnn1y09 mini-epoch 1;
+fvnnf09/fvnnf00 final checkpoint) and the old lineage (yr1win03). Old-lineage channels
 are looked up by name, sst/sss standing in for temp_2/salt_2 where missing. Curves that
 blow up are clipped to the axes of the bounded runs.
 
@@ -33,7 +33,12 @@ YEAR_RUNS = {
     "nztl09": ("fvars003 + training-like latent noise (nztl09)", C[0], 2209),
     "yr1fv003": ("fvars003, deterministic (yr1fv003)", C[1], 2209),
     "fvnn1y09": ("no-noise fine-tune, mini-epoch 1, deterministic (fvnn1y09)", C[4], 2209),
+    "fvnnf09": ("no-noise fine-tune, final checkpoint, deterministic (fvnnf09)", C[5], 2209),
     "yr1win03": ("old lineage, frcwin03 (yr1win03)", C[3], 2209),
+}
+RUNS_2200 = {
+    "nztl00": ("fvars003 + training-like latent noise (nztl00)", C[0], 2200),
+    "fvnnf00": ("no-noise fine-tune, final checkpoint, deterministic (fvnnf00)", C[5], 2200),
 }
 START_RUNS = {
     "nztl09": ("start 2209-01-01 (nztl09)", C[0], 2209),
@@ -139,14 +144,16 @@ def main():
     ap.add_argument("--out", default="paper_eval/figures/fnoise_compare")
     out = Path(ap.parse_args().out)
     out.mkdir(parents=True, exist_ok=True)
-    scores = {r: load(r) for r in {**YEAR_RUNS, **START_RUNS}}
+    scores = {r: load(r) for r in {**YEAR_RUNS, **START_RUNS, **RUNS_2200}}
     channel_figure(YEAR_RUNS, scores, "Global RMSE, one-year forced forecast from 2209-01-01",
                    False, out / "rmse_channels")
+    channel_figure(RUNS_2200, scores, "Global RMSE, one-year forced forecast from 2200-01-01",
+                   False, out / "rmse_channels_2200")
     channel_figure(START_RUNS, scores,
                    "Global RMSE, one-year forecasts of fvars003 + training-like latent noise, three starts",
                    True, out / "rmse_channels_starts")
-    ratio_figure({**YEAR_RUNS, **{k: v for k, v in START_RUNS.items() if k != "nztl09"}}, scores,
-                 out / "rmse_vs_clim_mean")
+    ratio_figure({**YEAR_RUNS, **{k: v for k, v in START_RUNS.items() if k != "nztl09"},
+                  "fvnnf00": RUNS_2200["fvnnf00"]}, scores, out / "rmse_vs_clim_mean")
     print("wrote", sorted(p.name for p in out.iterdir()))
 
 
