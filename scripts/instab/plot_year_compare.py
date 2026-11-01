@@ -38,7 +38,7 @@ YEAR_RUNS = {
 }
 RUNS_2200 = {
     "nztl00": ("fvars003 + training-like latent noise (nztl00)", C[0], 2200),
-    "fvnnf00": ("no-noise fine-tune, final checkpoint, deterministic (fvnnf00)", C[5], 2200),
+    "fvnnf00": ("no-noise fine-tune, final checkpoint, deterministic (fvnnf00)", C[7], 2200),
 }
 START_RUNS = {
     "nztl09": ("start 2209-01-01 (nztl09)", C[0], 2209),
