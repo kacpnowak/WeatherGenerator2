@@ -80,5 +80,7 @@ date
 srun --label .venv/bin/inference --from-run-id "$FROM_RUN" -e "$FROM_EPOCH" --run-id "$RUN_ID" \
   --options "${OPTS[@]}" > "output/instab_rollout_${RUN_ID}_${SLURM_JOBID}.txt" 2>&1
 
-echo "srun exit code: $?"
+rc=$?
+echo "srun exit code: $rc"
 date
+exit $rc

@@ -1,0 +1,34 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Short fine-tune of fvnn003 (no latent noise) with the latent dynamics frozen: the forecast
+# engine and the forcing injection into it. The encoder and the decoders keep training. Frozen
+# blocks run in eval mode (no dropout), as they do in the rollout. Fresh schedule
+# (general.istep=0 on the command line).
+
+fe_impute_latent_noise_std: 0.0
+
+training_config:
+  num_mini_epochs: 4
+  samples_per_mini_epoch: 2048
+  learning_rate_scheduling:
+    lr_start: 1e-6
+    lr_max: 1e-5
+    lr_final_decay: 2e-6
+    lr_final: 0.0
+    num_steps_warmup: 256
+    num_steps_cooldown: 512
+  forecast:
+    num_steps: 15
+    prefix_steps: [0, 90]
+
+freeze_modules: "forecast_engine|forcing_module"
+
+validation_config:
+  samples_per_mini_epoch: 256
