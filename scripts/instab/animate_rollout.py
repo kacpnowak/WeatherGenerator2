@@ -6,8 +6,9 @@ are in mesh order (nodes for TEMP/SALT/SURFACE, elements for U/V). Dry points of
 masked with the mesh's nlevels, triangles across the dateline are dropped. Colour limits are
 fixed per field (1st/99th percentile of the truth at three leads; the difference scale from
 the last lead), so frames are comparable. The panel titles carry the area-weighted global RMSE.
+Sea-ice concentration (POLAR) is drawn on Arctic and Antarctic caps with the 15 % ice edges.
 
-    python scripts/instab/animate_rollout.py fvnn10y [--fields sst sss ssh speed_2 temp_107]
+    python scripts/instab/animate_rollout.py fvnn10y [--fields sst sss ssh speed_2 temp_107 a_ice]
         [--stride 5] [--fps 20] [--workers 24] [--out paper_eval/figures/fvnn10y/animations]
 """
 
@@ -38,7 +39,12 @@ FIELDS = {
     "ssh": (("SURFACE",), ("ssh",), "Sea surface height", "m", "Spectral_r"),
     "temp_107": (("TEMP",), ("temp_107",), "Temperature, 107 m", "°C", "RdYlBu_r"),
     "speed_2": (("U", "V"), ("u_2", "v_2"), "Surface current speed, 2 m", "m/s", "magma"),
+    "a_ice": (("SURFACE",), ("a_ice",), "Sea-ice concentration", "1", "Blues_r"),
 }
+#: fields drawn on two polar caps (azimuthal equidistant, NH and SH) instead of the global map
+POLAR = {"a_ice"}
+CAP_DEG = 40.0  # cap radius in degrees of latitude from the pole
+ICE_EDGE = 0.15
 
 _G = {}  # per-worker state: zip group, mesh, triangulations
 
@@ -98,8 +104,70 @@ def valid_date(field, fstep):
     return str(np.asarray(_G["z"][f"0/{st}/{fstep}/target/times"][0]))[:10]
 
 
+def polar_geometry(hemi):
+    """(triangulation in cap coordinates, nodes in the cap) for 'nh' or 'sh'."""
+    key = f"polar_{hemi}"
+    if key in _G["cache"]:
+        return _G["cache"][key]
+    lon, lat = np.deg2rad(_G["lon"]), _G["lat"]
+    r = 90.0 - lat if hemi == "nh" else 90.0 + lat
+    x = r * np.sin(lon)
+    y = -r * np.cos(lon) if hemi == "nh" else r * np.cos(lon)
+    cap = r <= CAP_DEG + 2.0
+    tri = mtri.Triangulation(x, y, _G["tri"], mask=~cap[_G["tri"]].all(1))
+    _G["cache"][key] = (tri, cap)
+    return _G["cache"][key]
+
+
+def draw_polar(args):
+    """Sea-ice frame: rows NH / SH, columns truth / emulator / difference, 15 % ice edges."""
+    field, idx, fstep, lims, frame_dir = args
+    _, _, title, unit, cmap = FIELDS[field]
+    truth = np.clip(read(field, fstep, "target"), 0.0, 1.0)
+    pred = np.clip(read(field, fstep, "prediction"), 0.0, 1.0)
+    area = _G["nod_area"][0]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10.4), constrained_layout=True)
+    for row, hemi in zip(axes, ("nh", "sh")):
+        tri, cap = polar_geometry(hemi)
+        side = _G["lat"] > 0 if hemi == "nh" else _G["lat"] < 0
+        ext_t, ext_p = (float((v * area)[side].sum()) * 1e-12 for v in (truth, pred))
+        rmse = float(np.sqrt(np.average((pred - truth)[side & cap] ** 2, weights=area[side & cap])))
+        panels = ((truth, f"AWI-CM3, ice area {ext_t:.2f}·10⁶ km²", cmap, 0.0, 1.0),
+                  (pred, f"Emulator, ice area {ext_p:.2f}·10⁶ km²", cmap, 0.0, 1.0),
+                  (pred - truth, f"Emulator − truth (RMSE poleward of {90 - CAP_DEG:.0f}° "
+                                 f"{rmse:.3f})", "RdBu_r", -lims[2], lims[2]))
+        for col, (ax, (val, name, cm, vmin, vmax)) in enumerate(zip(row, panels)):
+            ax.add_patch(plt.Circle((0, 0), CAP_DEG, color="#c9c7c1", zorder=0))  # land
+            pc = ax.tripcolor(tri, val, cmap=cm, vmin=vmin, vmax=vmax)
+            circle = plt.Circle((0, 0), CAP_DEG, transform=ax.transData)
+            pc.set_clip_path(circle)
+            for edge, colour in ((truth, "k"), (pred, "#d6336c")):
+                if col == 2 or (col == 1 and edge is truth):
+                    cs = ax.tricontour(tri, edge, levels=[ICE_EDGE], colors=colour,
+                                       linewidths=0.8)
+                    cs.set_clip_path(circle)
+            ax.add_patch(plt.Circle((0, 0), CAP_DEG, fill=False, lw=0.8, color="#3d3c38"))
+            ax.set_xlim(-CAP_DEG, CAP_DEG)
+            ax.set_ylim(-CAP_DEG, CAP_DEG)
+            ax.set_aspect("equal")
+            ax.axis("off")
+            ax.set_title(f"{'Arctic' if hemi == 'nh' else 'Antarctic'} — {name}", loc="left",
+                         fontsize=10)
+            if hemi == "sh":
+                fig.colorbar(pc, ax=ax, orientation="horizontal", shrink=0.8, pad=0.02,
+                             label=unit)
+    fig.suptitle(f"{title} — {valid_date(field, fstep)}   (lead {fstep} d, year "
+                 f"{fstep / 365.25:.1f} from 2200-01-01; black: AWI-CM3 {ICE_EDGE:.0%} edge, "
+                 f"pink: emulator)", x=0.01, ha="left", fontsize=12)
+    fig.savefig(frame_dir / f"frame_{idx:05d}.png", dpi=100)
+    plt.close(fig)
+    return rmse
+
+
 def limits(field, fsteps):
     """Fixed colour limits: truth 1st/99th percentile at three leads, |diff| 99th at the last."""
+    if field in POLAR:
+        return 0.0, 1.0, 0.6
     _, wet, *_ = geometry(field)
     sample = [fsteps[0], fsteps[len(fsteps) // 2], fsteps[-1]]
     t = np.concatenate([read(field, f, "target")[wet] for f in sample])
@@ -174,7 +242,7 @@ def main():
             frame_dir = out / f"frames_{field}"
             frame_dir.mkdir(exist_ok=True)
             tasks = [(field, i, f, lims, frame_dir) for i, f in enumerate(fsteps)]
-            rmse = pool.map(draw, tasks, chunksize=4)
+            rmse = pool.map(draw_polar if field in POLAR else draw, tasks, chunksize=4)
             encode(frame_dir, out / f"{field}.mp4", a.fps)
             shutil.copy(frame_dir / f"frame_{len(fsteps) - 1:05d}.png", out / f"{field}_last.png")
             shutil.copy(frame_dir / f"frame_{len(fsteps) // 2:05d}.png", out / f"{field}_mid.png")
