@@ -6,6 +6,11 @@
     python scripts/instab/y2209_requests.py pattern     # node-level pattern test (archive)
     python scripts/instab/y2209_requests.py bench       # persistence / climatology benchmarks
     python scripts/instab/y2209_requests.py integrity   # archive calendar, columns, NaNs
+    python scripts/instab/y2209_requests.py anchored    # IC-anchored re-scoring (lead-1 bias removed)
+    python scripts/instab/y2209_requests.py scaledec    # basin / 10-degree box / node decomposition
+    python scripts/instab/y2209_requests.py pattern_f09 # pattern2 applied to fvnnf09
+    python scripts/instab/y2209_requests.py poststep    # fvnn10y post-step state vs fresh encodings
+    python scripts/instab/y2209_requests.py anchored2   # anchored re-scoring, anchors at leads 30/90
         [--workers 24] [--data ~/claude_api_tools/y2209/data] [--out ~/claude_api_tools/y2209/in2]
 
 Effective year: for each region x {T, S} x level >= 450 m with a trend-dominated truth (|trend
@@ -185,15 +190,30 @@ def seasonal_cmd(a):
 _G = {}
 
 
-def _init():
+def _init(open_zip=True):
     m = xr.open_dataset(MESH)
     _G["lon"], _G["lat"] = np.asarray(m.lon), np.asarray(m.lat)
     nz = len(_channels("TEMP"))
     _G["wet"] = np.arange(nz)[:, None] < (np.asarray(m.nlevels_nod2D) - 1)[None, :]
     _G["area"] = np.asarray(m.nod_area)[:nz]
     _G["n"] = len(m.lon)
-    _G["z"] = zarr.open_group(store=ZipStore(
-        "results/fvnn10y/validation_chkpt00000_rank0000.zip", mode="r", read_only=True), mode="r")
+    _G["zs"] = {}  # fresh zip handles per process (handles inherited over fork are not safe)
+    _G.pop("z", None)
+    if open_zip:
+        _G["z"] = _zg("fvnn10y")
+
+
+def _zg(run):
+    """Output zip of a rollout run, opened once per process (fvnn10y is also _G["z"])."""
+    zs = _G.setdefault("zs", {})
+    if run not in zs:
+        if run == "fvnn10y" and "z" in _G:
+            zs[run] = _G["z"]
+        else:
+            zs[run] = zarr.open_group(store=ZipStore(
+                f"results/{run}/validation_chkpt00000_rank0000.zip", mode="r", read_only=True),
+                mode="r")
+    return zs[run]
 
 
 def _arch_day(year, month, day, chans):
@@ -212,9 +232,19 @@ def _arch_day(year, month, day, chans):
     return blk[:, [names.index(c) for c in chans]]
 
 
-def _zip(stream, lead, kind):
-    x = np.asarray(_G["z"][f"0/{stream}/{lead}/{kind}/data"][...], dtype=np.float64)
+def _zip(stream, lead, kind, run="fvnn10y"):
+    x = np.asarray(_zg(run)[f"0/{stream}/{lead}/{kind}/data"][...], dtype=np.float64)
     return x[..., 0] if x.ndim == 3 else x
+
+
+def _zdate(stream, lead, run):
+    """Valid date of a forecast step, read from the zip's target times (not assumed)."""
+    t = np.asarray(_zg(run)[f"0/{stream}/{lead}/target/times"][:1])
+    return str(t[0])[:10]
+
+
+def _nleads(run, stream="TEMP"):
+    return max(int(k) for k in _zg(run)[f"0/{stream}"].keys())
 
 
 def _date(lead):
@@ -429,10 +459,511 @@ def integrity_cmd(a):
     print(df.to_string())
 
 
+# ----- review round 2: IC-anchored re-scoring, scale decomposition, fvnnf09 pattern test ------
+
+ANCH_LEVELS = (2, 107, 450, 975, 2035)
+DECOMP_REGIONS = ("mediterranean", "red_sea", "arctic", "n_atlantic", "trop_atlantic",
+                  "s_atlantic", "indian", "n_pacific", "s_pacific", "southern")
+
+
+def _layer_dz(chans):
+    """Layer thicknesses (m) from the level depths in the channel names: interfaces at the
+    midpoints between levels, 0 m at the top and 2150 m at the bottom."""
+    z = np.array([float(c.split("_")[1]) for c in chans])
+    edges = np.concatenate([[0.0], (z[1:] + z[:-1]) / 2, [2150.0]])
+    return np.diff(edges)
+
+
+def _anch_task(args):
+    run, lead = args
+    out = {}
+    for st in ("TEMP", "SALT"):
+        chans = _channels(st)
+        if ("b1", run, st) not in _G:  # lead-1 bias and truth, once per process and run
+            t1 = np.nan_to_num(_zip(st, 1, "target", run))
+            _G[("t1", run, st)] = t1
+            _G[("b1", run, st)] = np.nan_to_num(_zip(st, 1, "prediction", run)) - t1
+        t1, b1 = _G[("t1", run, st)], _G[("b1", run, st)]
+        truth = np.nan_to_num(_zip(st, lead, "target", run))
+        pred = np.nan_to_num(_zip(st, lead, "prediction", run))
+        w = (_G["area"] * _G["wet"]).T  # (nod, lev)
+        wv = w * _layer_dz(chans)[None, :]
+        for name, e in (("raw", pred - truth), ("anchored", pred - b1 - truth),
+                        ("persistence_lead1", t1 - truth)):
+            out[(st, f"rmse_{name}")] = (np.sqrt((e ** 2 * w).sum(0) / w.sum(0)),
+                                         np.sqrt((e ** 2 * wv).sum() / wv.sum()))
+            if name != "persistence_lead1":
+                out[(st, f"mean_err_{name}")] = ((e * w).sum(0) / w.sum(0),
+                                                 (e * wv).sum() / wv.sum())
+    return run, lead, _zdate("TEMP", lead, run), out
+
+
+def anchored_cmd(a):
+    _init(open_zip=False)
+    tasks = []
+    for run in ("fvnnf09", "fvnnf00", "fvnn10y"):
+        n = _nleads(run)
+        leads = sorted(set([1, 15, 30] + list(range(30, n + 1, 30)) + [n]))
+        tasks += [(run, l) for l in leads]
+    for z in _G["zs"].values():  # do not hand open zip handles to the forked workers
+        z.store.close()
+    _G["zs"] = {}
+    with Pool(a.workers, initializer=_init, initargs=(False,)) as pool:
+        res = pool.map(_anch_task, tasks, chunksize=1)
+    rows = []
+    for run, lead, date, out in res:
+        for (st, q), (lev, vol) in out.items():
+            chans = _channels(st)
+            r = {"run": run, "lead": lead, "date": date, "var": st, "quantity": q}
+            for d in ANCH_LEVELS:
+                r[f"z{d}"] = lev[chans.index(f"{st.lower()}_{d}")]
+            r["vol_0_2150"] = vol
+            rows.append(r)
+    df = pd.DataFrame(rows)
+    with open(a.out / "anchored_rescoring.csv", "w") as fh:
+        fh.write("# IC-anchored re-scoring (fvnnf09 start 2209-01-01, fvnnf00 and fvnn10y start "
+                 "2200-01-01; date = valid date read from the zip's target times). b1 = pred(lead 1) "
+                 "- truth(lead 1) per node and level. Global area-weighted over wet nodes at the levels "
+                 "z<depth> (m). rmse_raw: RMSE of pred - truth. rmse_anchored: RMSE of (pred - b1) - "
+                 "truth (0 at lead 1 by construction). rmse_persistence_lead1: RMSE of truth(lead 1) - "
+                 "truth. mean_err_raw / mean_err_anchored: area-weighted mean of pred - truth / "
+                 "(pred - b1) - truth. vol_0_2150: the same over the 31 levels 0-2150 m, area x layer "
+                 "thickness weighted (thickness from midpoints between level depths, 0 and 2150 m at "
+                 "the ends); on rmse_* rows the volume RMSE, on mean_err_* rows the volume-mean error.\n")
+        df.to_csv(fh, index=False, float_format="%.5g")
+    sel = df[(df.lead.isin([1, 30, 90, 180, 360, 363, 1800, 3420, 3600, 3650]))
+             & df.quantity.str.startswith("rmse")]
+    print(sel.to_string())
+
+
+def _trend_map(data):
+    """20-year truth change, mean(2195-2199) - mean(2175-2179) of monthly 15th snapshots, TEMP
+    then SALT channels (nod, 62). Cached in the data directory."""
+    p = data / "trend_map_5ymean_2195_2199_minus_2175_2179.npy"
+    if p.exists():
+        return np.load(p)
+    chans = _channels("TEMP") + _channels("SALT")
+    late = np.mean([_arch_day(y, m, 15, chans) for y in range(2195, 2200) for m in range(1, 13)], 0)
+    early = np.mean([_arch_day(y, m, 15, chans) for y in range(2175, 2180) for m in range(1, 13)], 0)
+    trend = late - early
+    tmp = p.with_suffix(f".tmp{np.random.randint(1 << 30)}.npy")
+    np.save(tmp, trend)
+    tmp.rename(p)
+    return trend
+
+
+def _win(st, centre, kind, run="fvnn10y", last=None):
+    """21-day mean centred on `centre` (every 2nd day, leads c-10..c+10, clipped to 1..last)."""
+    leads = [l for l in range(centre - 10, centre + 11, 2) if l >= 1 and (last is None or l <= last)]
+    return np.mean([_zip(st, l, kind, run) for l in leads], 0), leads
+
+
+def _decomp(f, w, reg, box):
+    """Nested decomposition f - mean = basin + box10 + node (orthogonal under the area weights:
+    basin = basin mean - global mean, box10 = mean of (f - basin mean) over the 10x10 degree box
+    within the basin, node = remainder)."""
+    sw = w.sum()
+    m = np.sum(w * f) / sw
+    bm = np.bincount(reg, w * f, reg.max() + 1) / np.maximum(np.bincount(reg, w, reg.max() + 1), 1e-300)
+    r1 = f - bm[reg]
+    cell = reg * 648 + box
+    cw = np.bincount(cell, w, cell.max() + 1)
+    cm = np.bincount(cell, w * r1, cell.max() + 1) / np.maximum(cw, 1e-300)
+    parts = {"basin": bm[reg] - m, "box10": cm[cell], "node": r1 - cm[cell]}
+    vt = np.sum(w * (f - m) ** 2) / sw
+    return m, vt, parts, {k: np.sum(w * v ** 2) / sw / vt for k, v in parts.items()}
+
+
+def scaledec_cmd(a):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from regional_diag import regions
+
+    _init(open_zip=False)
+    run = "fvnn10y"
+    lon, lat = _G["lon"], _G["lat"]
+    rg = regions(lon, lat)
+    reg = np.full(lon.shape, len(DECOMP_REGIONS), int)  # "other"
+    for i, name in reversed(list(enumerate(DECOMP_REGIONS))):  # first match wins
+        reg[rg[name]] = i
+    box10 = (np.floor((lat + 90) / 10).clip(0, 17) * 36
+             + np.floor(((lon + 180) % 360) / 10).clip(0, 35)).astype(int)
+    trend_all = _trend_map(a.data)
+
+    def lead_of(date):
+        lead = int((np.datetime64(date) - START).astype(int))
+        assert _zdate("TEMP", lead, run) == date, (date, _zdate("TEMP", lead, run))
+        return lead
+
+    rows = []
+    for st in ("TEMP", "SALT"):
+        chans = _channels(st)
+        trend = trend_all[:, :31] if st == "TEMP" else trend_all[:, 31:]
+        cache = {}
+
+        def w21(date, kind):
+            if (date, kind) not in cache:
+                cache[(date, kind)] = _win(st, lead_of(date), kind, run)[0]
+            return cache[(date, kind)]
+
+        def bias(date):
+            return w21(date, "prediction") - w21(date, "target")
+
+        qs = {}
+        for y in (2209, 2206, 2204):
+            a_, b_ = f"{y}-06-13", f"{y}-11-10"
+            qs[(y, f"step_pred: pred({b_}) - pred({a_})")] = w21(b_, "prediction") - w21(a_, "prediction")
+            qs[(y, f"step_bias: bias({b_}) - bias({a_})")] = bias(b_) - bias(a_)
+        qs[(2209, "drift_bias: bias(2209-05-15) - bias(2200-05-15)")] = bias("2209-05-15") - bias("2200-05-15")
+        for depth in (450, 975, 2035):
+            li = chans.index(f"{st.lower()}_{depth}")
+            m = _G["wet"][li] & np.isfinite(trend[:, li])
+            w = _G["area"][li][m]
+            xm, xvt, xp, xf = _decomp(trend[m, li], w, reg[m], box10[m])
+            rows.append({"var": st, "depth": depth, "year": "", "quantity": "trend_map_20yr",
+                         "mean": xm, "rms_centred": np.sqrt(xvt),
+                         **{f"varfrac_{k}": v for k, v in xf.items()}})
+            for (y, qn), q in qs.items():
+                ym, yvt, yp, yf = _decomp(q[m, li], w, reg[m], box10[m])
+                r = {"var": st, "depth": depth, "year": y, "quantity": qn, "mean": ym,
+                     "rms_centred": np.sqrt(yvt), **{f"varfrac_{k}": v for k, v in yf.items()}}
+                r["corr_total"], r["slope_total"] = _wcorr(trend[m, li], q[m, li], w)
+                for k in ("basin", "box10", "node"):
+                    r[f"corr_{k}"], r[f"slope_{k}"] = _wcorr(xp[k], yp[k], w)
+                rows.append(r)
+    df = pd.DataFrame(rows)
+    df["varfrac_sum"] = df.varfrac_basin + df.varfrac_box10 + df.varfrac_node
+    with open(a.out / "scale_decomposition.csv", "w") as fh:
+        fh.write("# fvnn10y scale decomposition, global wet nodes (and finite trend), area weighted. "
+                 "Quantities are 21-day means centred on the named dates (every 2nd day, leads c-10..c+10; "
+                 "bias = pred - truth); step_* for the same calendar windows in model years 2209, 2206, "
+                 "2204; trend_map_20yr = mean(2195-2199) - mean(2175-2179) of monthly 15th truth snapshots. "
+                 "Each field f is split as f - mean = basin + box10 + node: basin = mean over its basin "
+                 "minus the global mean (non-overlapping basins: each node to the first matching region "
+                 "of regional_diag.regions in the order mediterranean, red_sea, arctic, n_atlantic, "
+                 "trop_atlantic, s_atlantic, indian, n_pacific, s_pacific, southern, else other); box10 = "
+                 "mean of (f - basin mean) over the 10x10 degree box intersected with the basin; node = "
+                 "remainder. The parts are orthogonal, varfrac_* = part variance / centred total "
+                 "variance (sum to 1). mean = global area-weighted mean (not in the variance). corr_*/"
+                 "slope_* = area-weighted node-level correlation / regression slope of the part of the "
+                 "quantity on the same part of the trend map; corr_total/slope_total for the full fields.\n")
+        df.to_csv(fh, index=False, float_format="%.4g")
+    print(df.drop(columns=[c for c in df.columns if c.startswith("slope_")]).to_string())
+
+
+def pattern_f09_cmd(a):
+    """pattern2 applied to fvnnf09 (start 2209-01-01): bias = pred - truth at leads 1 (one day),
+    90, 180, 360 (21-day means, clipped to the run), vs the 20-year truth trend map."""
+    _init(open_zip=False)
+    run = "fvnnf09"
+    last = _nleads(run)
+    trend_all = _trend_map(a.data)
+    lon, lat = _G["lon"], _G["lat"]
+    box = (np.floor((lat + 90) / 5) * 72 + np.floor(((lon + 180) % 360) / 5)).astype(int)
+    med = (lon > -5.5) & (lon < 36.5) & (lat > 30) & (lat < 46)
+    rows = []
+    for st in ("TEMP", "SALT"):
+        chans = _channels(st)
+        trend = trend_all[:, :31] if st == "TEMP" else trend_all[:, 31:]
+        for lead in (1, 90, 180, 360):
+            lead = min(lead, last)
+            if lead == 1:
+                q, leads = _zip(st, 1, "prediction", run) - _zip(st, 1, "target", run), [1]
+            else:
+                p, leads = _win(st, lead, "prediction", run, last)
+                q = p - _win(st, lead, "target", run, last)[0]
+            info = {"run": run, "lead": lead, "date": _zdate(st, lead, run),
+                    "window_first": _zdate(st, leads[0], run), "window_last": _zdate(st, leads[-1], run),
+                    "n_days": len(leads), "var": st}
+            for depth in (450, 975, 2035):
+                li = chans.index(f"{st.lower()}_{depth}")
+                wet = _G["wet"][li] & np.isfinite(trend[:, li]) & np.isfinite(q[:, li])
+                for mname, m in (("global", wet), ("global excl. Mediterranean", wet & ~med)):
+                    w = _G["area"][li][m]
+                    x, y = trend[m, li], q[m, li]
+                    r, sl = _wcorr(x, y, w)
+                    b = box[m]
+                    sw = np.bincount(b, w, 72 * 36)
+                    ok = sw > 0
+                    bx = np.bincount(b, w * x, 72 * 36)[ok] / sw[ok]
+                    by = np.bincount(b, w * y, 72 * 36)[ok] / sw[ok]
+                    rb, slb = _wcorr(bx, by, sw[ok])
+                    rows.append({**info, "depth": depth, "mask": mname, "corr_node": r, "slope_node": sl,
+                                 "corr_5deg_box": rb, "slope_5deg_box": slb,
+                                 "mean_bias": np.average(y, weights=w),
+                                 "rms_quantity": np.sqrt(np.average(y ** 2, weights=w)),
+                                 "rms_trend_map": np.sqrt(np.average(x ** 2, weights=w))})
+    df = pd.DataFrame(rows)
+    with open(a.out / "pattern_fvnnf09.csv", "w") as fh:
+        fh.write("# pattern2 method (node_pattern_test_v2.csv) applied to fvnnf09 (start 2209-01-01). "
+                 "Quantity = bias = pred - truth at the named lead: lead 1 a single day, other leads "
+                 "21-day means (every 2nd day, leads c-10..c+10, clipped to the run's last lead; "
+                 "window_first/last/n_days give the days used; dates read from the zip). Trend map x = "
+                 "mean(2195-2199) - mean(2175-2179) of monthly 15th truth snapshots. Area-weighted "
+                 "correlation and regression slope of the bias on x at node level and after 5x5 degree "
+                 "box averaging; slope -1 = minus the 20-year change. mean_bias = area-weighted mean.\n")
+        df.to_csv(fh, index=False, float_format="%.4g")
+    print(df.to_string())
+
+
+# ----- review round 4: fvnn10y post-step state vs fresh encodings, later anchors ---------------
+
+POST_DATE = "2209-11-10"
+POST_RUNS = ("fvnn10y", "fvnnf09", "fvnn07y", "fvnn08y")
+POST_PAIRS = (("fvnn10y", "fvnnf09"), ("fvnn10y", "fvnn07y"), ("fvnn10y", "fvnn08y"),
+              ("fvnnf09", "fvnn07y"))
+
+
+def _lead_of_date(run, date):
+    """Lead whose valid date (read from the zip) is `date`; first guess from the lead-1 date."""
+    d1 = np.datetime64(_zdate("TEMP", 1, run))
+    lead = 1 + int((np.datetime64(date) - d1).astype(int))
+    for cand in [lead] + [lead + k for k in (-1, 1, -2, 2)]:
+        if cand >= 1 and _zdate("TEMP", cand, run) == date:
+            return cand
+    raise ValueError(f"{run}: no lead with valid date {date} near {lead}")
+
+
+def _basin_index(lon, lat):
+    """Non-overlapping basins as in scaledec: first matching region of DECOMP_REGIONS, else other."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from regional_diag import regions
+
+    rg = regions(lon, lat)
+    reg = np.full(lon.shape, len(DECOMP_REGIONS), int)
+    for i, name in reversed(list(enumerate(DECOMP_REGIONS))):
+        reg[rg[name]] = i
+    return reg, list(DECOMP_REGIONS) + ["other"]
+
+
+def _post_task(args):
+    run, st = args
+    centre = _lead_of_date(run, POST_DATE)
+    p, leads = _win(st, centre, "prediction", run)
+    t = _win(st, centre, "target", run)[0]
+    return run, st, centre, _zdate(st, leads[0], run), _zdate(st, leads[-1], run), len(leads), p, p - t
+
+
+def poststep_cmd(a):
+    _init(open_zip=False)
+    lon, lat = _G["lon"], _G["lat"]
+    reg, rnames = _basin_index(lon, lat)
+    box = (np.floor((lat + 90) / 5).clip(0, 35) * 72 + np.floor(((lon + 180) % 360) / 5).clip(0, 71)).astype(int)
+    tasks = [(run, st) for run in POST_RUNS for st in ("TEMP", "SALT")]
+    with Pool(min(a.workers, len(tasks)), initializer=_init, initargs=(False,)) as pool:
+        res = pool.map(_post_task, tasks, chunksize=1)
+    F, info = {}, {}
+    for run, st, centre, w0, w1, nd, p, b in res:
+        F[(run, st, "pred")], F[(run, st, "bias")] = p, b
+        info[(run, st)] = dict(centre=centre, w0=w0, w1=w1, nd=nd)
+        print(run, st, "centre lead", centre, w0, w1, nd)
+    rows = []
+    for st in ("TEMP", "SALT"):
+        chans = _channels(st)
+        for depth in (975, 2035):
+            li = chans.index(f"{st.lower()}_{depth}")
+            for q in ("bias", "pred"):
+                m = _G["wet"][li].copy()
+                for run in POST_RUNS:  # common mask over all four runs
+                    m &= np.isfinite(F[(run, st, q)][:, li])
+                w = _G["area"][li][m]
+                rr, bb = reg[m], box[m]
+                for ra, rb in POST_PAIRS:
+                    xa, xb = F[(ra, st, q)][m, li], F[(rb, st, q)][m, li]
+                    ga, gb = np.average(xa, weights=w), np.average(xb, weights=w)
+                    ya, yb = xa - ga, xb - gb
+                    r_node = _wcorr(ya, yb, w)[0]
+                    sw = np.bincount(bb, w, 72 * 36)
+                    ok = sw > 0
+                    r_box = _wcorr(np.bincount(bb, w * ya, 72 * 36)[ok] / sw[ok],
+                                   np.bincount(bb, w * yb, 72 * 36)[ok] / sw[ok], sw[ok])[0]
+                    ia, ib = info[(ra, st)], info[(rb, st)]
+                    base = {"run_a": ra, "run_b": rb, "var": st, "depth": depth, "quantity": q,
+                            "lead_a": ia["centre"], "window_a": f"{ia['w0']}..{ia['w1']}",
+                            "lead_b": ib["centre"], "window_b": f"{ib['w0']}..{ib['w1']}",
+                            "n_days": ia["nd"]}
+                    rows.append({**base, "region": "global", "corr_node": r_node, "corr_5deg_box": r_box,
+                                 "mean_a": ga, "mean_b": gb, "mean_diff": ga - gb,
+                                 "mean_diff_centred": 0.0, "rms_centred_a": np.sqrt(np.average(ya ** 2, weights=w)),
+                                 "rms_centred_b": np.sqrt(np.average(yb ** 2, weights=w))})
+                    rw = np.bincount(rr, w, len(rnames))
+                    ma = np.bincount(rr, w * xa, len(rnames)) / np.maximum(rw, 1e-300)
+                    mb = np.bincount(rr, w * xb, len(rnames)) / np.maximum(rw, 1e-300)
+                    for k, name in enumerate(rnames):
+                        if rw[k] == 0:
+                            continue
+                        rows.append({**base, "region": name, "mean_a": ma[k], "mean_b": mb[k],
+                                     "mean_diff": ma[k] - mb[k],
+                                     "mean_diff_centred": (ma[k] - ga) - (mb[k] - gb),
+                                     "area_frac": rw[k] / w.sum()})
+    df = pd.DataFrame(rows)
+    with open(a.out / "poststep_vs_fresh.csv", "w") as fh:
+        fh.write(f"# fvnn10y post-step state vs fresh out-of-range encodings (fvnnf09 start 2209-01-01, "
+                 f"fvnn07y 2207-01-01, fvnn08y 2208-01-01; fvnn10y 2200-01-01). Fields: 21-day means "
+                 f"centred on {POST_DATE} (every 2nd day, leads c-10..c+10, c = lead whose zip valid date is "
+                 f"{POST_DATE}; lead_*/window_* give each run's centre lead and first..last valid dates) of "
+                 "pred (quantity=pred) and of bias = pred - truth (quantity=bias), TEMP/SALT at 975 and "
+                 "2035 m. Nodes: wet at the level and finite in all four runs; area weighted. Pairs "
+                 "a vs b: fvnn10y vs each fresh run, and fvnnf09 vs fvnn07y (reference pair of two fresh "
+                 "encodings). region=global rows: corr_node = area-weighted node-level Pearson correlation "
+                 "of the two fields after removing each field's global area-weighted mean; corr_5deg_box "
+                 "= the same after area-weighted averaging into 5x5 degree boxes (box weight = summed "
+                 "area); mean_a/mean_b = global area-weighted means, mean_diff = mean_a - mean_b; "
+                 "rms_centred_* = area-weighted RMS after removing the global mean. Basin rows: "
+                 "non-overlapping basins as in scale_decomposition.csv (each node to the first matching "
+                 "region of regional_diag.regions in the order mediterranean, red_sea, arctic, n_atlantic, "
+                 "trop_atlantic, s_atlantic, indian, n_pacific, s_pacific, southern, else other); "
+                 "mean_a/mean_b = basin area-weighted means, mean_diff = mean_a - mean_b (raw), "
+                 "mean_diff_centred = the basin mean difference after removing each field's global mean "
+                 "(= mean_diff - global mean_diff); area_frac = basin share of the masked area.\n")
+        df.to_csv(fh, index=False, float_format="%.5g")
+    g = df[df.region.isin(["global", "mediterranean"])]
+    print(g[["run_a", "run_b", "var", "depth", "quantity", "region", "corr_node", "corr_5deg_box",
+             "mean_diff", "mean_diff_centred"]].to_string())
+
+
+A2_RUNS = ("fvnnf09", "fvnn07y", "fvnn08y")
+A2_ANCHORS = (30, 90)
+A2_LEVELS = (450, 975, 2035)
+
+
+def _a2_leads(run, last):
+    """Scored leads per anchor (clipped to the run) and the set of all leads to read."""
+    sel = {}
+    for an in A2_ANCHORS:
+        ls = [an + k for k in (0, 15, 30, 60, 90, 180, 270, 360)] + [last]
+        if run == "fvnn07y":
+            ls += list(range(an, last + 1, 90))
+        sel[an] = sorted(set(l for l in ls if l <= last))
+    return sel
+
+
+def _a2_anchor_task(args):
+    run, an = args
+    out = {}
+    for st in ("TEMP", "SALT"):
+        bs = [np.nan_to_num(_zip(st, l, "prediction", run)) - np.nan_to_num(_zip(st, l, "target", run))
+              for l in range(an - 2, an + 3)]
+        out[st] = np.mean(bs, 0)
+    return run, an, [_zdate("TEMP", l, run) for l in (an - 2, an + 2)], out
+
+
+def _a2_task(args):
+    """Per (run, lead): volume-mean raw error (every lead); for scored leads also level RMSE /
+    mean error and the anchored versions for each anchor whose scored set contains the lead."""
+    run, lead, anchors, mapdir = args
+    res = {"vol_mean_raw": {}, "scored": {}}
+    for st in ("TEMP", "SALT"):
+        chans = _channels(st)
+        e = np.nan_to_num(_zip(st, lead, "prediction", run)) - np.nan_to_num(_zip(st, lead, "target", run))
+        w = (_G["area"] * _G["wet"]).T
+        wv = w * _layer_dz(chans)[None, :]
+        res["vol_mean_raw"][st] = (e * wv).sum() / wv.sum()
+        if not anchors:
+            continue
+
+        def stats(x):
+            return {"rmse": (np.sqrt((x ** 2 * w).sum(0) / w.sum(0)), np.sqrt((x ** 2 * wv).sum() / wv.sum())),
+                    "mean_err": ((x * w).sum(0) / w.sum(0), (x * wv).sum() / wv.sum())}
+
+        res["scored"][(st, None)] = stats(e)
+        for an in anchors:
+            key = ("amap", run, an, st)
+            if key not in _G:
+                _G[key] = np.load(Path(mapdir) / f"{run}_{an}_{st}.npy")
+            res["scored"][(st, an)] = stats(e - _G[key])
+    return run, lead, _zdate("TEMP", lead, run), res
+
+
+def anchored2_cmd(a):
+    import shutil
+    import tempfile
+
+    _init(open_zip=False)
+    lasts = {run: _nleads(run) for run in A2_RUNS}
+    sels = {run: _a2_leads(run, lasts[run]) for run in A2_RUNS}
+    for z in _G["zs"].values():  # do not hand open zip handles to the forked workers
+        z.store.close()
+    _G["zs"] = {}
+    mapdir = Path(tempfile.mkdtemp(prefix="anchor_maps_", dir=a.data))
+    try:
+        with Pool(a.workers, initializer=_init, initargs=(False,)) as pool:
+            amap_res = pool.map(_a2_anchor_task, [(r, an) for r in A2_RUNS for an in A2_ANCHORS], chunksize=1)
+            win = {}
+            for run, an, wd, out in amap_res:
+                win[(run, an)] = wd
+                for st, m in out.items():
+                    np.save(mapdir / f"{run}_{an}_{st}.npy", m)
+            tasks = []
+            for run in A2_RUNS:
+                first = min(A2_ANCHORS) + 30
+                for lead in range(1, lasts[run] + 1):
+                    ans = [an for an in A2_ANCHORS if lead in sels[run][an]]
+                    if ans or lead >= first:
+                        tasks.append((run, lead, ans, str(mapdir)))
+            res = pool.map(_a2_task, tasks, chunksize=4)
+    finally:
+        shutil.rmtree(mapdir, ignore_errors=True)
+    rows, drift = [], []
+    series = {}
+    for run, lead, date, r in res:
+        series.setdefault(run, []).append((lead, date, r["vol_mean_raw"]))
+        for (st, an), sts in r["scored"].items():
+            chans = _channels(st)
+            for an2 in ([an] if an is not None else [x for x in A2_ANCHORS if lead in sels[run][x]]):
+                kind = "raw" if an is None else "anchored"
+                for qn, (lev, vol) in sts.items():
+                    row = {"run": run, "anchor_lead": an2, "anchor_window": "{}..{}".format(*win[(run, an2)]),
+                           "lead": lead, "date": date, "var": st, "quantity": f"{qn}_{kind}"}
+                    for d in A2_LEVELS:
+                        row[f"z{d}"] = lev[chans.index(f"{st.lower()}_{d}")]
+                    row["vol_0_2150"] = vol
+                    rows.append(row)
+    for run in A2_RUNS:
+        s = sorted(series[run])
+        leads = np.array([x[0] for x in s])
+        dates = np.array([np.datetime64(x[1]) for x in s])
+        for an in A2_ANCHORS:
+            amask = np.array([x[0] >= an + 30 for x in s])
+            yrs = (dates[amask] - dates[amask][0]).astype(int) / 365.25
+            for st in ("TEMP", "SALT"):
+                y =np.array([x[2][st] for x in s])[amask]
+                slope, icpt = np.polyfit(yrs, y, 1)
+                drift.append({"run": run, "anchor_lead": an, "anchor_window": "{}..{}".format(*win[(run, an)]),
+                              "lead": "drift", "date": f"{dates[amask][0]}..{dates[amask][-1]}", "var": st,
+                              "quantity": f"drift_vol_mean_err_anchored_per_yr ({'K' if st == 'TEMP' else 'psu'}/yr)",
+                              "vol_0_2150": slope, "n_leads_fit": int(amask.sum()),
+                              "first_lead_fit": int(leads[amask][0]), "last_lead_fit": int(leads[amask][-1])})
+    df = pd.DataFrame(rows).sort_values(["run", "anchor_lead", "var", "quantity", "lead"])
+    df = pd.concat([df, pd.DataFrame(drift)], ignore_index=True)
+    with open(a.out / "anchored_late_anchor.csv", "w") as fh:
+        fh.write("# Anchored re-scoring with later anchors (fvnnf09 start 2209-01-01, fvnn07y 2207-01-01, "
+                 "fvnn08y 2208-01-01; date = valid date read from the zip's target times). Anchor map for "
+                 "anchor lead a: A_a = mean of pred - truth over leads a-2..a+2 (5 days, anchor_window = "
+                 "their valid dates), per node and level. Scored leads: a, a+15, a+30, a+60, a+90, a+180, "
+                 "a+270, a+360 and the run's last lead (fvnn07y also every 90 days from a to the end), "
+                 "only those <= last lead. rmse_raw / mean_err_raw: RMSE / area-weighted mean of pred - "
+                 "truth; rmse_anchored / mean_err_anchored: the same for (pred - A_a) - truth (near 0 at "
+                 "lead a, not exactly 0 since A_a is a 5-day mean); raw rows are repeated for each anchor. "
+                 "Global area-weighted over wet nodes (NaN set to 0, as in anchored_rescoring.csv) at the "
+                 "levels z<depth> (m). vol_0_2150: the same over the 31 levels 0-2150 m, area x layer "
+                 "thickness weighted (thickness from midpoints between level depths, 0 and 2150 m at the "
+                 "ends); on rmse_* rows the volume RMSE, on mean_err_* rows the volume-mean error. "
+                 "lead=drift rows: least-squares slope (per 365.25 days of valid date) of the daily "
+                 "anchored volume-mean error over all leads >= a+30 to the last lead (K/yr for TEMP, "
+                 "psu/yr for SALT), in vol_0_2150; it equals the slope of the raw volume-mean error over "
+                 "the same leads, since A_a is constant in time.\n")
+        df.to_csv(fh, index=False, float_format="%.5g")
+    sel = df[df.quantity.isin(["rmse_raw", "rmse_anchored"]) | (df.lead == "drift")]
+    print(sel.to_string())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("what", choices=["lambda", "stepreg", "seasonal", "pattern", "pattern2", "bench",
-                                     "integrity"])
+                                     "integrity", "anchored", "scaledec", "pattern_f09", "poststep",
+                                     "anchored2"])
     ap.add_argument("--workers", type=int, default=24)
     ap.add_argument("--data", default=str(Path.home() / "claude_api_tools/y2209/data"))
     ap.add_argument("--out", default=str(Path.home() / "claude_api_tools/y2209/in2"))
