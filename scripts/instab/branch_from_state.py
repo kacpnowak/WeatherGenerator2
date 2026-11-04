@@ -21,6 +21,7 @@ import torch
 
 from weathergen.model.fe_noise import FeNoise
 from weathergen.model.forcing_scale import ForcingScale
+from weathergen.model.forcing_split import ForcingSplit
 
 RESULTS = Path(__file__).resolve().parents[2] / "results"
 
@@ -41,6 +42,8 @@ def main():
     ap.add_argument("--list", metavar="RUN")
     ap.add_argument("--forcing-scale", type=float, default=None)
     ap.add_argument("--fe-noise", type=json.loads, default=None)
+    ap.add_argument("--forcing-split", type=json.loads, default=None,
+                    help='e.g. {"const_path": "C.pt", "alpha_const": 1.0, "alpha_anom": 0.0}')
     a = ap.parse_args()
     if a.list:
         for k, p in states(a.list).items():
@@ -54,15 +57,15 @@ def main():
     fn = FeNoise.from_config(a.fe_noise)
     s["forcing_scale"] = fs.as_dict() if fs is not None else None
     s["fe_noise"] = fn.as_dict() if fn is not None else None
-    if s.get("forcing_split") is not None:
-        raise SystemExit("source state has a forcing_split setting; not supported here")
+    fsp = ForcingSplit.from_config(a.forcing_split)
+    s["forcing_split"] = fsp.as_dict() if fsp is not None else None
     dst = RESULTS / a.new_run / "rollout_state.pt"
     if dst.parent.exists() and any(dst.parent.iterdir()):
         raise SystemExit(f"{dst.parent} is not empty")
     dst.parent.mkdir(parents=True, exist_ok=True)
     torch.save(s, dst)
     print(f"{src} (done_steps={s['done_steps']}) -> {dst}; forcing_scale={s['forcing_scale']}, "
-          f"fe_noise={s['fe_noise']}")
+          f"fe_noise={s['fe_noise']}, forcing_split={s['forcing_split']}")
 
 
 if __name__ == "__main__":

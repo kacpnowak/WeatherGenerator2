@@ -14,7 +14,8 @@
 # Forcing-injection decomposition (fable D1 step 1) with the worktree code, from the main tree:
 #   sbatch --job-name=fdecomp scripts/instab/sbatch_forcing_decomp.sh "fvars003 frcwin03"
 # One process per model, 363 days of forcing from 2209-01-01 (the last forcing index a rollout from 2209-01-01 can read; the data end at 2210-01-01T00), free default rollout of 150 days
-# for the latent norms. fvars003 also writes C (const_path of forecast.forcing_split).
+# for the latent norms. fvars003 also writes C (const_path of forecast.forcing_split); other
+# models too with SAVE_CONST=1. EPOCH selects the mini-epoch (default -1, the latest save).
 MODELS=${1:-fvars003 frcwin03}
 START=${WG_START:-2209-01-01}
 WT=${WT:-/work/ab0995/a270225/WeatherGenerator2}
@@ -34,14 +35,14 @@ end=$(date -d "$START + 1 year + 10 days" +%Y-%m-%d)
 for m in $MODELS; do
   tag=${m}_${START}
   extra=()
-  [ "$m" = fvars003 ] && extra=(--save-const "$OUT/C_${tag}.pt")
+  { [ "$m" = fvars003 ] || [ -n "${SAVE_CONST:-}" ]; } && extra=(--save-const "$OUT/C_${tag}.pt")
   opts=(test_config.start_date=${START}T00:00 test_config.end_date=${end}T00:00
         test_config.forecast.num_steps=366 test_config.forecast.chunk_size=1
         test_config.samples_per_mini_epoch=1 test_config.output.num_samples=0
         test_config.compute_loss=false)
   date; echo "== $m $START"
   srun --label .venv/bin/python "$WT/scripts/instab/forcing_decomp.py" --out "$OUT" --tag "$tag" --days "${DECOMP_DAYS:-363}" \
-    "${extra[@]}" -- --from-run-id "$m" -e -1 --run-id "fd${m: -3}" \
+    "${extra[@]}" -- --from-run-id "$m" -e "${EPOCH:--1}" --run-id "fd${m: -3}" \
     --options "${opts[@]}" > "output/forcing_decomp_${tag}_${SLURM_JOBID}.txt" 2>&1 < /dev/null
   echo "srun exit code: $?"
 done

@@ -12,7 +12,8 @@
 #SBATCH --error=logs/day1-scan-%x.%j.err
 
 # Day-1 forecasts of FROM_RUN (mini-epoch EPOCH) from a list of start dates, one inference per
-# start (run id PREFIX<YYYYMMDD>), TEMP/SALT/SURFACE written. Used to see how the encoded state
+# start (run id PREFIX<YYYYMMDD>), TEMP/SALT/SURFACE written. Two steps in one-step chunks, so
+# the carried latent after step 2 is saved (rollout_state.pt needs chunk_size < num_steps). Used to see how the encoded state
 # and the first step depend on the start year (inside / beyond the training years).
 #
 #   sbatch --job-name=d1scan scripts/instab/sbatch_day1_scan.sh fvnn003 10 fvd1 2010-01-01 2010-07-01 ...
@@ -39,7 +40,7 @@ for d in "$@"; do
   srun --label .venv/bin/inference --from-run-id "$FROM_RUN" -e "$EPOCH" --run-id "$id" --options \
     test_config.start_date=${d}T00:00 test_config.end_date=${end}T00:00 \
     test_config.samples_per_mini_epoch=1 test_config.output.num_samples=1 \
-    "test_config.output.streams=[TEMP,SALT,SURFACE]" test_config.forecast.num_steps=1 \
+    "test_config.output.streams=[TEMP,SALT,SURFACE]" test_config.forecast.num_steps=2 \
     test_config.compute_loss=false test_config.forecast.resume=true test_config.forecast.chunk_size=1 \
     streams.TEMP.max_num_targets=-1 \
     streams.SALT.max_num_targets=-1 streams.SURFACE.max_num_targets=-1 \
