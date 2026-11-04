@@ -69,9 +69,12 @@ def _init_rollout(run):
     wet_e = np.arange(nz)[:, None] < (np.asarray(m.nlevels) - 1)[None, :]
     _G["w_n"] = np.asarray(m.nod_area)[:nz] * wet_n  # (lev, nod)
     _G["w_e"] = np.asarray(m.elem_area)[None, :] * wet_e  # (lev, elem)
-    c_e = np.asarray(_G["z"]["0/U/1/target/coords"][...])
     _G["reg_n"] = regions(np.asarray(m.lon), np.asarray(m.lat))
-    _G["reg_e"] = regions(c_e[:, 1], c_e[:, 0])
+    # runs written without U/V (e.g. TEMP,SALT,SURFACE only) skip the velocity statistics
+    _G["has_uv"] = "U" in _G["z"]["0"]
+    if _G["has_uv"]:
+        c_e = np.asarray(_G["z"]["0/U/1/target/coords"][...])
+        _G["reg_e"] = regions(c_e[:, 1], c_e[:, 0])
 
 
 def _wmean(x, w, mask):
@@ -91,6 +94,9 @@ def _rollout_step(fstep):
             out[(st, "pred", r)] = _wmean(p, _G["w_n"], mask)
             out[(st, "truth", r)] = _wmean(t, _G["w_n"], mask)
             out[(st, "rmse", r)] = np.sqrt(_wmean((p - t) ** 2, _G["w_n"], mask))
+    if not _G["has_uv"]:
+        date = np.datetime64(str(np.asarray(g[f"0/TEMP/{fstep}/target/times"][0]))[:10])
+        return fstep, date, out
     uv = {}
     for st in ("U", "V"):
         for kind in ("prediction", "target"):
