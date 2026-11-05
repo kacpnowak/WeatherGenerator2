@@ -25,7 +25,8 @@ import y2209_requests as yr  # noqa: E402
 
 DATA = Path.home() / "claude_api_tools/y2209/data"
 OUT = Path.home() / "claude_api_tools/y2209/in3"
-RUNS = ("fvnn10y", "fvnnf09", "fvnnf00", "fvnn07y", "fvnn08y", "fvnn01y1", "fvnn02y1", "fvnn04y1")
+RUNS = ("fvnn10y", "fvnnf09", "fvnnf00", "fvnn07y", "fvnn08y", "fvnn01y1", "fvnn02y1", "fvnn04y1",
+        "fvfs02y", "fvfs09y")
 ATL = ("n_atlantic", "trop_atlantic", "s_atlantic")
 PACIND = ("n_pacific", "s_pacific", "indian")
 GROUPS = {
@@ -147,7 +148,8 @@ def seasonage(a):
 
 
 TRIGGER = ("fvtr_fp32", "fvtr_fs08", "fvtr_fs12", "fvtr_nz3s0", "fvtr_nz3s1", "fvtr_nz2s0",
-           "fvtr_anom0", "fvtr_f2208", "fvtr_anom0a", "fvtr_f2208a", "fvtr_anom08a")
+           "fvtr_anom0", "fvtr_f2208", "fvtr_anom0a", "fvtr_f2208a", "fvtr_anom08a",
+           "fvtr_sa12", "fvtr_sc12")
 
 
 def trigger(a):

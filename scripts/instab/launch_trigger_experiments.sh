@@ -26,6 +26,9 @@ EXPS=(
   "f2208|3450||streams.IFS_ATMO.window_shift=-8754h"
   "anom0a|3390|--forcing-split SPLIT|$F.forcing_split.const_path=$C $F.forcing_split.alpha_const=1.0 $F.forcing_split.alpha_anom=0.0"
   "f2208a|3390||streams.IFS_ATMO.window_shift=-8754h"
+  # mean vs seasonal lever (fable r4 request 4): scale the constant or the anomaly part by 1.2
+  "sa12|3450|--forcing-split {\"const_path\":\"CPATH\",\"alpha_const\":1.0,\"alpha_anom\":1.2}|$F.forcing_split.const_path=$C $F.forcing_split.alpha_const=1.0 $F.forcing_split.alpha_anom=1.2"
+  "sc12|3450|--forcing-split {\"const_path\":\"CPATH\",\"alpha_const\":1.2,\"alpha_anom\":1.0}|$F.forcing_split.const_path=$C $F.forcing_split.alpha_const=1.2 $F.forcing_split.alpha_anom=1.0"
   # same as anom0a with the constant of another year: run with C=<.../C_fvnn003_2208-01-01.pt>
   "anom08a|3390|--forcing-split SPLIT|$F.forcing_split.const_path=$C $F.forcing_split.alpha_const=1.0 $F.forcing_split.alpha_anom=0.0"
 )
@@ -44,7 +47,7 @@ for e in "${EXPS[@]}"; do
   if [ "$bargs" = "--forcing-split SPLIT" ]; then
     $PY scripts/instab/branch_from_state.py $SRC $step $run --forcing-split "$SPLIT" || exit 1
   elif [ -n "$bargs" ]; then
-    read -r flag val <<< "$bargs"
+    read -r flag val <<< "${bargs//CPATH/$C}"
     $PY scripts/instab/branch_from_state.py $SRC $step $run $flag "$val" || exit 1
   else
     $PY scripts/instab/branch_from_state.py $SRC $step $run || exit 1
