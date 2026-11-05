@@ -78,7 +78,8 @@ def lambda_cmd(a):
     fit = truth_fit(a.data)
     rows = []
     for run, freq in (("fvnn10y", "M"), ("fvnnf09", "30D"), ("fvnnf00", "30D"),
-                      ("fvnn07y", "M"), ("fvnn08y", "M")):
+                      ("fvnn07y", "M"), ("fvnn08y", "M"), ("fvnn01y1", "M"), ("fvnn02y1", "M"),
+                      ("fvnn04y1", "M")):
         p = a.data / f"rollout_regional_{run}.nc"
         if not p.exists():
             print("missing", p)

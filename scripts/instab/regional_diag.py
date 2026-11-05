@@ -117,7 +117,7 @@ def _rollout_step(fstep):
 def rollout(run, workers, out):
     _init_rollout(run)
     # branched / resumed runs start their output after step 1: use the steps present
-    steps = sorted(int(k) for k in _G["z"]["0/TEMP"].group_keys())
+    steps = sorted(int(k) for k in _G["z"]["0/TEMP"].group_keys() if int(k) >= 1)  # 0 = target-only
     _G["z"].store.close()  # workers open their own handles
     with Pool(workers, initializer=_init_rollout, initargs=(run,)) as pool:
         res = pool.map(_rollout_step, steps, chunksize=8)

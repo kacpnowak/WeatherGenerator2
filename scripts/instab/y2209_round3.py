@@ -25,7 +25,7 @@ import y2209_requests as yr  # noqa: E402
 
 DATA = Path.home() / "claude_api_tools/y2209/data"
 OUT = Path.home() / "claude_api_tools/y2209/in3"
-RUNS = ("fvnn10y", "fvnnf09", "fvnnf00", "fvnn07y", "fvnn08y")
+RUNS = ("fvnn10y", "fvnnf09", "fvnnf00", "fvnn07y", "fvnn08y", "fvnn01y1", "fvnn02y1", "fvnn04y1")
 ATL = ("n_atlantic", "trop_atlantic", "s_atlantic")
 PACIND = ("n_pacific", "s_pacific", "indian")
 GROUPS = {
