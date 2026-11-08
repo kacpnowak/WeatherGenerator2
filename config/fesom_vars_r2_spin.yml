@@ -1,0 +1,19 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Run fvr2spn of long-rollout round 2: round 1's long spin-up (run B: best TEMP and SALT
+# climatology ratios over nine years, flattest error) on the best round-1 model. A fork of
+# fvdrop02 (run A extended) with a fresh optimizer and lr cycle:
+#   train_continue --from-run-id fvdrop02 -e 10 --run-id fvr2spn \
+#       --config <mesh overlay> config/fesom_vars_r2_spin.yml --options general.istep=0
+# The saved config it inherits has the latent noise and the forecast-engine dropout off.
+
+training_config:
+  forecast:
+    prefix_steps: [0, 365]

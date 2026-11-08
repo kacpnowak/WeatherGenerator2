@@ -268,6 +268,7 @@ def test_iter_skips_sample_without_forcing():
         mini_epoch=0,
         _prefix_range=(0, 0),
         _prefix_seed=0,
+        _prefix_zero_fraction=0.0,
     )
     batches = list(MultiStreamDataSampler.__iter__(stub))
     assert tried == [0, 1, 2]
@@ -339,6 +340,7 @@ def _iter_stub(get_batch, perms):
         mini_epoch=0,
         _prefix_range=(0, 0),
         _prefix_seed=0,
+        _prefix_zero_fraction=0.0,
     )
 
 
@@ -509,6 +511,7 @@ def _prefix_iter_stub(rank, prefix_range=(1, 90), get_prefix_batch=None):
         _get_prefix_batch=get_prefix_batch or prefix_batch,
         _prefix_range=prefix_range,
         _prefix_seed=7,
+        _prefix_zero_fraction=0.0,
     )
     return stub, seen
 

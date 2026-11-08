@@ -1,0 +1,19 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Run fvr2mix of long-rollout round 2: the long spin-up of fvr2spn, with a quarter of the
+# training steps starting from the initial condition instead. With [0, 365] alone a step has
+# no spin-up 1 time in 366: round 1's run B then had the worst short-lead SST of all runs, and
+# its encoder, which only gets a gradient on those steps, hardly trained. A fork of fvdrop02
+# like fvr2spn (see config/fesom_vars_r2_spin.yml).
+
+training_config:
+  forecast:
+    prefix_steps: [0, 365]
+    prefix_zero_fraction: 0.25

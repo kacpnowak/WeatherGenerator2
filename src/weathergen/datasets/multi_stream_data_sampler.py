@@ -176,8 +176,31 @@ def resolve_prefix_range(forecast_cfg: dict, stage: Stage) -> tuple[int, int]:
     return (prefix[0], prefix[1])
 
 
+def resolve_prefix_zero_fraction(forecast_cfg: dict, stage: Stage) -> float:
+    """
+    Share of training steps with no spin-up (`forecast.prefix_zero_fraction`, default 0).
+
+    With a wide prefix range a step rarely starts from the initial condition, and only those
+    steps train the encoder and the first forecast steps; this guarantees a share of them.
+    """
+    fraction = forecast_cfg.get("prefix_zero_fraction", 0.0)
+    if stage != TRAIN:
+        return 0.0
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, int | float)
+        or not 0 <= fraction <= 1
+    ):
+        raise ValueError(f"forecast.prefix_zero_fraction must be in [0, 1], got {fraction!r}")
+    return float(fraction)
+
+
 def draw_prefix_steps(
-    prefix_range: tuple[int, int], seed: int, mini_epoch: int, position: int
+    prefix_range: tuple[int, int],
+    seed: int,
+    mini_epoch: int,
+    position: int,
+    zero_fraction: float = 0.0,
 ) -> int:
     """
     Spin-up length of the training step at `position` (sample index in the rank's share).
@@ -185,12 +208,17 @@ def draw_prefix_steps(
     Seeded only by the run seed, the mini-epoch and the position, never by the rank or the
     loader worker, so every rank draws the same length for the same training step: no rank
     waits on another's longer spin-up, and all ranks run the same forecast-engine calls.
+    A share `zero_fraction` of the steps has no spin-up; without it the draws are the ones
+    runs made before the option existed, so their resume replays the same spin-ups.
     """
     low, high = prefix_range
     if high == 0:
         return 0
     rng = np.random.default_rng([seed, mini_epoch, position])
-    return int(rng.integers(low, high + 1))
+    prefix = int(rng.integers(low, high + 1))
+    if zero_fraction > 0 and rng.random() < zero_fraction:
+        return 0
+    return prefix
 
 
 def worker_ranges(rank: int, len_per_rank: int, num_workers: int) -> list[tuple[int, int]]:
@@ -290,6 +318,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.list_num_forecast_steps = np.array(steps, dtype=np.int32)
         # unsupervised spin-up steps drawn per training step (training stage only)
         self._prefix_range = resolve_prefix_range(forecast_cfg, stage)
+        self._prefix_zero_fraction = resolve_prefix_zero_fraction(forecast_cfg, stage)
 
         # Lazy target materialization: for a long single-sample rollout (decadal), building
         # every forecast step's targets up front blows memory. When the rollout is chunked
@@ -1530,6 +1559,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 self._prefix_seed,
                 self.mini_epoch,
                 rank_position + i * self.batch_size,
+                self._prefix_zero_fraction,
             )
 
             # use while loop due to the scattered nature of the data in time and to
