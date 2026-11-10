@@ -17,6 +17,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import xarray as xr  # noqa: E402
+from numpy.typing import NDArray  # noqa: E402
 
 #: run name (after the prefix), legend label, colour, line style
 RUNS = [
@@ -69,11 +70,11 @@ def _curve(scores: dict[str, xr.DataArray], spec, model: str) -> xr.DataArray:
     return scores[stream].sel(model=model, channel=channel)
 
 
-def _running(da: xr.DataArray) -> np.ndarray:
+def _running(da: xr.DataArray) -> NDArray:
     return da.rolling(lead=WINDOW, center=True, min_periods=WINDOW // 2).mean().values
 
 
-def _cumulative(da: xr.DataArray) -> np.ndarray:
+def _cumulative(da: xr.DataArray) -> NDArray:
     values = da.values
     return np.cumsum(values) / np.arange(1, len(values) + 1)
 
