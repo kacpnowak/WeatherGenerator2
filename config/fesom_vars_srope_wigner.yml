@@ -1,0 +1,46 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Fine-tune of fvnn003 (the 10-year-rollout model) with S2RoPE-Wigner (real Wigner-D rotations, bands l=1..10 = 120 of the 128 head dims)
+# in the forecast engine. Based on fvofe (config/fesom_vars_freeze_allbutfe.yml): only the
+# forecast engine trains, so fvofe is the no-RoPE control. RoPE adds no parameters; its
+# position tensors are rebuilt with the model, so fvnn003's checkpoint loads unchanged.
+# RoPE is restricted to the forecast engine (rope_modules): the encoder heads are 64-dim and
+# cannot hold these bands (limit there: Wigner L=7, SH l=15), and the encoder is frozen.
+# Larger budget than fvofe (lr_max 5e-5, 12 mini-epochs instead of 1e-5, 4): switching RoPE on
+# raises fvnn003's validation loss about 10x (0.029 -> 0.31 Wigner / 0.35 SH, smoke test
+# 2026-11-10), so the forecast engine has to re-learn its attention, not just adjust it.
+# Fresh schedule (general.istep=0 on the command line).
+
+fe_impute_latent_noise_std: 0.0
+pe_global_enable: True
+rope_mode: spherical_unitary
+rope_unitary_max_band: 10
+rope_modules: forecast
+
+training_config:
+  num_mini_epochs: 12
+  samples_per_mini_epoch: 2048
+  learning_rate_scheduling:
+    lr_start: 1e-6
+    lr_max: 5e-5
+    lr_final_decay: 2e-6
+    lr_final: 0.0
+    num_steps_warmup: 256
+    num_steps_cooldown: 512
+  forecast:
+    num_steps: 15
+    prefix_steps: [0, 90]
+
+freeze_modules: "embed_target_coords|encoder|forcing_module|latent_pre_norm|pred_heads|target_token_engines"
+
+validation_config:
+  samples_per_mini_epoch: 256
+  # zero-shot loss of fvnn003 with RoPE switched on
+  validate_before_training: True

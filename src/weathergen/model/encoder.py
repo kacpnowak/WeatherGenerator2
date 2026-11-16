@@ -24,7 +24,51 @@ from weathergen.model.engines import (
 
 # from weathergen.model.model import ModelParams
 from weathergen.model.parametrised_prob_dist import LatentInterpolator
-from weathergen.model.positional_encoding import positional_encoding_harmonic
+from weathergen.model.positional_encoding import get_rope_mode, positional_encoding_harmonic
+
+
+def validate_pe_global_config(cf) -> None:
+    """Reject pe_global_enable=False outside forecast-mode training.
+
+    Under masking-style strategies, cells without input tokens have pe_global as their
+    only identity; without it they start from identical q_cells and the representation
+    degrades silently (see the collapse note at the pe_global initialization in
+    ModelParams.reset_parameters). Fail loudly instead.
+
+    TODO: this only inspects the top-level training_config.model_input. A per-stream
+    masking_override (cf.streams[*].masking_override, see masking.py) can still flip a
+    stream to random/healpix masking and would pass this check; extend the validation
+    to the effective per-stream strategies (and add a regression test) before relying
+    on pe_global_enable=False outside plain single-stream forecast configs.
+    """
+    if cf.get("pe_global_enable", True):
+        return
+    model_input = cf.get("training_config", {}).get("model_input", {}) or {}
+    active = [m_cfg for m_cfg in model_input.values() if m_cfg.get("enabled", True)]
+    if not active:
+        raise ValueError(
+            "pe_global_enable=False requires forecast-mode training, but no active "
+            "model_input entries were found to verify this."
+        )
+    strategies = {str(m_cfg.get("masking_strategy")) for m_cfg in active}
+    non_forecast = sorted(strategies - {"forecast"})
+    if non_forecast:
+        raise ValueError(
+            "pe_global_enable=False requires masking_strategy 'forecast' for all "
+            f"active model_input entries; found {non_forecast}. Masked cells rely on "
+            "pe_global as their only identity."
+        )
+
+
+def build_global_latent_queries(cf, q_cells, pe_global, num_healpix_cells, rs):
+    """Initial global latent queries: q_cells replicated per cell, plus the absolute
+    per-cell positional embedding unless pe_global_enable=False (no-global ablation)."""
+    pe = pe_global if cf.get("pe_global_enable", True) else 0.0
+    # TODO: re-enable or remove ae_local_queries_per_cell
+    if cf.ae_local_queries_per_cell:
+        return (q_cells + pe).repeat(rs, 1, 1)
+    tokens_global = q_cells.repeat(num_healpix_cells, 1, 1) + pe
+    return tokens_global.repeat(rs, 1, 1)
 
 
 class EncoderModule(torch.nn.Module):
@@ -39,6 +83,7 @@ class EncoderModule(torch.nn.Module):
         :param stream_names: Ordered list of stream identifiers aligned with cf.streams.
         """
         super(EncoderModule, self).__init__()
+        validate_pe_global_config(cf)
         self.cf = cf
 
         self.healpix_level = cf.healpix_level
@@ -133,7 +178,11 @@ class EncoderModule(torch.nn.Module):
         tokens_global = checkpoint(
             self.ae_global_engine,
             tokens_global,
-            coords=model_params.rope_coords,
+            coords=(
+                model_params.rope_packed_data()
+                if get_rope_mode(self.cf, module="global") != "none"
+                else None
+            ),
             use_reentrant=False,
         )
 
@@ -221,6 +270,10 @@ class EncoderModule(torch.nn.Module):
         tokens_global_register_class,
         tokens_lens,
         rope_cell_coords=None,
+        rope_cell_coeffs=None,
+        rope_extra_coeffs=None,
+        rope_cell_band_mats=None,
+        rope_extra_band_mats=None,
     ):
         """
         Aggregation engine on the global latents of unmasked cells
@@ -251,8 +304,30 @@ class EncoderModule(torch.nn.Module):
         )
 
         # Build packed coords matching the interleaved token order
-        if rope_cell_coords is not None:
-            num_extra = self.num_class_tokens + self.num_register_tokens
+        num_extra = self.num_class_tokens + self.num_register_tokens
+        if rope_cell_band_mats is not None:
+            packed_bands = []
+            for cell_mats, extra_mats in zip(
+                rope_cell_band_mats, rope_extra_band_mats, strict=True
+            ):
+                packed = []
+                for mask_b in cell_mask.flatten(0, 1):
+                    packed.append(extra_mats)
+                    packed.append(cell_mats[mask_b])
+                packed_bands.append(torch.cat(packed, dim=0))
+            packed_coords = tuple(packed_bands)
+        elif rope_cell_coeffs is not None:
+            extra_real, extra_imag = rope_extra_coeffs.unbind(dim=-1)
+            cell_real, cell_imag = rope_cell_coeffs.unbind(dim=-1)
+            packed_real = []
+            packed_imag = []
+            for mask_b in cell_mask.flatten(0, 1):
+                packed_real.append(extra_real)
+                packed_imag.append(extra_imag)
+                packed_real.append(cell_real[mask_b])
+                packed_imag.append(cell_imag[mask_b])
+            packed_coords = (torch.cat(packed_real, dim=0), torch.cat(packed_imag, dim=0))
+        elif rope_cell_coords is not None:
             zero_coords = torch.zeros(
                 num_extra, 2, device=rope_cell_coords.device, dtype=rope_cell_coords.dtype
             )
@@ -297,13 +372,12 @@ class EncoderModule(torch.nn.Module):
         pos_enc = positional_encoding_harmonic
         tokens_global_register_class = pos_enc(self.q_cells.repeat(rs, num_extra_tokens, 1))
 
-        # TODO: re-enable or remove ae_local_queries_per_cell
-        if self.cf.ae_local_queries_per_cell:
-            tokens_global = (self.q_cells + model_params.pe_global).repeat(rs, 1, 1)
-        else:
-            num_tokens = self.num_healpix_cells
-            tokens_global = self.q_cells.repeat(num_tokens, 1, 1) + model_params.pe_global
-            tokens_global = tokens_global.repeat(rs, 1, 1)
+        # pe_global_enable=False drops the absolute per-cell positional embedding from the
+        # global latent queries (ablation: is relative RoPE-type information sufficient?).
+        # Forecast-mode only; enforced by validate_pe_global_config at construction.
+        tokens_global = build_global_latent_queries(
+            self.cf, self.q_cells, model_params.pe_global, self.num_healpix_cells, rs
+        )
 
         # apply local assimilation engine and project onto global latent vectors
         tokens_global_unmasked, posteriors = self.assimilate_local_project_chunked(
@@ -315,7 +389,17 @@ class EncoderModule(torch.nn.Module):
             tokens_global_unmasked,
             tokens_global_register_class,
             batch.tokens_lens,
-            rope_cell_coords=model_params.rope_cell_coords,
+            **(
+                dict(
+                    rope_cell_coords=model_params.rope_cell_coords,
+                    rope_cell_coeffs=model_params.rope_spherical_cell_coeffs,
+                    rope_extra_coeffs=model_params.rope_spherical_extra_coeffs,
+                    rope_cell_band_mats=model_params.rope_unitary_cell_data(),
+                    rope_extra_band_mats=model_params.rope_unitary_extra_data(),
+                )
+                if get_rope_mode(self.cf, module="aggregation") != "none"
+                else {}
+            ),
         )
 
         # final processing

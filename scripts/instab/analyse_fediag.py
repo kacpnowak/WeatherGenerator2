@@ -101,9 +101,13 @@ NONOISE = [("fvnn0e0", "fvnn003 mini-epoch 0, deterministic"),
            ("fvzal09", "fvzal (forecast, aggregation, global frozen), deterministic, 363 d"),
            ("fvzal00", "fvzal (forecast, aggregation, global frozen), deterministic, 363 d, from 2200"),
            ("fvofe09", "fvofe (only the forecast engine trains), deterministic, 363 d"),
-           ("fvofe00", "fvofe (only the forecast engine trains), deterministic, 363 d, from 2200")]
+           ("fvofe00", "fvofe (only the forecast engine trains), deterministic, 363 d, from 2200"),
+           *[(f"srwig{e}_{y}", f"srwig (fvofe recipe + S2RoPE-Wigner L=10 in the forecast engine), "
+              f"checkpoint {c}, deterministic, 363 d" + (", from 2200" if y == "00" else ""))
+             for e, c in ((4, 4), (8, 8), (12, 10)) for y in ("09", "00")]]
 _ALL = [r for r, _ in D1 + D2 + NONOISE] + [r for v in D9.values() for r, _ in v]
-for _r in ("fvnnf00", "fvnn10y", "fvzfe00", "fvzal00", "fvofe00"):
+for _r in ("fvnnf00", "fvnn10y", "fvzfe00", "fvzal00", "fvofe00", "srwig4_00", "srwig8_00",
+           "srwig12_00"):
     ams.RUNS.setdefault(_r, ("3", "2200-01-01", "real"))
 for _r in _ALL:
     ams.RUNS.setdefault(_r, ("3", START, "real"))

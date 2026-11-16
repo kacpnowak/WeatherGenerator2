@@ -29,6 +29,7 @@ from weathergen.model.embeddings import (
     StreamEmbedTransformer,
 )
 from weathergen.model.layers import MLP
+from weathergen.model.positional_encoding import get_rope_mode
 from weathergen.model.utils import ActivationFactory
 from weathergen.utils.utils import get_dtype, is_stream_fe_only
 
@@ -55,9 +56,7 @@ class EmbeddingEngine(torch.nn.Module):
         ]
 
         self.data_streams = [
-            stream_cfg
-            for stream_cfg in cf.streams.values()
-            if not is_stream_fe_only(stream_cfg)
+            stream_cfg for stream_cfg in cf.streams.values() if not is_stream_fe_only(stream_cfg)
         ]
 
         for i, (si, stream_name) in enumerate(
@@ -401,6 +400,8 @@ class QueryAggregationEngine(torch.nn.Module):
         super(QueryAggregationEngine, self).__init__()
         self.cf = cf
         self.num_healpix_cells = num_healpix_cells
+        rope_mode = get_rope_mode(self.cf, module="aggregation")
+        rope_post_norm = self.cf.get("rope_spherical_post_norm", False)
 
         self.ae_aggregation_blocks = torch.nn.ModuleList()
 
@@ -421,7 +422,8 @@ class QueryAggregationEngine(torch.nn.Module):
                         qk_norm_type=self.cf.get("qk_norm_type", self.cf.norm_type),
                         norm_eps=self.cf.norm_eps,
                         attention_dtype=get_dtype(self.cf.attention_dtype),
-                        with_2d_rope=self.cf.get("rope_2D", False),
+                        rope_mode=rope_mode,
+                        rope_post_norm=rope_post_norm,
                     )
                 )
             else:
@@ -477,6 +479,8 @@ class GlobalAssimilationEngine(torch.nn.Module):
         super(GlobalAssimilationEngine, self).__init__()
         self.cf = cf
         self.num_healpix_cells = num_healpix_cells
+        rope_mode = get_rope_mode(self.cf, module="global")
+        rope_post_norm = self.cf.get("rope_spherical_post_norm", False)
 
         self.ae_global_blocks = torch.nn.ModuleList()
 
@@ -497,7 +501,8 @@ class GlobalAssimilationEngine(torch.nn.Module):
                         qk_norm_type=self.cf.get("qk_norm_type", self.cf.norm_type),
                         norm_eps=self.cf.norm_eps,
                         attention_dtype=get_dtype(self.cf.attention_dtype),
-                        with_2d_rope=self.cf.get("rope_2D", False),
+                        rope_mode=rope_mode,
+                        rope_post_norm=rope_post_norm,
                     )
                 )
             else:
@@ -514,7 +519,8 @@ class GlobalAssimilationEngine(torch.nn.Module):
                         qk_norm_type=self.cf.get("qk_norm_type", self.cf.norm_type),
                         norm_eps=self.cf.norm_eps,
                         attention_dtype=get_dtype(self.cf.attention_dtype),
-                        with_2d_rope=self.cf.get("rope_2D", False),
+                        rope_mode=rope_mode,
+                        rope_post_norm=rope_post_norm,
                     )
                 )
             # MLP block
@@ -565,6 +571,8 @@ class ForecastingEngine(torch.nn.Module):
         super(ForecastingEngine, self).__init__()
         self.cf = cf
         self.num_healpix_cells = num_healpix_cells
+        rope_mode = get_rope_mode(self.cf, module="forecast")
+        rope_post_norm = self.cf.get("rope_spherical_post_norm", False)
         self.fe_blocks = torch.nn.ModuleList()
 
         global_rate = int(1 / self.cf.forecast_att_dense_rate)
@@ -584,7 +592,8 @@ class ForecastingEngine(torch.nn.Module):
                             dim_aux=dim_aux,
                             norm_eps=self.cf.norm_eps,
                             attention_dtype=get_dtype(self.cf.attention_dtype),
-                            with_2d_rope=self.cf.get("rope_2D", False),
+                            rope_mode=rope_mode,
+                            rope_post_norm=rope_post_norm,
                         )
                     )
                 else:
@@ -602,7 +611,8 @@ class ForecastingEngine(torch.nn.Module):
                             dim_aux=dim_aux,
                             norm_eps=self.cf.norm_eps,
                             attention_dtype=get_dtype(self.cf.attention_dtype),
-                            with_2d_rope=self.cf.get("rope_2D", False),
+                            rope_mode=rope_mode,
+                            rope_post_norm=rope_post_norm,
                         )
                     )
                 # Add MLP block

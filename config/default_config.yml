@@ -66,10 +66,39 @@ num_register_tokens: 0
 
 healpix_level: 5
 
-# Use 2D RoPE instead of traditional global positional encoding
-# When True: uses 2D RoPE based on healpix cell coordinates (lat/lon)
-# When False: uses traditional pe_global positional encoding
-rope_2D: False
+# Absolute per-cell positional embedding added to the global latent queries. Set False
+# to ablate it (does relative RoPE-type information suffice?). Forecast-mode training
+# only: masking-mode training relies on pe_global as the sole identity of masked cells
+# (without it their representations collapse; see ModelParams.reset_parameters).
+pe_global_enable: True
+
+# Generalized RoPE selector.
+rope_mode: none  # one of: none, 2d, spherical, spherical_unitary
+# Optional spherical harmonic band for spherical RoPE. If null, the model picks one
+# conservative shared band that fits all spherical-RoPE attention modules.
+rope_spherical_band: null
+# Largest Wigner-D band L for spherical_unitary RoPE (bands l=1..L occupy L*(L+2) head
+# dimensions). If null, the largest L fitting the smallest head dimension is used.
+rope_unitary_max_band: null
+# Attention modules that apply RoPE: "all", or "|"-separated names from aggregation, global,
+# forecast (e.g. "forecast"). The band capacity checks then only count those modules.
+rope_modules: all
+# Re-enable the legacy post-modulation q/k norm. With the RMS-isometric (sqrt(4*pi))
+# coefficient normalization the modulation preserves q/k scale, so this is off by default.
+rope_spherical_post_norm: False
+# Apply the sqrt(4*pi) RMS-isometric rescaling to the spherical coefficients. Set False
+# (together with rope_spherical_post_norm: True) to faithfully reproduce the original
+# post-norm scheme: the constant scales only the rotary slice of the head vector, so the
+# post-norm does NOT absorb it and the rotary/pass-through balance differs by sqrt(4*pi).
+rope_spherical_rms_isometric: True
+# Amplitude-compression exponent gamma for the spherical coefficients. 1.0 keeps the exact
+# addition-theorem kernel; gamma<1 reduces the per-mode amplitude spread across latitudes
+# (phase kept, per-pixel energy renormalized), improving conditioning near the poles.
+# NOTE: gamma != 1.0 renormalizes the per-pixel energy to 2l+1, which restores the 4*pi
+# convention and would override rope_spherical_rms_isometric: False -- that combination is
+# therefore rejected at model construction. Use rms_isometric: False only with the default
+# amp_power: 1.0.
+rope_spherical_amp_power: 1.0
 
 with_mixed_precision: True
 with_flash_attention: True
