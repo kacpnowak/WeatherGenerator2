@@ -9,8 +9,9 @@
 
 """
 Training state saved next to each model checkpoint (a sidecar `.pt` file): the optimizer state,
-the dynamic-loss channel-weight EMAs and the step counter it was saved at. Restored only when a
-run is resumed (general.istep > 0), never when a new run starts from another run's weights.
+the dynamic-loss channel-weight EMAs, the EMA teacher of student-teacher training (if any) and
+the step counter it was saved at. Restored only when a run is resumed (general.istep > 0), never
+when a new run starts from another run's weights.
 """
 
 import logging
@@ -91,11 +92,22 @@ def load_optimizer_state(
         group.update(kept)
 
 
-def save_train_state(path: Path, optimizer_state: dict, dynamic_loss: dict, istep: int) -> None:
-    """Write the training state on rank 0, via a temporary file so that `path` is never partial."""
+def save_train_state(
+    path: Path,
+    optimizer_state: dict,
+    dynamic_loss: dict,
+    istep: int,
+    ema_teacher: dict | None = None,
+) -> None:
+    """Write the training state on rank 0, via a temporary file so that `path` is never partial.
+
+    ema_teacher: {"ema_model": teacher weights, "postprocess_targets": {loss: state}} or None.
+    """
     if not is_root():
         return
     state = {"optimizer": optimizer_state, "dynamic_loss": dynamic_loss, "istep": istep}
+    if ema_teacher is not None:
+        state["ema_teacher"] = ema_teacher
     path_tmp = path.with_name(path.stem + "_tmp" + path.suffix)
     torch.save(state, path_tmp)
     path_tmp.replace(path)

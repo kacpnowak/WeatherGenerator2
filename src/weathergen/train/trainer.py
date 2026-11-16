@@ -37,6 +37,7 @@ from weathergen.train.collapse_monitor import CollapseMonitor
 from weathergen.train.loss_calculator import LossCalculator
 from weathergen.train.loss_modules.loss_module_physical import DynamicLossEMA
 from weathergen.train.lr_scheduler import LearningRateScheduler
+from weathergen.train.target_and_aux_ssl_teacher import EMATeacher
 from weathergen.train.target_and_aux_utils import get_target_aux_calculator
 from weathergen.train.train_state import (
     gather_optimizer_state,
@@ -470,6 +471,13 @@ class Trainer(TrainerBase):
                         preds_full.latent[chunk_step_offset + step_idx].update(
                             source_samples.latent[step_idx]
                         )
+                        # deep SSL predictions, or the SSL loss falls back to the unfused head
+                        if source_samples.latent_deep is not None:
+                            if preds_full.latent_deep is None:
+                                preds_full.latent_deep = [{} for _ in preds_full.physical]
+                            preds_full.latent_deep[chunk_step_offset + step_idx].update(
+                                source_samples.latent_deep[step_idx]
+                            )
 
                 if chunk_size and chunk_idx < len(chunks) - 1:
                     if (
@@ -1062,12 +1070,23 @@ class Trainer(TrainerBase):
 
         state = load_train_state(file_state) if is_root() else None
         # every rank has to know whether there is a state, restoring the optimizer is collective
-        shared = [None if state is None else (state["dynamic_loss"], state["istep"])]
+        shared = [
+            None
+            if state is None
+            else (state["dynamic_loss"], state["istep"], "ema_teacher" in state)
+        ]
         if torch.distributed.is_initialized():
             torch.distributed.broadcast_object_list(shared, src=0)
         if shared[0] is None:
             return
-        dynamic_loss, istep_state = shared[0]
+        dynamic_loss, istep_state, has_ema_teacher = shared[0]
+        # every rank holds a full EMA teacher: each reads it from the (memory-mapped) file
+        # instead of receiving gigabytes of pickled weights from rank 0
+        ema_teacher_state = None
+        if has_ema_teacher:
+            local_state = state if is_root() else load_train_state(file_state)
+            ema_teacher_state = local_state["ema_teacher"]
+        self._restore_ema_teachers(ema_teacher_state, file_state)
 
         load_optimizer_state(self.model, self.optimizer, state["optimizer"] if is_root() else {})
         if is_root():
@@ -1099,6 +1118,56 @@ class Trainer(TrainerBase):
                     f"Resuming {run_id_contd}: restored dynamic-loss state of loss term "
                     f"{loss_term} for streams {sorted(saved)}."
                 )
+
+    def _ema_teachers(self, with_val: bool = True) -> list[EMATeacher]:
+        """The EMATeacher target calculators of training (and validation)."""
+        calcs = [self.target_and_aux_calculators] + (
+            [self.target_and_aux_calculators_val] if with_val else []
+        )
+        return [
+            c for cs in calcs if cs is not None for c in cs.values() if isinstance(c, EMATeacher)
+        ]
+
+    def _ema_teacher_state(self) -> dict | None:
+        """State of the training EMA teacher (weights + target centering buffers), or None."""
+        teachers = self._ema_teachers(with_val=False)
+        if not teachers:
+            return None
+        teacher = teachers[0]
+        return {
+            "ema_model": {
+                k: v.detach().cpu() for k, v in teacher.ema_model.ema_model.state_dict().items()
+            },
+            "postprocess_targets": {
+                name: module.state_dict() for name, module in teacher.postprocess_targets.items()
+            },
+        }
+
+    def _restore_ema_teachers(self, ema_state: dict | None, file_state) -> None:
+        """
+        Load a saved EMA teacher into the training and validation teachers. Without one, a
+        resumed run keeps the teacher the EMA calculator reset from the student, as before.
+        """
+        teachers = self._ema_teachers()
+        if not teachers:
+            return
+        if ema_state is None:
+            if is_root():
+                logger.warning(
+                    f"No EMA teacher state in {file_state}: the teacher restarts from the student."
+                )
+            return
+        for teacher in teachers:
+            mkeys, ukeys = teacher.ema_model.ema_model.load_state_dict(
+                ema_state["ema_model"], strict=False
+            )
+            for name, module in teacher.postprocess_targets.items():
+                if name in ema_state.get("postprocess_targets", {}):
+                    module.load_state_dict(ema_state["postprocess_targets"][name], strict=False)
+            if is_root() and (mkeys or ukeys):
+                logger.warning(f"EMA teacher restore: missing keys {mkeys}, unused keys {ukeys}")
+        if is_root():
+            logger.info(f"Restored EMA teacher state from {file_state}.")
 
     def _get_full_model_state_dict(self):
         maybe_sharded_sd = (
@@ -1155,7 +1224,13 @@ class Trainer(TrainerBase):
                     for loss_term, ema in self._dynamic_loss_emas().items()
                 }
                 file_state = train_state_path(base_path, self.cf.general.run_id, mini_epoch)
-                save_train_state(file_state, optimizer_state, dynamic_loss, self.cf.general.istep)
+                save_train_state(
+                    file_state,
+                    optimizer_state,
+                    dynamic_loss,
+                    self.cf.general.istep,
+                    ema_teacher=self._ema_teacher_state(),
+                )
                 logger.info(
                     f"Saved optimizer and dynamic-loss state (istep={self.cf.general.istep}) to "
                     f"{file_state}"

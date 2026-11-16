@@ -279,6 +279,7 @@ def _eager_sampler(output_offset):
     """Stub `self` that drives `_get_batch` down to its forcing call, without data streams."""
     stub = _sampler()
     stub.output_offset = output_offset
+    stub.teacher_time_offset = 0
     stub.mode_cfg = {"training_mode": ["masking"], "model_input": {"random": {}}}
     no_masks = types.SimpleNamespace(masks=[])
     stub.streams_datasets = {"S": types.SimpleNamespace(info={}, readers=[])}

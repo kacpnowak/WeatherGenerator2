@@ -316,6 +316,21 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.forecast_policy = forecast_cfg["policy"]
         steps = np.array(forecast_cfg["num_steps"], dtype=np.int32).reshape(-1)
         self.list_num_forecast_steps = np.array(steps, dtype=np.int32)
+        # teacher_time_offset (temporal JEPA): number of time windows the teacher's input is
+        # shifted forward relative to the student's. Only active with student_teacher training,
+        # so an offset left in a pretraining config cannot leak into forecast finetuning or
+        # inference (where it would shift every target time by that many windows).
+        configured_offset = int(mode_cfg.get("teacher_time_offset", 0) or 0)
+        if "student_teacher" in mode_cfg.get("training_mode", []):
+            self.teacher_time_offset = configured_offset
+        else:
+            if configured_offset != 0:
+                logger.warning(
+                    f"teacher_time_offset={configured_offset} is set but training_mode="
+                    f"{mode_cfg.get('training_mode', [])} does not include 'student_teacher'. "
+                    "Ignoring it (setting to 0)."
+                )
+            self.teacher_time_offset = 0
         # unsupervised spin-up steps drawn per training step (training stage only)
         self._prefix_range = resolve_prefix_range(forecast_cfg, stage)
         self._prefix_zero_fraction = resolve_prefix_zero_fraction(forecast_cfg, stage)
@@ -329,6 +344,12 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self._lazy_targets = mode_cfg.get("samples_per_mini_epoch", 0) == 1 and chunk_size < int(
             self.list_num_forecast_steps.max()
         )
+        # the teacher time offset is implemented in the eager full-batch path only
+        if self.teacher_time_offset > 0 and (self._lazy_targets or self._prefix_range[1] > 0):
+            raise NotImplementedError(
+                "teacher_time_offset > 0 is not supported with forecast.prefix_steps or "
+                "chunked (lazy-target) rollouts."
+            )
 
         # free-running forecast: for forecast steps beyond the dataset coverage there is no
         # ground truth, so gridded (anemoi) streams build a full-grid target query with
@@ -374,13 +395,17 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         """Check if samples_per_mini_epoch is suitable
         Repeated both to initialise the MultiStreamDataSampler and for each mini epoch"""
 
-        max_index = self.index_range.end - (
-            (  # max time units needed to make a forecast
-                self.time_step * (fsm + self.output_offset)  # translation due to forecasting
-                + self.len_timedelta  # length of forecasting window
+        max_index = (
+            self.index_range.end
+            - (
+                (  # max time units needed to make a forecast
+                    self.time_step * (fsm + self.output_offset)  # translation due to forecasting
+                    + self.len_timedelta  # length of forecasting window
+                )
+                // self.step_timedelta  # as number of indexs
             )
-            // self.step_timedelta  # as number of indexs
-        )
+            - self.teacher_time_offset
+        )  # the teacher reads windows that far ahead
 
         available_samples = max_index * self.batch_size  # as number of samples
 
@@ -431,6 +456,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         depends on fsm so must be repeated for __init__ and reset"""
         perms_len = int(self.index_range.end - self.index_range.start)
         perms_len -= (fsm + self.output_offset) * (self.time_step // self.step_timedelta)
+        # the teacher reads its windows at idx + teacher_time_offset: keep those in range
+        perms_len -= self.teacher_time_offset
 
         return np.arange(perms_len)
 
@@ -1199,6 +1226,28 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             input_tokens = self.tokenizer.get_tokens_windows(stream_info, input_data, True)
             output_tokens = self.tokenizer.get_tokens_windows(stream_info, output_data, False)
 
+            # temporal JEPA: the teacher (target) samples see windows shifted forward in time
+            target_idx = idx + self.teacher_time_offset
+            if self.teacher_time_offset > 0:
+                input_data_target = self._get_input_windows(target_idx, i_max, stream_ds)
+                input_tokens_target = self.tokenizer.get_tokens_windows(
+                    stream_info, input_data_target, True
+                )
+                if "target_coords" in target_select or "target_values" in target_select:
+                    output_data_target = self._get_output_windows(
+                        target_idx, num_forecast_steps, stream_ds
+                    )
+                    output_tokens_target = self.tokenizer.get_tokens_windows(
+                        stream_info, output_data_target, False
+                    )
+                else:
+                    # the targets use only the teacher's network input: skip reading the
+                    # shifted output windows (placeholders, never read for this mode)
+                    output_data_target, output_tokens_target = output_data, output_tokens
+            else:
+                input_data_target, output_data_target = input_data, output_data
+                input_tokens_target, output_tokens_target = input_tokens, output_tokens
+
             for sidx, source_mask in enumerate(source_masks.masks):
                 # Map each source to its target
                 tidx = source_to_target[sidx].item()
@@ -1224,14 +1273,14 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 # the inputs. Hence the target mask is also the source mask here.
                 sdata = self._build_stream_data(
                     target_select,
-                    idx,
+                    target_idx,
                     num_forecast_steps,
                     stream_info,
                     target_masks.metadata[tidx].params.get("num_steps_input", 1),
-                    input_data,
-                    output_data,
-                    input_tokens,
-                    output_tokens,
+                    input_data_target,
+                    output_data_target,
+                    input_tokens_target,
+                    output_tokens_target,
                     output_mask=target_mask,
                     input_mask=target_mask,
                 )

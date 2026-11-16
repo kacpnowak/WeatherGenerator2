@@ -55,9 +55,7 @@ class EmbeddingEngine(torch.nn.Module):
         ]
 
         self.data_streams = [
-            stream_cfg
-            for stream_cfg in cf.streams.values()
-            if not is_stream_fe_only(stream_cfg)
+            stream_cfg for stream_cfg in cf.streams.values() if not is_stream_fe_only(stream_cfg)
         ]
 
         for i, (si, stream_name) in enumerate(
@@ -467,16 +465,21 @@ class QueryAggregationEngine(torch.nn.Module):
 class GlobalAssimilationEngine(torch.nn.Module):
     name: "GlobalAssimilationEngine"
 
-    def __init__(self, cf: Config, num_healpix_cells: int) -> None:
+    def __init__(
+        self, cf: Config, num_healpix_cells: int, tap_global_layers: set[int] | None = None
+    ) -> None:
         """
         Initialize the GlobalAssimilationEngine with the configuration.
 
         :param cf: Configuration object containing parameters for the engine.
         :param num_healpix_cells: Number of healpix cells used for local queries.
+        :param tap_global_layers: Layer indices (counted in attention+MLP pairs) after which
+            to collect intermediate representations for deep self-supervision; None disables.
         """
         super(GlobalAssimilationEngine, self).__init__()
         self.cf = cf
         self.num_healpix_cells = num_healpix_cells
+        self.tap_global_layers = tap_global_layers
 
         self.ae_global_blocks = torch.nn.ModuleList()
 
@@ -534,11 +537,22 @@ class GlobalAssimilationEngine(torch.nn.Module):
                 torch.nn.LayerNorm(self.cf.ae_global_dim_embed, elementwise_affine=False)
             )
 
-    def forward(self, tokens, coords=None):
+    def forward(self, tokens, coords=None) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Returns the tokens and the tapped intermediates (empty unless tap_global_layers)."""
         aux_info = None
+        intermediates: list[torch.Tensor] = []
+        layer = 0
         for block in self.ae_global_blocks:
-            tokens = checkpoint(block, tokens, coords, aux_info, use_reentrant=False)
-        return tokens
+            # the optional trailing LayerNorm (ae_global_trailing_layer_norm) takes one input
+            if isinstance(block, torch.nn.LayerNorm):
+                tokens = checkpoint(block, tokens, use_reentrant=False)
+            else:
+                tokens = checkpoint(block, tokens, coords, aux_info, use_reentrant=False)
+            if isinstance(block, MLP):
+                if self.tap_global_layers and layer in self.tap_global_layers:
+                    intermediates.append(tokens)
+                layer += 1
+        return tokens, intermediates
 
 
 class IdentityEngine(torch.nn.Module):
@@ -1019,6 +1033,29 @@ class TargetPredictionEngine(nn.Module):
             else output
         )
         return output
+
+
+class DeepSSLFusion(nn.Module):
+    """Concatenate multi-level representations along the channel dim and fuse with an MLP.
+
+    Used by the student in deep self-supervision (V-JEPA 2.1 style): the tapped intermediate
+    encoder levels and the final level are concatenated and projected back to dim_embed.
+    """
+
+    def __init__(self, num_levels: int, dim_embed: int, hidden_factor: int = 2):
+        super().__init__()
+        # Intermediate levels are tapped before any final normalisation, so they arrive on very
+        # different scales than the final level: normalise each before concatenating.
+        self.level_norms = nn.ModuleList([nn.LayerNorm(dim_embed) for _ in range(num_levels)])
+        self.proj = nn.Sequential(
+            nn.Linear(num_levels * dim_embed, hidden_factor * dim_embed, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_factor * dim_embed, dim_embed, bias=False),
+        )
+
+    def forward(self, levels: list[torch.Tensor]) -> torch.Tensor:
+        normed = [norm(level) for norm, level in zip(self.level_norms, levels, strict=True)]
+        return self.proj(torch.cat(normed, dim=-1))
 
 
 @dataclasses.dataclass

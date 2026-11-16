@@ -114,8 +114,34 @@ class EncoderModule(torch.nn.Module):
         # query aggregation engine
         self.ae_aggregation_engine = QueryAggregationEngine(cf, self.num_healpix_cells)
 
+        # deep SSL taps: "local2global" (encoder input to the global engine) and "global:<i>"
+        # (after global layer i); only parsed when training_config.deep_ssl is enabled
+        deep_ssl_cfg = cf.get("training_config", {}).get("deep_ssl", None)
+        self.tap_local2global = False
+        tap_global_layers: set[int] | None = None
+        if deep_ssl_cfg and deep_ssl_cfg.get("enabled", False) and deep_ssl_cfg.get("tap_after"):
+            for tap in deep_ssl_cfg.tap_after:
+                tap_str = str(tap)
+                if tap_str == "local2global":
+                    self.tap_local2global = True
+                elif tap_str.startswith("global:"):
+                    tap_global_layers = tap_global_layers or set()
+                    tap_global_layers.add(int(tap_str.split(":")[1]))
+                else:
+                    raise ValueError(f"Unknown deep_ssl tap {tap_str!r}")
+
         # global assimilation engine
-        self.ae_global_engine = GlobalAssimilationEngine(cf, self.num_healpix_cells)
+        self.ae_global_engine = GlobalAssimilationEngine(
+            cf, self.num_healpix_cells, tap_global_layers=tap_global_layers
+        )
+
+        # optional non-affine LayerNorm on the encoder output (always on in the
+        # develop-ssl-diffusion-v1 encoder); off by default so existing checkpoints are unchanged
+        self.output_norm = (
+            torch.nn.LayerNorm(cf.ae_global_dim_embed, elementwise_affine=False)
+            if cf.get("encoder_output_layer_norm", False)
+            else None
+        )
 
     def forward(self, model_params, batch):
         """
@@ -130,14 +156,22 @@ class EncoderModule(torch.nn.Module):
             self.assimilate_local, model_params, stream_cell_tokens, batch, use_reentrant=False
         )
 
-        tokens_global = checkpoint(
+        intermediates: list[torch.Tensor] = []
+        if self.tap_local2global:
+            intermediates.append(tokens_global.clone())
+
+        tokens_global, global_intermediates = checkpoint(
             self.ae_global_engine,
             tokens_global,
             coords=model_params.rope_coords,
             use_reentrant=False,
         )
+        intermediates.extend(global_intermediates)
 
-        return tokens_global, posteriors
+        if self.output_norm is not None:
+            tokens_global = self.output_norm(tokens_global)
+
+        return tokens_global, posteriors, intermediates
 
     def interpolate_latents(self, tokens: torch.Tensor) -> (torch.Tensor, torch.Tensor):
         """ "
