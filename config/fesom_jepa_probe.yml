@@ -1,0 +1,90 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Frozen-encoder probe of a temporal-JEPA FESOM pretraining checkpoint
+# (config/fesom_jepa_pretrain.yml): the encoder is frozen and only freshly initialised stream
+# decoders are trained to reconstruct the encoded day (no forecast engine, forecast offset 0).
+# The per-channel validation MSE (normalised units; 1 ~ predicting the level's mean) shows how
+# much of each vertical level the latent retains. Compare checkpoints under the same budget,
+# and against a random-init encoder (train --config config/fesom_jepa_pretrain.yml
+# config/fesom_jepa_probe.yml).
+#
+# Applied with train_continue on the pretraining run, with general.istep=0:
+#   train_continue --from-run-id <run> -e <mini_epoch> --run-id <probe id> \
+#       --config config/fesom_jepa_probe.yml --options general.istep=0
+
+fe_num_blocks: 0
+streams_directory: ./config/streams/fesom_all_levels/
+freeze_modules: ".*encoder.*|latent_pre_norm"
+
+general:
+  istep: 0
+
+# few loader workers: their start-up (each opens every yearly store) dominates a short probe
+data_loading:
+  num_workers: 4
+
+train_logging:
+  terminal: 10
+  metrics: 20
+  checkpoint: 100000
+
+training_config:
+  training_mode: ["masking"]
+  teacher_time_offset: 0
+  deep_ssl:
+    enabled: False
+  context_loss:
+    enabled: False
+
+  num_mini_epochs: 1
+  samples_per_mini_epoch: 512
+
+  learning_rate_scheduling:
+    lr_start: 1e-6
+    lr_max: 2e-4
+    lr_final_decay: 2e-4
+    lr_final: 0.0
+    num_steps_warmup: 16
+    num_steps_cooldown: 16
+    policy_warmup: "cosine"
+    policy_decay: "constant"
+    policy_cooldown: "linear"
+    parallel_scaling_policy: "sqrt"
+
+  losses:
+    student-teacher: {enabled: False, type: Disabled}
+    physical:
+      enabled: True
+      type: LossPhysical
+      loss_fcts:
+        mse: {}
+
+  model_input:
+    forecasting:
+      masking_strategy: "forecast"
+  target_input:
+    random_easy_target: {enabled: False}
+
+  forecast:
+    time_step: 0
+    num_steps: 0
+    offset: 0
+    policy: null
+
+validation_config:
+  samples_per_mini_epoch: 32
+  shuffle: False
+  start_date: 2200-01-01T00:00
+  end_date: 2200-12-31T00:00
+  validate_with_ema:
+    enabled: False
+  output:
+    num_samples: 0
+  validate_before_training: False

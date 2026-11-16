@@ -1,0 +1,58 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Representation-collapse check of a temporal-JEPA FESOM pretraining checkpoint
+# (config/fesom_jepa_pretrain.yml): 16 steps at a negligible learning rate with the collapse
+# monitor on every step (effective rank, singular-value spectrum, per-dimension variance of the
+# student JEPA prediction and of the teacher target). As a new run (general.istep=0) the EMA
+# teacher starts as a copy of the checkpoint's student, so the teacher metrics measure that
+# encoder's latent of day t+1.
+#
+#   train_continue --from-run-id <run> -e <mini_epoch> --run-id <id> \
+#       --config config/fesom_jepa_collapse_check.yml --options general.istep=0
+# Random-init reference: train --config config/fesom_jepa_pretrain.yml \
+#       config/fesom_jepa_collapse_check.yml --run-id <id>
+
+general:
+  istep: 0
+
+# few loader workers: their start-up (each opens every yearly store) dominates a short job
+data_loading:
+  num_workers: 4
+
+train_logging:
+  terminal: 4
+  metrics: 4
+  checkpoint: 100000
+  collapse_monitoring:
+    enabled: true
+    compute_frequency: 1
+    log_frequency: 4
+    metrics:
+      effective_rank: {enabled: true, tensor_source: "both", sample_size: 4096}
+      singular_values: {enabled: true, tensor_source: "both", sample_size: 4096}
+      dimension_variance: {enabled: true, tensor_source: "both"}
+      prototype_entropy: {enabled: false}
+      ema_beta: {enabled: true}
+
+training_config:
+  num_mini_epochs: 1
+  samples_per_mini_epoch: 64
+  learning_rate_scheduling:
+    lr_start: 1e-12
+    lr_max: 1e-12
+    lr_final_decay: 1e-12
+    lr_final: 0.0
+    # OneCycleLR divides by (warm-up steps - 1)
+    num_steps_warmup: 2
+    num_steps_cooldown: 2
+
+validation_config:
+  samples_per_mini_epoch: 4
+  validate_before_training: False

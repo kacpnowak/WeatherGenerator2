@@ -1,0 +1,114 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Stage 2 of config/fesom_jepa_pipeline.yml: physical 2-step forecast fine-tune of a
+# temporal-JEPA-pretrained FESOM encoder (config/fesom_jepa_pretrain.yml), on all levels.
+# An overlay for train_continue from the pretraining run, with general.istep=0 (a new stage:
+# fresh optimizer and schedule). As config_gjl_repro_finetune_forecast_n320.yml does for the
+# atmosphere, it creates the 16-block forecast engine from scratch (the pretraining run has
+# none), switches the student-teacher loss off and the physical loss on. The IFS forcing
+# stream joins here (config/streams/fesom_all_levels_forced/), injected into the forecast
+# engine as in the fvars models; its embedding is new.
+#
+# train_continue merges this overlay into the pretraining run's saved config as a union, so
+# every inherited setting that must change is overwritten here explicitly.
+#
+# Settings follow the fvars recipe (docs/fesom-vars-training-recipe.md): no latent noise, no
+# forecast-engine dropout, MSE with dynamic channel weights.
+
+fe_num_blocks: 16
+fe_dropout_rate: 0.0
+fe_impute_latent_noise_std: 0.0
+streams_directory: ./config/streams/fesom_all_levels_forced/
+# the SSL pre-norm acts only at step 0, which a forecast with offset 1 never computes; frozen,
+# DDP (inherited from pretraining: no FSDP) does not wait for its gradient
+freeze_modules: "latent_pre_norm"
+
+general:
+  # num_mini_epochs is an absolute target: start this stage at mini-epoch 0
+  istep: 0
+
+train_logging:
+  terminal: 10
+  metrics: 20
+  checkpoint: 250
+
+training_config:
+  training_mode: ["masking"]
+  teacher_time_offset: 0
+  deep_ssl:
+    enabled: False
+  context_loss:
+    enabled: False
+
+  num_mini_epochs: 8
+  samples_per_mini_epoch: 2048
+  shuffle: True
+  start_date: 2010-01-01T00:00
+  end_date: 2199-12-31T00:00
+  time_window_step: 86400
+  time_window_len: 86400
+
+  learning_rate_scheduling:
+    lr_start: 1e-6
+    lr_max: 5e-5
+    lr_final_decay: 2e-6
+    lr_final: 0.0
+    num_steps_warmup: 256
+    num_steps_cooldown: 512
+    policy_warmup: "cosine"
+    policy_decay: "cosine"
+    policy_cooldown: "linear"
+    parallel_scaling_policy: "sqrt"
+
+  optimizer:
+    grad_clip: 1.0
+    weight_decay: 0.1
+    log_grad_norms: False
+    adamw:
+      beta1: 0.98125
+      beta2: 0.9875
+      eps: 2e-08
+
+  losses:
+    student-teacher: {enabled: False, type: Disabled}
+    physical:
+      enabled: True
+      type: LossPhysical
+      loss_fcts:
+        mse: {}
+        dynamic_loss:
+          window: 128
+          L: 20.0
+
+  model_input:
+    forecasting:
+      masking_strategy: "forecast"
+  target_input:
+    random_easy_target: {enabled: False}
+
+  forecast:
+    time_step: 86400
+    offset: 1
+    num_steps: 2
+    policy: "fixed"
+    pushforward: False
+
+validation_config:
+  samples_per_mini_epoch: 64
+  shuffle: False
+  start_date: 2200-01-01T00:00
+  end_date: 2200-12-31T00:00
+  validate_with_ema:
+    enabled: False
+  output:
+    num_samples: 0
+    normalized_samples: False
+    streams: null
+  validate_before_training: False
