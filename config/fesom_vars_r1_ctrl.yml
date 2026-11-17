@@ -1,0 +1,13 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Run C of long-rollout round 1 (fvctrl01): the control, stage 3 of the fvars lineage with the
+# latent noise off and nothing else changed. This overlay holds no keys on purpose: the run is
+# fesom_vars_stage3.yml + fesom_vars_r1_base.yml. It exists so all four runs are launched the
+# same way (one run overlay each) and so A, B and D read as one change against C.

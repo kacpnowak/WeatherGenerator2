@@ -84,6 +84,8 @@ class Stepper:
 
     def __init__(self, model, mp, src, land_cells=None, land_init=None):
         self.m, self.mp, self.src = model, mp, src
+        # packed RoPE payload, as the model's forecast loop passes it
+        self.rope = mp.rope_packed_data() if mp.rope_coords is not None else None
         self.lc, self.land_init = land_cells, land_init
         self.na = model.num_aux_tokens
 
@@ -109,7 +111,7 @@ class Stepper:
         try:
             with ctx:
                 zin, cond = self.forcing(z, k)
-                out = m.forecast_engine(zin, cond, coords=self.mp.rope_coords)
+                out = m.forecast_engine(zin, cond, coords=self.rope)
                 if self.lc is not None:
                     out = self.lc.after_step(out, self.land_init, self.na)
         finally:
@@ -122,7 +124,7 @@ class Stepper:
 
 def encode(model, mp, src):
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        tokens, _ = model.encoder(mp, src)
+        tokens, _, _ = model.encoder(mp, src)
         tokens = tokens.reshape((len(src), src.get_num_source_steps(), *tokens.shape[1:])).sum(1)
     return tokens
 

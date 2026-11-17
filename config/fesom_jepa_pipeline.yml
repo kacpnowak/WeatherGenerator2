@@ -1,0 +1,28 @@
+# Temporal-JEPA pretraining of the FESOM ocean model on all vertical levels, followed by a
+# physical 2-step forecast fine-tune: the ocean counterpart of the atmosphere pipeline
+# config/gjl_repro_forecast_n320_pipeline.yml on shmh40/dev/safe-seminar-develop-ssl-diffusion-v1.
+# The forecast stage continues the newly created pretraining checkpoint.
+#
+# Submission (this launcher has no non-submitting dry-run mode):
+#   uv run ../WeatherGenerator-private/hpc/launch-slurm.py --pipeline config/fesom_jepa_pipeline.yml \
+#       --account <slurm account>
+# The launcher takes the code from a sibling checkout named WeatherGenerator (it copies its
+# git-tracked files and config/), so that checkout must hold this code, committed.
+# On JUPITER the FESOM mesh path comes from the stream configs; for runs whose saved config
+# comes from elsewhere add ../WeatherGenerator-private/hpc/jupiter/config/fesom_mesh_jupiter.yml.
+parallelize: false
+stages:
+  - name: pretrain
+    stage: train
+    # an overlay on config/default_config.yml (base_config would replace the default config)
+    config_files:
+      - ./config/fesom_jepa_pretrain.yml
+    chain_jobs: 1
+    nodes: 2
+  - name: forecastft
+    stage: train
+    from_run_id: STAGE.pretrain
+    config_files:
+      - ./config/fesom_jepa_forecast_ft.yml
+    chain_jobs: 1
+    nodes: 2

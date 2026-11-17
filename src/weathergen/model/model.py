@@ -27,6 +27,7 @@ from weathergen.datasets.utils import healpix_verts_rots, r3tos2
 from weathergen.model.encoder import EncoderModule
 from weathergen.model.engines import (
     BilinearDecoder,
+    DeepSSLFusion,
     EnsPredictionHead,
     ForecastingEngine,
     IdentityEngine,
@@ -74,12 +75,15 @@ class ModelOutput:
 
     physical: list[dict[StreamName, torch.Tensor]]
     latent: list[dict[str, torch.Tensor | LatentState]]
+    # deep SSL: per forecast step {head name: [per-level predictions]}; None without deep SSL
+    latent_deep: list[dict[str, list[torch.Tensor]]] | None
 
     def __init__(
         self, len_output: int, batch: BatchSamples | None = None, step_offset: int = 0
     ) -> None:
         self.physical = [{} for _ in range(len_output)]
         self.latent = [{} for _ in range(len_output)]
+        self.latent_deep = None
         self.batch = batch
         self.step_offset = step_offset
         # carried latent one step before the last latent_state, kept for a latent filter
@@ -97,6 +101,13 @@ class ModelOutput:
 
     def add_latent_prediction(self, fstep: int, latent_name: str, pred: torch.Tensor) -> None:
         self.latent[fstep][latent_name] = pred
+
+    def add_deep_latent_prediction(
+        self, fstep: int, name: str, level_preds: list[torch.Tensor]
+    ) -> None:
+        if self.latent_deep is None:
+            self.latent_deep = [{} for _ in range(len(self.physical))]
+        self.latent_deep[fstep][name] = level_preds
 
     def get_physical_prediction(
         self, fstep: int, stream_name: StreamName | None = None, sample_idx: int | None = None
@@ -546,6 +557,9 @@ class Model(torch.nn.Module):
         self.num_register_tokens = cf.num_register_tokens
         self.latent_heads = None
         self.latent_pre_norm = None
+        # deep SSL fusion + per-level projections (student only, see create())
+        self.deep_ssl_fusion: DeepSSLFusion | None = None
+        self.deep_ssl_level_projections: nn.ModuleDict | None = None
         # auxiliary tokens
         self.class_token_idxs = list(
             range(cf.num_register_tokens, cf.num_register_tokens + cf.num_class_tokens)
@@ -839,6 +853,26 @@ class Model(torch.nn.Module):
                         use_patch_token=False,
                     )
 
+        # Deep SSL (V-JEPA 2.1 style): the student fuses the tapped encoder levels, predicts
+        # once and projects the prediction per level. Identity heads (EMA teacher) need no
+        # projection; prepare_encoder_teacher strips the fusion from teachers.
+        deep_ssl_cfg = cf.training_config.get("deep_ssl", None)
+        if deep_ssl_cfg and deep_ssl_cfg.get("enabled", False) and deep_ssl_cfg.get("tap_after"):
+            num_levels = len(deep_ssl_cfg.tap_after) + 1  # taps + final output
+            self.deep_ssl_fusion = DeepSSLFusion(
+                num_levels, cf.ae_global_dim_embed, deep_ssl_cfg.get("fusion_hidden_factor", 2)
+            )
+            self.deep_ssl_level_projections = nn.ModuleDict()
+            for ssl_target_losses in ssl_losses_cfgs:
+                for loss, loss_conf in ssl_target_losses.loss_fcts.items():
+                    head = self.latent_heads[loss] if loss in self.latent_heads else None
+                    if head is None or isinstance(head, LatentPredictionHeadIdentity):
+                        continue
+                    out_dim = loss_conf["out_dim"]
+                    self.deep_ssl_level_projections[loss] = nn.ModuleList(
+                        [nn.Linear(out_dim, out_dim, bias=False) for _ in range(num_levels)]
+                    )
+
         return self
 
     def reset_parameters(self):
@@ -1014,13 +1048,16 @@ class Model(torch.nn.Module):
         if isinstance(batch, BatchSamples):
             step_offset = 0
             batch_ctx = batch
-            tokens, posteriors = self.encoder(model_params, batch_ctx)
+            tokens, posteriors, intermediates = self.encoder(model_params, batch_ctx)
             output.add_latent_prediction(0, "posteriors", posteriors)
             shape = (len(batch), batch.get_num_source_steps(), *tokens.shape[1:])
             tokens = tokens.reshape(shape).sum(axis=1)
+            # deep SSL taps, collapsed over input steps like the tokens
+            intermediates = [inter.reshape(shape).sum(axis=1) for inter in intermediates]
             if land_cells is not None:
                 land_init = land_cells.initial_tokens(tokens, self.num_aux_tokens)
         else:
+            intermediates = None
             step_offset = batch.step_offset + len(batch.physical)
             latent_state = batch.get_last_latent_state()
             batch_ctx = batch.batch
@@ -1160,7 +1197,9 @@ class Model(torch.nn.Module):
                 model_params, step, step + batch_step_offset, tokens, batch_ctx, output
             )
             # latent predictions (raw and with SSL heads)
-            output = self.predict_latent(model_params, step, tokens, batch_ctx, output)
+            output = self.predict_latent(
+                model_params, step, tokens, batch_ctx, output, intermediates
+            )
 
         output.latent_filter_prev = z_prev
         output.land_cells_init = land_init
@@ -1173,9 +1212,12 @@ class Model(torch.nn.Module):
         tokens: torch.Tensor,
         batch: ModelBatch,
         output: ModelOutput,
+        intermediates: list[torch.Tensor] | None = None,
     ) -> ModelOutput:
         """
         Compute latent predictions
+
+        intermediates: deep SSL encoder taps (only used at step 0, like the SSL heads)
         """
 
         # safe latent prediction
@@ -1186,6 +1228,31 @@ class Model(torch.nn.Module):
         # latent predictions for SSL training
         for name, head in self.latent_heads.items():
             output.add_latent_prediction(step, name, head(latent_state))
+
+        # deep SSL: multi-level predictions
+        if intermediates and step == 0:
+            all_levels = intermediates + [tokens]
+            if self.deep_ssl_fusion is not None:
+                # student: fuse all levels, predict once, project per level
+                fused = self.deep_ssl_fusion(all_levels)
+                fused_latent = self.tokens_to_latent_state(self.latent_pre_norm(fused), fused)
+                for name, head in self.latent_heads.items():
+                    predictor_out = head(fused_latent)
+                    projections = self.deep_ssl_level_projections[name]
+                    level_preds = [proj(predictor_out) for proj in projections]
+                    output.add_deep_latent_prediction(step, name, level_preds)
+            else:
+                # teacher: independent prediction per level (no fusion)
+                level_preds_per_head: dict[str, list[torch.Tensor]] = {
+                    name: [] for name in self.latent_heads
+                }
+                for level_tokens in all_levels:
+                    level_post_norm = self.latent_pre_norm(level_tokens)
+                    level_state = self.tokens_to_latent_state(level_post_norm, level_tokens)
+                    for name, head in self.latent_heads.items():
+                        level_preds_per_head[name].append(head(level_state))
+                for name, preds in level_preds_per_head.items():
+                    output.add_deep_latent_prediction(step, name, preds)
 
         return output
 

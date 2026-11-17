@@ -291,7 +291,7 @@ def probe_encdec(tr, batch, args):
     stats = {s: stream_stats(ds, s) for s in STREAMS}
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        tokens, _ = model.encoder(mp, src)
+        tokens, _, _ = model.encoder(mp, src)
         tokens = tokens.reshape((len(src), src.get_num_source_steps(), *tokens.shape[1:])).sum(1)
     preds = [decode(model, mp, tokens, src, 0, STREAMS)]
     latents = [tokens]
@@ -346,6 +346,9 @@ class StepMap:
 
     def __init__(self, model, model_params, src, fidx):
         self.model, self.mp, self.src, self.fidx = model, model_params, src, fidx
+        # packed RoPE payload, as the model's forecast loop passes it
+        mp = model_params
+        self.rope = mp.rope_packed_data() if mp.rope_coords is not None else None
         self.forcing = src.forcing[fidx]
         self.condition = src.conditions[fidx]
         self.n_calls = 0
@@ -365,7 +368,7 @@ class StepMap:
         try:
             with ctx:
                 t, cond = m.forcing_module(z, self.condition, self.forcing, m.num_aux_tokens)
-                t = m.forecast_engine(t, cond, coords=self.mp.rope_coords)
+                t = m.forecast_engine(t, cond, coords=self.rope)
         finally:
             set_fe_attention_dtype(m, torch.bfloat16)
             torch.backends.cuda.matmul.allow_tf32 = tf32
@@ -757,7 +760,12 @@ def probe_gain(tr, batch, args):
             if isinstance(m, att_mod.MultiSelfAttentionHead):
                 m.dtype = torch.float64
         forcing64 = F.forcing.double() if torch.is_tensor(F.forcing) else F.forcing
-        rope = mp.rope_coords.double() if torch.is_tensor(mp.rope_coords) else mp.rope_coords
+        # the packed RoPE payload (coefficients / Wigner-D matrices in the spherical modes)
+        rope = mp.rope_packed_data() if mp.rope_coords is not None else None
+        if torch.is_tensor(rope):
+            rope = rope.double()
+        elif rope is not None:
+            rope = tuple(r.double() for r in rope)
         z64 = z.double()
 
         def f64(x):

@@ -16,7 +16,7 @@ EXPECTED = {
     "V": (2153, "ocean_elem", [f"v_{d}" for d in DEPTHS], "wet_stats_elem.json"),
     "SURFACE": (2154, "ocean_node", ["ssh", "a_ice", "m_ice"], None),
 }
-ARCHIVE = Path("/work/ab0995/a270088/Kacper/weathergenertor/AWICM3")
+ARCHIVE = Path("/e/data1/climateai/hclimrep/data/ifs-fesom")
 
 
 def test_stream_names():
@@ -31,7 +31,7 @@ def test_ocean_stream(name):
     assert list(s["source"]) == channels and list(s["target"]) == channels
     assert s["loss_weight"] == 1.0
     assert s["wet_mask_from_mesh"] is True and s["bathymetry_geoinfo"] is True
-    assert s["mesh_path"] == "/work/ab0995/a270225/atmorep_data/multiverse/core2/original/cycle_1/fesom.mesh.diag.nc"
+    assert s["mesh_path"] == "/e/data1/climateai/hclimrep/data/ifs-fesom/fesom.mesh.diag.nc"
     if stats:
         assert s["normalization_stats"] == f"config/streams/fesom/{stats}"
     else:

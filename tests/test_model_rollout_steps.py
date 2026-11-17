@@ -54,13 +54,13 @@ def _stub_model():
         output.add_physical_prediction(output_step, "stream", tokens)
         return output
 
-    def predict_latent(model_params, step, tokens, batch, output):
+    def predict_latent(model_params, step, tokens, batch, output, intermediates=None):
         state = LatentState(None, None, None, tokens)
         output.add_latent_prediction(step, "latent_state", state)
         return output
 
     model = SimpleNamespace(
-        encoder=lambda params, batch: (torch.zeros(len(batch), NUM_TOKENS, DIM), None),
+        encoder=lambda params, batch: (torch.zeros(len(batch), NUM_TOKENS, DIM), None, []),
         forecast_engine=forecast_engine,
         forcing_module=forcing_module,
         predict_decoders=predict_decoders,

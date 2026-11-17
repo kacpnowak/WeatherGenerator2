@@ -8,7 +8,6 @@
 # nor does it submit to any jurisdiction.
 
 import dataclasses
-import itertools
 import logging
 import pathlib
 from collections.abc import Sequence
@@ -50,6 +49,27 @@ FORECAST_DEFAULTS = {
     "policy": None,
     "num_steps": np.array([0], dtype=np.int32),
 }
+
+
+def resolve_data_file(
+    fname: str | pathlib.Path, data_paths: Sequence[str | pathlib.Path], what: str
+) -> pathlib.Path:
+    """
+    Return the path of a stream's data file (zarr stores may be directories).
+
+    `fname` itself if it exists (a full path overrides the data paths), else the first
+    `data_paths` entry under which it exists. The same dataset can live in several data
+    paths, so a candidate that is missing must not be picked just because it comes first.
+    `what` names the stream in the error raised when no candidate exists.
+    """
+    fname = pathlib.Path(fname)
+    if fname.exists():
+        return fname
+    candidates = [pathlib.Path(path) / fname for path in data_paths]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Did not find input data for {what}: {candidates}.")
 
 
 def collect_datasources(stream_datasets: list, idx: int, type: str, rng) -> IOReaderData:
@@ -156,8 +176,31 @@ def resolve_prefix_range(forecast_cfg: dict, stage: Stage) -> tuple[int, int]:
     return (prefix[0], prefix[1])
 
 
+def resolve_prefix_zero_fraction(forecast_cfg: dict, stage: Stage) -> float:
+    """
+    Share of training steps with no spin-up (`forecast.prefix_zero_fraction`, default 0).
+
+    With a wide prefix range a step rarely starts from the initial condition, and only those
+    steps train the encoder and the first forecast steps; this guarantees a share of them.
+    """
+    fraction = forecast_cfg.get("prefix_zero_fraction", 0.0)
+    if stage != TRAIN:
+        return 0.0
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, int | float)
+        or not 0 <= fraction <= 1
+    ):
+        raise ValueError(f"forecast.prefix_zero_fraction must be in [0, 1], got {fraction!r}")
+    return float(fraction)
+
+
 def draw_prefix_steps(
-    prefix_range: tuple[int, int], seed: int, mini_epoch: int, position: int
+    prefix_range: tuple[int, int],
+    seed: int,
+    mini_epoch: int,
+    position: int,
+    zero_fraction: float = 0.0,
 ) -> int:
     """
     Spin-up length of the training step at `position` (sample index in the rank's share).
@@ -165,41 +208,79 @@ def draw_prefix_steps(
     Seeded only by the run seed, the mini-epoch and the position, never by the rank or the
     loader worker, so every rank draws the same length for the same training step: no rank
     waits on another's longer spin-up, and all ranks run the same forecast-engine calls.
+    A share `zero_fraction` of the steps has no spin-up; without it the draws are the ones
+    runs made before the option existed, so their resume replays the same spin-ups.
     """
     low, high = prefix_range
     if high == 0:
         return 0
     rng = np.random.default_rng([seed, mini_epoch, position])
-    return int(rng.integers(low, high + 1))
+    prefix = int(rng.integers(low, high + 1))
+    if zero_fraction > 0 and rng.random() < zero_fraction:
+        return 0
+    return prefix
 
 
-def resume_worker_skips(batches_per_worker: Sequence[int], num_skip: int) -> tuple[list[int], int]:
+def worker_ranges(rank: int, len_per_rank: int, num_workers: int) -> list[tuple[int, int]]:
     """
-    Split the first `num_skip` batches of a mini-epoch over the loader workers that yield them.
+    Sample range [iter_start, iter_end) of every DataLoader worker of `rank`.
 
-    torch's DataLoader (with in_order=True, the default) sends one task per round to every
-    worker whose iterator is not exhausted, cycling through the workers from worker 0 at every
-    iter(), and returns the results in task order. Worker w's j-th batch is therefore returned
-    in round j, and the batches of a mini-epoch come as round 0 (workers 0, 1, ...), round 1,
-    ..., with only the workers that have more than j batches in round j (the last worker can
-    have more batches than the others).
-
-    Returns the number of each worker's batches among the first `num_skip`, and the worker
-    that yields the batch after them (0 when there is no skip or no batch left).
+    The rank's share [rank * len_per_rank, (rank + 1) * len_per_rank) is split evenly over the
+    workers, and the last worker also takes the remainder.
     """
-    num_workers = len(batches_per_worker)
-    consumed = [0] * num_workers
-    if num_skip <= 0:
-        return consumed, 0
-    order = (
-        w
-        for j in range(max(batches_per_worker, default=0))
+    local_start, local_end = rank * len_per_rank, (rank + 1) * len_per_rank
+    per_worker = len_per_rank // num_workers
+    ranges = [
+        (local_start + w * per_worker, local_start + (w + 1) * per_worker)
         for w in range(num_workers)
-        if j < batches_per_worker[w]
-    )
-    for w in itertools.islice(order, num_skip):
-        consumed[w] += 1
-    return consumed, next(order, 0)
+    ]
+    ranges[-1] = (ranges[-1][0], local_end)
+    return ranges
+
+
+def _delivery_order(worker_lengths: list[int]) -> list[int]:
+    """
+    DataLoader worker of every batch, in the order the trainer receives them.
+
+    For an IterableDataset the DataLoader returns batches round-robin over the workers that
+    still have batches, starting at worker 0: round k holds the k-th batch of every worker with
+    more than k batches. `worker_lengths` is the number of batches of each worker.
+    """
+    return [
+        w
+        for k in range(max(worker_lengths, default=0))
+        for w, num_batches in enumerate(worker_lengths)
+        if k < num_batches
+    ]
+
+
+def worker_skip_counts(steps_to_skip: int, worker_lengths: list[int]) -> list[int]:
+    """
+    Number of its own batches each DataLoader worker skips so that the first `steps_to_skip`
+    batches the trainer receives are skipped.
+    """
+    skips = [0] * len(worker_lengths)
+    for w in _delivery_order(worker_lengths)[:steps_to_skip]:
+        skips[w] += 1
+    return skips
+
+
+def resumed_worker_assignments(
+    steps_to_skip: int, worker_lengths: list[int]
+) -> list[tuple[int, int] | None]:
+    """
+    For every DataLoader worker of a resumed run: the original worker it takes over and how
+    many of that worker's batches it skips, or None when it has nothing left to produce.
+
+    A fresh DataLoader starts its round-robin at worker 0, but the batch at step
+    `steps_to_skip` of the uninterrupted run can come from any worker. Resumed worker j thus
+    produces the batches of the j-th original worker to deliver after the skipped steps, so the
+    trainer receives the remaining batches in the uninterrupted order.
+    """
+    skips = worker_skip_counts(steps_to_skip, worker_lengths)
+    # original workers in the order they deliver their next batch after the skipped steps
+    takers = list(dict.fromkeys(_delivery_order(worker_lengths)[steps_to_skip:]))
+    return [(w, skips[w]) for w in takers] + [None] * (len(worker_lengths) - len(takers))
 
 
 @dataclasses.dataclass
@@ -216,10 +297,8 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self._stage = stage
 
         self.mini_epoch = 0
-        # batches (per rank) at the start of the current mini-epoch to skip: those a run
-        # resumed from a mid-epoch checkpoint has already trained (set by the trainer, reset
-        # by advance())
-        self.skip_batches = 0
+        # training steps of the current mini-epoch done by an earlier job (set_resume_position)
+        self.skip_steps = 0
         self.mask_value = 0.0
         self.rank = cf.rank
         self.world_size = cf.world_size
@@ -237,8 +316,24 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.forecast_policy = forecast_cfg["policy"]
         steps = np.array(forecast_cfg["num_steps"], dtype=np.int32).reshape(-1)
         self.list_num_forecast_steps = np.array(steps, dtype=np.int32)
+        # teacher_time_offset (temporal JEPA): number of time windows the teacher's input is
+        # shifted forward relative to the student's. Only active with student_teacher training,
+        # so an offset left in a pretraining config cannot leak into forecast finetuning or
+        # inference (where it would shift every target time by that many windows).
+        configured_offset = int(mode_cfg.get("teacher_time_offset", 0) or 0)
+        if "student_teacher" in mode_cfg.get("training_mode", []):
+            self.teacher_time_offset = configured_offset
+        else:
+            if configured_offset != 0:
+                logger.warning(
+                    f"teacher_time_offset={configured_offset} is set but training_mode="
+                    f"{mode_cfg.get('training_mode', [])} does not include 'student_teacher'. "
+                    "Ignoring it (setting to 0)."
+                )
+            self.teacher_time_offset = 0
         # unsupervised spin-up steps drawn per training step (training stage only)
         self._prefix_range = resolve_prefix_range(forecast_cfg, stage)
+        self._prefix_zero_fraction = resolve_prefix_zero_fraction(forecast_cfg, stage)
 
         # Lazy target materialization: for a long single-sample rollout (decadal), building
         # every forecast step's targets up front blows memory. When the rollout is chunked
@@ -246,10 +341,15 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # chunk of targets at a time instead. Multi-sample runs (e.g. weather-range with
         # several samples) keep the eager path so dataloader workers stay useful.
         chunk_size = forecast_cfg.get("chunk_size") or int(self.list_num_forecast_steps.max())
-        self._lazy_targets = (
-            mode_cfg.get("samples_per_mini_epoch", 0) == 1
-            and chunk_size < int(self.list_num_forecast_steps.max())
+        self._lazy_targets = mode_cfg.get("samples_per_mini_epoch", 0) == 1 and chunk_size < int(
+            self.list_num_forecast_steps.max()
         )
+        # the teacher time offset is implemented in the eager full-batch path only
+        if self.teacher_time_offset > 0 and (self._lazy_targets or self._prefix_range[1] > 0):
+            raise NotImplementedError(
+                "teacher_time_offset > 0 is not supported with forecast.prefix_steps or "
+                "chunked (lazy-target) rollouts."
+            )
 
         # free-running forecast: for forecast steps beyond the dataset coverage there is no
         # ground truth, so gridded (anemoi) streams build a full-grid target query with
@@ -295,13 +395,17 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         """Check if samples_per_mini_epoch is suitable
         Repeated both to initialise the MultiStreamDataSampler and for each mini epoch"""
 
-        max_index = self.index_range.end - (
-            (  # max time units needed to make a forecast
-                self.time_step * (fsm + self.output_offset)  # translation due to forecasting
-                + self.len_timedelta  # length of forecasting window
+        max_index = (
+            self.index_range.end
+            - (
+                (  # max time units needed to make a forecast
+                    self.time_step * (fsm + self.output_offset)  # translation due to forecasting
+                    + self.len_timedelta  # length of forecasting window
+                )
+                // self.step_timedelta  # as number of indexs
             )
-            // self.step_timedelta  # as number of indexs
-        )
+            - self.teacher_time_offset
+        )  # the teacher reads windows that far ahead
 
         available_samples = max_index * self.batch_size  # as number of samples
 
@@ -352,6 +456,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         depends on fsm so must be repeated for __init__ and reset"""
         perms_len = int(self.index_range.end - self.index_range.start)
         perms_len -= (fsm + self.output_offset) * (self.time_step // self.step_timedelta)
+        # the teacher reads its windows at idx + teacher_time_offset: keep those in range
+        perms_len -= self.teacher_time_offset
 
         return np.arange(perms_len)
 
@@ -400,24 +506,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             dataset = self._get_dataset_class(stream_info, stream_name)
 
             for fname in stream_info["filenames"]:
-                fname = pathlib.Path(fname)
-                # dont check if file exists since zarr stores might be directories
-                if fname.exists():
-                    # check if fname is a valid path to allow for simple overwriting
-                    filename = fname
-                else:
-                    filenames = [pathlib.Path(path) / fname for path in cf.data_paths]
-
-                    if not any(filename.exists() for filename in filenames):  # see above
-                        msg = (
-                            f"Did not find input data for {stream_info['type']} "
-                            f"stream '{stream_name}': {filenames}."
-                        )
-                        raise FileNotFoundError(msg)
-
-                    # The same dataset can exist on different locations in the filesystem,
-                    # so we need to choose here.
-                    filename = filenames[0]
+                filename = resolve_data_file(
+                    fname, cf.data_paths, f"{stream_info['type']} stream '{stream_name}'"
+                )
 
                 ds_type = stream_info["type"]
                 if is_root():
@@ -506,17 +597,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             )
             forcing_tw_handler = forcing_time_window_handler(self.time_window_handler, stream_info)
             for fname in stream_info["filenames"]:
-                fname = pathlib.Path(fname)
-                if fname.exists():
-                    filename = fname
-                else:
-                    filenames = [pathlib.Path(path) / fname for path in cf.data_paths]
-                    if not any(f.exists() for f in filenames):
-                        raise FileNotFoundError(
-                            f"Did not find input data for forcing stream '{stream_name}': "
-                            f"{filenames}."
-                        )
-                    filename = filenames[0]
+                filename = resolve_data_file(
+                    fname, cf.data_paths, f"forcing stream '{stream_name}'"
+                )
 
                 ds = dataset(
                     tw_handler=forcing_tw_handler,
@@ -670,8 +753,20 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         Advance mini_epoch (this is applied to the template for the worker processes)
         """
         self.mini_epoch += 1
-        # a resumed run skips trained batches only in the mini-epoch it resumes in
-        self.skip_batches = 0
+        # a resume position applies only to the mini-epoch it was set for
+        self.skip_steps = 0
+
+    def set_resume_position(self, mini_epoch: int, steps_done: int) -> None:
+        """
+        Continue in mini-epoch `mini_epoch` after its first `steps_done` training steps.
+
+        Like advance(), this is applied to the template for the worker processes. The next
+        iteration yields the batches an uninterrupted run yields from step `steps_done` on:
+        the skipped steps keep their place in the sample, forecast-step and spin-up sequences,
+        but their data is not loaded.
+        """
+        self.mini_epoch = mini_epoch
+        self.skip_steps = steps_done
 
     def get_sources_size(self):
         return [
@@ -1005,9 +1100,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
             if rdata.is_empty():
                 time_win = self.time_window_handler.window(step_forecast_dt)
-                if self.free_running and all(
-                    isinstance(ds, DataReaderAnemoi) for ds in stream_ds
-                ):
+                if self.free_running and all(isinstance(ds, DataReaderAnemoi) for ds in stream_ds):
                     # forecast beyond the data: predict the full grid using analytic geoinfos
                     # (no ground truth exists past the dataset). Not a spoof -> outputs written.
                     rdata = collect_forecast_queries(stream_ds, time_win.start)
@@ -1133,6 +1226,28 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             input_tokens = self.tokenizer.get_tokens_windows(stream_info, input_data, True)
             output_tokens = self.tokenizer.get_tokens_windows(stream_info, output_data, False)
 
+            # temporal JEPA: the teacher (target) samples see windows shifted forward in time
+            target_idx = idx + self.teacher_time_offset
+            if self.teacher_time_offset > 0:
+                input_data_target = self._get_input_windows(target_idx, i_max, stream_ds)
+                input_tokens_target = self.tokenizer.get_tokens_windows(
+                    stream_info, input_data_target, True
+                )
+                if "target_coords" in target_select or "target_values" in target_select:
+                    output_data_target = self._get_output_windows(
+                        target_idx, num_forecast_steps, stream_ds
+                    )
+                    output_tokens_target = self.tokenizer.get_tokens_windows(
+                        stream_info, output_data_target, False
+                    )
+                else:
+                    # the targets use only the teacher's network input: skip reading the
+                    # shifted output windows (placeholders, never read for this mode)
+                    output_data_target, output_tokens_target = output_data, output_tokens
+            else:
+                input_data_target, output_data_target = input_data, output_data
+                input_tokens_target, output_tokens_target = input_tokens, output_tokens
+
             for sidx, source_mask in enumerate(source_masks.masks):
                 # Map each source to its target
                 tidx = source_to_target[sidx].item()
@@ -1158,14 +1273,14 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 # the inputs. Hence the target mask is also the source mask here.
                 sdata = self._build_stream_data(
                     target_select,
-                    idx,
+                    target_idx,
                     num_forecast_steps,
                     stream_info,
                     target_masks.metadata[tidx].params.get("num_steps_input", 1),
-                    input_data,
-                    output_data,
-                    input_tokens,
-                    output_tokens,
+                    input_data_target,
+                    output_data_target,
+                    input_tokens_target,
+                    output_tokens_target,
                     output_mask=target_mask,
                     input_mask=target_mask,
                 )
@@ -1462,9 +1577,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         from weathergen.model.forcing import ForcingUnavailableError
 
         iter_start, iter_end, num_skip = self.worker_workset()
-        logger.info(
-            f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}, skip={num_skip}"
-        )
+        logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
         # position of this worker's first sample in the rank's share: the same on every rank
         rank_position = iter_start - self.rank * self.len
 
@@ -1480,18 +1593,12 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         forcing_skips = 0
         for i, _bidx in enumerate(range(iter_start, iter_end, self.batch_size)):
             if i < num_skip:
-                # a run resumed within this mini-epoch has trained this batch already (see
-                # worker_workset): advance the loop index (which selects the forecast steps and
-                # the spin-up draw) and idx_raw as if the batch had used one sample, without
-                # loading data. The sample index, forecast steps and spin-up length of the
-                # batches that follow are those of an uninterrupted run, except that
-                # (a) a skipped batch that originally skipped invalid samples (empty, NaN,
-                #     missing forcing) used more than one, which shifts idx_raw after it, and
-                # (b) self.rng, which the tokenizer/masking and the target subsampling draw
-                #     from, is not advanced for the skipped batches, so their draws after a
-                #     mid-epoch resume differ from those of an uninterrupted run.
+                # already trained on: consume its sample without loading it, so the following
+                # batches keep the samples, forecast steps and spin-up lengths of an
+                # uninterrupted run (assumes no invalid sample was retried before it)
                 idx_raw += 1
                 continue
+
             # num_forecast_steps needs to be constant per batch
             # (amortized through data parallel training)
             num_forecast_steps = perms_num_forecast_steps[i]
@@ -1501,6 +1608,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 self._prefix_seed,
                 self.mini_epoch,
                 rank_position + i * self.batch_size,
+                self._prefix_zero_fraction,
             )
 
             # use while loop due to the scattered nature of the data in time and to
@@ -1535,9 +1643,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     # ensure the batch is valid, i.e. not completely empty and no NaN values
                     # student teacher has no classical targets
                     not_valid = batch.sources_empty() or batch.is_nan()
-                    not_valid = not_valid or (
-                        batch.targets_empty() if "masking" in mode else False
-                    )
+                    not_valid = not_valid or (batch.targets_empty() if "masking" in mode else False)
 
                 # skip completely empty batch item or when all targets are empty -> no grad
                 if not_valid:
@@ -1551,52 +1657,47 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
     def __len__(self):
         return self.len
 
-    def _worker_range(self, worker_id: int, num_workers: int) -> tuple[int, int]:
-        """Samples [iter_start, iter_end) of loader worker `worker_id` in the rank's share."""
-        local_start, local_end = self.rank * self.len, (self.rank + 1) * self.len
-        per_worker = (local_end - local_start) // num_workers
-        iter_start = local_start + worker_id * per_worker
-        # the last worker takes the remainder
-        iter_end = local_end if worker_id + 1 == num_workers else iter_start + per_worker
-        return iter_start, iter_end
-
-    def worker_workset(self):
+    def worker_workset(self) -> tuple[int, int, int]:
         """
-        Share of this loader worker in the current mini-epoch: its samples [iter_start,
-        iter_end) and the number of its first batches to skip (those a resumed run has
-        already trained, see `skip_batches`).
+        Sample range [iter_start, iter_end) of this loader worker, and the number of its first
+        batches to skip because an earlier job trained on them (set_resume_position).
+
+        When resumed mid-mini-epoch, the worker takes over the original worker given by
+        resumed_worker_assignments: that worker's range and RNG seed, so the trainer receives
+        the remaining batches of the uninterrupted run in the same order.
         """
         local_start, local_end = self.rank * self.len, (self.rank + 1) * self.len
 
         worker_info = torch.utils.data.get_worker_info()
-
         if worker_info is None:
             assert self.world_size == 1, self.world_size
-            iter_start = 0
-            iter_end = len(self)
-            num_skip = min(self.skip_batches, len(range(iter_start, iter_end, self.batch_size)))
-
+            worker_id, num_workers = 0, 1
         else:
-            num_workers = worker_info.num_workers
-            # resuming within the mini-epoch: the trained batches came from the workers in
-            # round robin (see resume_worker_skips), so each worker skips its own share of
-            # them. The loader starts its round robin at worker 0 again, so loader worker 0
-            # takes the role (share, seed) of the worker that yields the next batch, and the
-            # others follow in order: the batches then come in the uninterrupted order.
-            batches_per_worker = [
-                len(range(*self._worker_range(w, num_workers), self.batch_size))
-                for w in range(num_workers)
-            ]
-            consumed, next_worker = resume_worker_skips(batches_per_worker, self.skip_batches)
-            worker_id = (worker_info.id + next_worker) % num_workers
-            num_skip = consumed[worker_id]
+            worker_id, num_workers = worker_info.id, worker_info.num_workers
+        ranges = worker_ranges(self.rank, self.len, num_workers)
 
+        num_skip = 0
+        if self.skip_steps > 0:
+            lengths = [-(-(end - start) // self.batch_size) for start, end in ranges]
+            assignment = resumed_worker_assignments(self.skip_steps, lengths)[worker_id]
+            logger.info(
+                f"mini_epoch {self.mini_epoch} resumed at step {self.skip_steps}: loader worker "
+                f"{worker_id} takes over (worker, skipped batches) {assignment}"
+            )
+            if assignment is None:
+                # the remaining batches all come from the other workers
+                return local_end, local_end, 0
+            worker_id, num_skip = assignment
+        iter_start, iter_end = ranges[worker_id]
+
+        if worker_info is not None:
             # ensure the rng seed is fully unique across workers and mini_epochs
             # the worker processes are generated as bit-wise copy of the "template" (the actual
             # instance of the present class that is created) whenever __iter__ is started. This
             # happens for each mini_epoch, for train and validation, and independently for each DDP
             # worker. After the bit-wise copy, the rng seed needs to be made unique for
-            # DDP workers, loader process, mini_epoch.
+            # DDP workers, loader process, mini_epoch. When resumed, worker_id is the original
+            # worker taken over, whose seed reproduces its samples.
             dist = torch.distributed
             self.data_loader_rng_seed *= (
                 (((dist.get_rank() + 1) * 73) if dist.is_initialized() else 1)
@@ -1604,12 +1705,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 * (self.mini_epoch + 13)
                 * 7
             )
-            # split workload
-            iter_start, iter_end = self._worker_range(worker_id, num_workers)
             logger.info(
                 f"{self.rank}::{worker_info.id}"
                 + f" : dataset [{local_start},{local_end}) : [{iter_start},{iter_end})"
-                + (f" (worker {worker_id}'s share, skip {num_skip})" if self.skip_batches else "")
             )
 
         return iter_start, iter_end, num_skip

@@ -53,6 +53,7 @@ paper_eval/
   compute_spectra.py    # CLI: spectra stage orchestrator -> spectra.nc
   regrid.py             # nearest-neighbour mesh->lat/lon regridding; optional visual-check utility, unused by the pipeline
   selfcheck.py          # CLI: independent re-derivation + verification of the stage-1 cache (8 checks)
+  rollout_gate.py       # CLI: stability gate of a free rollout (all streams finite, SST RMSE < 3 degC at every checked lead); no climatology
   plot.py               # CLI: build every figure (f01..f11) from the caches
   plotting/             # per-figure builders (curves, depth, fesom_maps, eerie_maps, seasonal, spectra_figs,
                          # variability) + shared style.py
@@ -116,6 +117,19 @@ stage-1 cache. Prints one PASS/FAIL/SKIP line per check plus a summary line; exi
 nonzero iff any check FAILs (a SKIP, e.g. a missing maps cache, does not fail the run).
 Confirmed 8/8 PASS against the full production cache, with recompute deltas essentially
 exact (<1e-9).
+
+### c2. Rollout stability gate (no climatology, no compute pass)
+
+```
+.venv/bin/python -m paper_eval.rollout_gate --results-dir <dir> --mini-epoch 0 \
+    --archive <ifs-fesom>/ocean_node --mesh <ifs-fesom>/fesom.mesh.diag.nc --every 10
+```
+
+For every `--every`-th lead (and the last) it prints the area-weighted wet-point RMSE of
+`temp_2` (TEMP stream) against the ocean_node archive at `init + lead` days, and whether
+every prediction of TEMP, SALT, SURFACE, U and V is finite. Finiteness is checked at every lead. Exits nonzero unless all are
+finite, every RMSE is below `--max-sst-rmse` (3.0) and the rollout reaches `--min-lead`
+(120: past the days 50-80 window in which the earlier fvars models blew up).
 
 ### d. Stage-1 full run
 

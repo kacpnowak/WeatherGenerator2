@@ -22,7 +22,7 @@ FORCED_SETS = {
     "fesom_forced_adaln": "adaln_local",
     "fesom_forced_atm": "additive",
 }
-ATMOS_ARCHIVE = Path("/work/ab0995/a270088/Kacper/weathergenertor/AWICM3/atmos_all")
+ATMOS_ARCHIVE = Path("/e/data1/climateai/hclimrep/data/ifs-fesom/atmos_all")
 
 
 def _ocean_stream_names():

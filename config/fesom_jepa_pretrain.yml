@@ -1,0 +1,234 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Temporal-JEPA pretraining of the FESOM ocean encoder on ALL vertical levels (stage 1 of
+# config/fesom_jepa_pipeline.yml; stage 2 is the 2-step forecast fine-tune
+# config/fesom_jepa_forecast_ft.yml).
+#
+#   .venv/bin/train --config config/fesom_jepa_pretrain.yml
+#
+# Streams: TEMP, SALT, U, V with all 46 wet levels (2-5825 m) and SURFACE (ssh, a_ice, m_ice),
+# config/streams/fesom_all_levels/ (the fvars streams stop at 2035 m). No IFS forcing here: in
+# this model the atmosphere enters only through the forecast engine, which this stage does not
+# have; the forecast stage adds it.
+#
+# Task (temporal JEPA, as config_gjl6a0kb_reproduction_n320_iasi_channels.yml on the
+# shmh40/dev/safe-seminar-develop-ssl-diffusion-v1 branch): the student encodes the ocean of day
+# t, the EMA teacher the ocean of day t+1 (teacher_time_offset: 1, one 1-day window), and a
+# transformer predictor maps the student's latent onto the teacher's at every teacher-visible
+# cell (JEPA temporal: true). Deep SSL supervises the input of the global engine and the
+# outputs of its first two layers as well as the final latent.
+#
+# Architecture: the encoder of config/config_fesom_vars.yml (the fvars family) unchanged, so the
+# forecast stage is an fvars model with a JEPA-pretrained encoder. Differences against it:
+# fe_num_blocks 0 (the forecast engine would otherwise run at step 0 here), no FSDP (the EMA
+# teacher does not support it), no physical loss.
+
+streams_directory: ./config/streams/fesom_all_levels/
+zarr_store: "zip"
+
+embed_unembed_mode: "block"
+embed_dropout_rate: 0.1
+
+ae_local_dim_embed: 2048
+ae_local_num_blocks: 4
+ae_local_num_heads: 16
+ae_local_dropout_rate: 0.1
+ae_local_with_qk_lnorm: True
+ae_local_num_queries: 1
+ae_local_queries_per_cell: False
+ae_local_max_tokens_per_cell: 256
+
+ae_adapter_num_heads: 16
+ae_adapter_embed: 128
+ae_adapter_with_qk_lnorm: True
+ae_adapter_with_residual: True
+ae_adapter_dropout_rate: 0.1
+
+ae_global_dim_embed: 2048
+ae_global_num_blocks: 4
+ae_global_num_heads: 32
+ae_global_dropout_rate: 0.1
+ae_global_with_qk_lnorm: True
+ae_global_att_dense_rate: 1.0
+ae_global_block_factor: 64
+ae_global_mlp_hidden_factor: 2
+ae_global_trailing_layer_norm: False
+
+ae_aggregation_num_blocks: 8
+ae_aggregation_num_heads: 32
+ae_aggregation_dropout_rate: 0.1
+ae_aggregation_with_qk_lnorm: True
+ae_aggregation_att_dense_rate: 1.0
+ae_aggregation_block_factor: 64
+ae_aggregation_mlp_hidden_factor: 2
+
+decoder_type: PerceiverIOCoordConditioning
+pred_adapter_kv: False
+pred_self_attention: True
+pred_dyadic_dims: False
+pred_mlp_adaln: True
+
+num_class_tokens: 0
+num_register_tokens: 0
+
+# no forecast engine during pretraining; the forecast stage creates it (16 blocks, as fvars)
+fe_num_blocks: 0
+fe_num_heads: 16
+fe_dropout_rate: 0.0
+fe_with_qk_lnorm: True
+fe_layer_norm_after_blocks: [7]
+fe_impute_latent_noise_std: 0.0
+forecast_att_dense_rate: 1.0
+
+healpix_level: 5
+rope_2D: False
+
+with_mixed_precision: True
+with_flash_attention: True
+compile_model: False
+# EMATeacher does not support FSDP
+with_fsdp: False
+# every parameter gets a gradient (without a physical loss no decoders are built; the forecast
+# stage creates them). True would also fail: DDP cannot find the tensors inside ModelOutput.
+ddp_find_unused_parameters: False
+attention_dtype: bf16
+mixed_precision_dtype: bf16
+mlp_norm_eps: 1e-5
+norm_eps: 1e-4
+norm_type: "LayerNorm"
+
+freeze_modules: ""
+
+train_logging:
+  terminal: 10
+  metrics: 20
+  checkpoint: 250
+  # same block as config/fesom_jepa_collapse_monitor.yml
+  collapse_monitoring:
+    enabled: true
+    compute_frequency: 20
+    log_frequency: 20
+    metrics:
+      effective_rank: {enabled: true, tensor_source: "both", sample_size: 2048}
+      singular_values: {enabled: true, tensor_source: "both", sample_size: 2048}
+      dimension_variance: {enabled: true, tensor_source: "both"}
+      prototype_entropy: {enabled: false}
+      ema_beta: {enabled: true}
+
+data_loading:
+  num_workers: 8
+  repeat_data_in_mini_epoch: False
+
+training_config:
+  training_mode: ["student_teacher"]
+  # the teacher sees the next 1-day window
+  teacher_time_offset: 1
+  deep_ssl:
+    enabled: True
+    tap_after: [local2global, "global:0", "global:1"]
+    fusion_hidden_factor: 4
+    level_weights: [0.25, 0.25, 0.25, 0.25]
+  context_loss:
+    enabled: False
+
+  num_mini_epochs: 64
+  samples_per_mini_epoch: 4096
+  shuffle: True
+  start_date: 2010-01-01T00:00
+  end_date: 2199-12-31T00:00
+  time_window_step: 86400
+  time_window_len: 86400
+
+  learning_rate_scheduling:
+    lr_start: 1e-6
+    lr_max: 1e-4
+    lr_final_decay: 1e-6
+    lr_final: 0.0
+    num_steps_warmup: 256
+    num_steps_cooldown: 512
+    policy_warmup: "cosine"
+    policy_decay: "constant"
+    policy_cooldown: "linear"
+    parallel_scaling_policy: "sqrt"
+
+  optimizer:
+    grad_clip: 0.25
+    weight_decay: 0.05
+    log_grad_norms: False
+    adamw:
+      beta1: 0.9875
+      beta2: 0.994
+      eps: 2e-08
+
+  losses:
+    physical: {enabled: False, type: Disabled}
+    student-teacher:
+      enabled: True
+      type: LossLatentSSLStudentTeacher
+      weight: 1.0
+      loss_fcts:
+        JEPA:
+          weight: 1
+          loss_extra_args: {temporal: True}
+          out_dim: 2048
+          head: transformer
+          num_blocks: 6
+          num_heads: 16
+          with_qk_lnorm: True
+          intermediate_dim: 1024
+          dropout_rate: 0.1
+          target_source_correspondence: {"0": {"0": independent}}
+      target_and_aux_calc:
+        EMATeacher:
+          ema_ramp_up_ratio: null
+          # EMA half-life in samples (despite the name: beta = 0.5 ** (global_batch / this)).
+          # gjl6a0kb uses 400000 over 96 x 8192 = 786432 samples, a half-life of about half the
+          # run; 131072 keeps that ratio for 64 x 4096 = 262144 samples (16384 of the 32768 steps
+          # at world size 8). Scale it with the run length.
+          ema_halflife_in_thousands: 131072
+          model_param_overrides:
+            training_config:
+              losses:
+                student-teacher:
+                  loss_fcts: {JEPA: {head: identity}}
+
+  # named after default_config's only source entry so that the union merge keeps one source
+  # (a second, differently named entry would count as a second sample per batch)
+  model_input:
+    forecasting:
+      masking_strategy: forecast
+      num_samples: 1
+      num_steps_input: 1
+      masking_strategy_config: {}
+  target_input:
+    random_easy_target:
+      masking_strategy: forecast
+      num_samples: 1
+      masking_strategy_config: {}
+
+  # temporal JEPA uses the step-zero identity path (no forecast steps)
+  forecast:
+    time_step: 0
+    num_steps: 0
+    offset: 0
+    policy: null
+
+validation_config:
+  samples_per_mini_epoch: 64
+  shuffle: False
+  start_date: 2200-01-01T00:00
+  end_date: 2200-12-31T00:00
+  validate_with_ema:
+    enabled: False
+  output:
+    num_samples: 0
+    normalized_samples: False
+    streams: null
+  validate_before_training: False

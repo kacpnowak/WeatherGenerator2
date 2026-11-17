@@ -74,9 +74,7 @@ class _FakeReader:
             return ReaderData.empty(num_data_fields=2, num_geo_fields=0)
         n = self.snapshots - (1 if idx in self.short_windows else 0)
         p = len(_COORDS)
-        times = np.repeat(
-            np.datetime64("2001-01-01T00") + np.arange(n) * np.timedelta64(6, "h"), p
-        )
+        times = np.repeat(np.datetime64("2001-01-01T00") + np.arange(n) * np.timedelta64(6, "h"), p)
         return ReaderData(
             coords=np.tile(_COORDS, (n, 1)),
             geoinfos=np.zeros((n * p, 0), dtype=np.float32),
@@ -140,9 +138,7 @@ def test_forcing_window_index_follows_time_step():
 
 def test_forcing_step_range_builds_only_that_chunk():
     reader, batch = _FakeReader(), _Batch(3)
-    MultiStreamDataSampler._build_forcing_data(
-        _sampler(), batch, reader, 10, 3, step_range=(1, 3)
-    )
+    MultiStreamDataSampler._build_forcing_data(_sampler(), batch, reader, 10, 3, step_range=(1, 3))
     assert reader.requested == [11, 12]
     assert len(batch.get_source_samples().forcing[0]) == 0
 
@@ -272,6 +268,7 @@ def test_iter_skips_sample_without_forcing():
         mini_epoch=0,
         _prefix_range=(0, 0),
         _prefix_seed=0,
+        _prefix_zero_fraction=0.0,
     )
     batches = list(MultiStreamDataSampler.__iter__(stub))
     assert tried == [0, 1, 2]
@@ -282,6 +279,7 @@ def _eager_sampler(output_offset):
     """Stub `self` that drives `_get_batch` down to its forcing call, without data streams."""
     stub = _sampler()
     stub.output_offset = output_offset
+    stub.teacher_time_offset = 0
     stub.mode_cfg = {"training_mode": ["masking"], "model_input": {"random": {}}}
     no_masks = types.SimpleNamespace(masks=[])
     stub.streams_datasets = {"S": types.SimpleNamespace(info={}, readers=[])}
@@ -343,6 +341,7 @@ def _iter_stub(get_batch, perms):
         mini_epoch=0,
         _prefix_range=(0, 0),
         _prefix_seed=0,
+        _prefix_zero_fraction=0.0,
     )
 
 
@@ -513,6 +512,7 @@ def _prefix_iter_stub(rank, prefix_range=(1, 90), get_prefix_batch=None):
         _get_prefix_batch=get_prefix_batch or prefix_batch,
         _prefix_range=prefix_range,
         _prefix_seed=7,
+        _prefix_zero_fraction=0.0,
     )
     return stub, seen
 

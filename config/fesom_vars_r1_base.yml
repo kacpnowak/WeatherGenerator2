@@ -1,0 +1,19 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Base of the long-rollout round-1 runs, layered on fesom_vars_stage3.yml: the training-only
+# latent noise is off. Without this every run would inherit 1e-4 from fvars002.
+#
+# Free rollouts of the fvars models blew up at about days 50-80. The noise adds
+# randn * ||tokens|| * std per forecast step in training only (model/engines.py). The norm is
+# over the whole latent, so this is about 50 % of each token's RMS: the model learned to work on
+# heavily noised latents and ran in an untrained state once the noise was gone. fvnn003
+# (fvars003 fine-tuned with the noise off) stayed stable over a one-year rollout.
+
+fe_impute_latent_noise_std: 0.0

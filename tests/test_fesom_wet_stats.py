@@ -22,7 +22,7 @@ import pytest
 import weathergen.readers_extra.data_reader_fesom as fesom
 from weathergen.datasets.data_reader_base import TimeWindowHandler
 
-DATA_ROOT = Path("/work/ab0995/a270088/Kacper/weathergenertor/AWICM3")
+DATA_ROOT = Path("/e/data1/climateai/hclimrep/data/ifs-fesom")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 

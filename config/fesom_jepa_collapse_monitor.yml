@@ -1,0 +1,27 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Collapse monitoring for temporal-JEPA pretraining (config/fesom_jepa_pretrain.yml has the same
+# block): effective rank, singular-value spectrum and per-dimension variance of the student JEPA
+# prediction and the EMA-teacher target, every 20 steps. An overlay to switch it on when resuming
+# a run started without it:
+#   train_continue --from-run-id <run> -e -1 --reuse-run-id \
+#       --config config/fesom_jepa_collapse_monitor.yml
+
+train_logging:
+  collapse_monitoring:
+    enabled: true
+    compute_frequency: 20
+    log_frequency: 20
+    metrics:
+      effective_rank: {enabled: true, tensor_source: "both", sample_size: 2048}
+      singular_values: {enabled: true, tensor_source: "both", sample_size: 2048}
+      dimension_variance: {enabled: true, tensor_source: "both"}
+      prototype_entropy: {enabled: false}
+      ema_beta: {enabled: true}

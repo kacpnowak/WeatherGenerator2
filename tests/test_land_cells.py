@@ -80,12 +80,12 @@ def _stub_model(forcing=_forcing, forcing_mode="additive"):
         output.add_physical_prediction(output_step, "stream", tokens.clone())
         return output
 
-    def predict_latent(model_params, step, tokens, batch, output):
+    def predict_latent(model_params, step, tokens, batch, output, intermediates=None):
         output.add_latent_prediction(step, "latent_state", LatentState(None, None, None, tokens))
         return output
 
     return SimpleNamespace(
-        encoder=lambda params, batch: (Z0.clone(), None),
+        encoder=lambda params, batch: (Z0.clone(), None, []),
         forecast_engine=lambda tokens, condition, coords=None: _fe(tokens),
         forcing_module=_Forcing(forcing, forcing_mode),
         predict_decoders=predict_decoders,

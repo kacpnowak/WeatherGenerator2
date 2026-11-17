@@ -50,7 +50,7 @@ logger = logging.getLogger("forcing_decomp")
 
 def encode(model, mp, src):
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        tokens, _ = model.encoder(mp, src)
+        tokens, _, _ = model.encoder(mp, src)
         tokens = tokens.reshape((len(src), src.get_num_source_steps(), *tokens.shape[1:])).sum(1)
     return tokens
 
@@ -212,7 +212,7 @@ class DecompTrainer(Trainer):
                     lat["C_over_z"].append(C_norm["all"] / nz["all"])
 
             rec(0, z, None)
-            cond_coords = mp.rope_coords
+            cond_coords = mp.rope_packed_data() if mp.rope_coords is not None else None
             for n in range(1, R + 1):
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     zin, cond = fm(z, src.conditions[n], src.forcing[n], na)

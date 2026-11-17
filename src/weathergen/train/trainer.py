@@ -40,8 +40,18 @@ from weathergen.model.model_interface import (
 from weathergen.model.utils import apply_fct_to_blocks, set_to_eval
 from weathergen.train.collapse_monitor import CollapseMonitor
 from weathergen.train.loss_calculator import LossCalculator
+from weathergen.train.loss_modules.loss_module_physical import DynamicLossEMA
 from weathergen.train.lr_scheduler import LearningRateScheduler
+from weathergen.train.target_and_aux_ssl_teacher import EMATeacher
 from weathergen.train.target_and_aux_utils import get_target_aux_calculator
+from weathergen.train.train_state import (
+    gather_optimizer_state,
+    load_optimizer_state,
+    load_train_state,
+    save_train_state,
+    should_restore_train_state,
+    train_state_path,
+)
 from weathergen.train.trainer_base import TrainerBase
 from weathergen.train.utils import (
     TRAIN,
@@ -73,46 +83,34 @@ def prefix_length(batch) -> int:
 
 
 def resume_position(
-    istep: int,
-    len_dataset: int,
-    batch_size: int,
-    samples_per_mini_epoch: int,
-    world_size_original: int | None,
-    world_size: int,
+    istep: int, steps_per_mini_epoch: int, num_mini_epochs: int, world_size_changed: bool = False
 ) -> tuple[int, int]:
     """
-    Where a continued run resumes: the mini-epoch, and the number of its batches (per rank)
-    the checkpoint has already trained.
+    Where a run continued after `istep` optimizer steps resumes: (mini_epoch_base, steps_done),
+    with steps_done the optimizer steps already done in mini_epoch_base.
 
-    `istep` counts the training steps in the checkpoint. A `_latest` checkpoint is saved within
-    a mini-epoch, so the run resumes within it and must train only its remaining batches. The
-    position in the mini-epoch is known only when the world size is unchanged and the steps per
-    mini-epoch below are the batches a rank trains per mini-epoch; otherwise the mini-epoch is
-    trained from its first batch again, as before.
+    A run stopped at the end of a mini-epoch resumes at the start of the next one, a complete run
+    at (num_mini_epochs, 0). After a world-size change, the steps done no longer map to the same
+    samples, so the interrupted mini-epoch restarts from its first step.
     """
-    if world_size_original is None:
-        # len(DataLoader) == len(dataset) for the training loader (batch_size=None)
-        steps_per_mini_epoch = len_dataset
-    else:
-        len_per_rank = max(1, len_dataset // (world_size_original * batch_size)) * batch_size
-        steps_per_mini_epoch = min(len_per_rank, samples_per_mini_epoch) * world_size_original
-    mini_epoch_base, num_trained = divmod(istep, steps_per_mini_epoch)
+    mini_epoch_base, steps_done = divmod(istep, steps_per_mini_epoch)
+    if mini_epoch_base >= num_mini_epochs:
+        return num_mini_epochs, 0
+    return mini_epoch_base, 0 if world_size_changed else steps_done
 
-    if num_trained > 0 and world_size_original not in (None, world_size):
-        logger.warning(
-            f"Resuming at step {istep} with world size {world_size}, the run started with "
-            f"world size {world_size_original}: mini_epoch {mini_epoch_base} is trained from "
-            "its first batch, without skipping the batches already trained."
-        )
-        num_trained = 0
-    elif num_trained > 0 and steps_per_mini_epoch != len_dataset // batch_size:
-        logger.warning(
-            f"Resuming at step {istep}: {steps_per_mini_epoch} steps per mini-epoch, but "
-            f"{len_dataset // batch_size} batches per rank; mini_epoch {mini_epoch_base} is "
-            "trained from its first batch, without skipping the batches already trained."
-        )
-        num_trained = 0
-    return mini_epoch_base, num_trained
+
+def resume_istep(
+    istep: int, steps_per_mini_epoch: int, num_mini_epochs: int, world_size_changed: bool = False
+) -> int:
+    """
+    The optimizer step counter a continued run carries on from: `istep`, unless the world size
+    changed. Then the interrupted mini-epoch restarts from its first step (resume_position) and
+    the counter restarts with it, so the run still ends at num_mini_epochs * steps_per_mini_epoch.
+    """
+    if not world_size_changed:
+        return istep
+    mini_epoch_base, _ = resume_position(istep, steps_per_mini_epoch, num_mini_epochs, True)
+    return mini_epoch_base * steps_per_mini_epoch
 
 
 class Trainer(TrainerBase):
@@ -559,6 +557,13 @@ class Trainer(TrainerBase):
                         preds_full.latent[chunk_step_offset + step_idx].update(
                             source_samples.latent[step_idx]
                         )
+                        # deep SSL predictions, or the SSL loss falls back to the unfused head
+                        if source_samples.latent_deep is not None:
+                            if preds_full.latent_deep is None:
+                                preds_full.latent_deep = [{} for _ in preds_full.physical]
+                            preds_full.latent_deep[chunk_step_offset + step_idx].update(
+                                source_samples.latent_deep[step_idx]
+                            )
 
                 if chunk_size and chunk_idx < len(chunks) - 1:
                     if (
@@ -756,6 +761,32 @@ class Trainer(TrainerBase):
             self.grad_scaler = torch.amp.GradScaler("cuda")
         assert len(self.dataset) > 0, f"No data found in {self.dataset}"
 
+        # recover mini_epoch and the steps already done in it when continuing a run; the sampler
+        # starts at mini_epoch 0, step 0 in a new process (ecmwf/WeatherGenerator#2953). Done
+        # before the lr scheduler is built, which continues from the (realigned) step counter.
+        steps_per_mini_epoch = len(self.dataset) // self.batch_size_per_gpu
+        world_size_changed = cf.world_size != self.world_size_original
+        istep_saved = self.cf.general.istep
+        mini_epoch_base, steps_done = resume_position(
+            istep_saved, steps_per_mini_epoch, self.training_cfg.num_mini_epochs, world_size_changed
+        )
+        self.cf.general.istep = resume_istep(
+            istep_saved, steps_per_mini_epoch, self.training_cfg.num_mini_epochs, world_size_changed
+        )
+        self.dataset.set_resume_position(mini_epoch_base, steps_done)
+        if is_root():
+            if world_size_changed and istep_saved > 0:
+                logger.warning(
+                    f"World size changed from {self.world_size_original} to {cf.world_size}: "
+                    f"the data order cannot be continued, mini_epoch {mini_epoch_base} restarts "
+                    f"from its first step and istep from {istep_saved} to "
+                    f"{self.cf.general.istep}."
+                )
+            logger.info(
+                f"Training starts at mini_epoch {mini_epoch_base}, step {steps_done} of "
+                f"{steps_per_mini_epoch} (istep={self.cf.general.istep})."
+            )
+
         # lr is updated after each batch so account for this
         # TODO: conf should be read-only, do not modify the conf in flight
         len_ds = len(self.dataset)
@@ -777,8 +808,17 @@ class Trainer(TrainerBase):
         val_cfg = self.validation_cfg
         self.loss_calculator_val = LossCalculator(cf, val_cfg, VAL, device=self.device)
 
-        # recover mini_epoch when continuing run
-        mini_epoch_base = self._align_sampler_with_resume()
+        # continue the optimizer and dynamic-loss state when this run is resumed, but not when a
+        # new run starts from another run's weights (general.istep=0); decided on the saved
+        # istep, since a world-size change can realign the counter of a resumed run to 0
+        if run_id_contd is not None:
+            if should_restore_train_state(istep_saved):
+                self._restore_train_state(run_id_contd, mini_epoch_contd, istep_saved)
+            elif is_root():
+                logger.info(
+                    f"Starting from the weights of {run_id_contd} with a new optimizer and "
+                    "dynamic-loss state (istep=0)."
+                )
 
         if is_root():
             config.save(self.cf, None)
@@ -808,6 +848,8 @@ class Trainer(TrainerBase):
                     f"Mini_epoch {mini_epoch} of {self.training_cfg.num_mini_epochs}: save_model."
                 )
             self.save_model(mini_epoch)
+            # keep _latest no older than the last completed mini_epoch
+            self.save_model(-1)
 
         # log final model
         self.save_model(self.training_cfg.num_mini_epochs)
@@ -816,34 +858,6 @@ class Trainer(TrainerBase):
         # already gone away, and the ranks never exit.
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
-
-    def _align_sampler_with_resume(self) -> int:
-        """
-        Set the training sampler to where a continued run resumes; return that mini-epoch.
-
-        The sampler starts at mini_epoch 0 in every process, but its worker seed, the
-        forecast-step curriculum and the spin-up draw depend on the mini-epoch, and
-        train_continue reuses the run's rng seed: without this, every continued run would
-        replay the first mini-epochs (ecmwf/WeatherGenerator#2953). A run resumed from a
-        mid-epoch checkpoint also skips the batches of that mini-epoch the checkpoint has
-        trained, so it trains each step of the planned schedule once.
-        """
-        mini_epoch_base, num_trained = resume_position(
-            self.cf.general.istep,
-            len(self.dataset),
-            self.batch_size_per_gpu,
-            self.training_cfg.samples_per_mini_epoch,
-            self.world_size_original,
-            self.cf.world_size,
-        )
-        self.dataset.mini_epoch = mini_epoch_base
-        self.dataset.skip_batches = num_trained
-        if num_trained > 0 and is_root():
-            logger.info(
-                f"Resuming at step {self.cf.general.istep}: mini_epoch {mini_epoch_base}, "
-                f"after its first {num_trained} batches."
-            )
-        return mini_epoch_base
 
     def validate_before_training(self):
         """
@@ -877,22 +891,19 @@ class Trainer(TrainerBase):
         apply_fct_to_blocks(self.model, cf.freeze_modules, set_to_eval)
 
         dataset_iter = iter(self.data_loader)
-        # a run resumed within this mini-epoch starts at the first batch it has not trained;
-        # bidx is the position in the mini-epoch (logging, checkpoint cadence)
-        bidx_start = self.dataset.skip_batches
 
         self.optimizer.zero_grad()
 
         # training loop
         self.t_start = time.time()
-        for bidx, batch in enumerate(dataset_iter, start=bidx_start):
+        for bidx, batch in enumerate(dataset_iter):
             with self.training_loop_annotation_context(f"batch_{bidx}"):
                 if cf.data_loading.get("memory_pinning", False):
                     # pin memory for faster CPU-GPU transfer
                     batch = batch.pin_memory()
 
                 batch.to_device(self.device)
-            
+
             with torch.autocast(
                 device_type=f"cuda:{cf.local_rank}",
                 dtype=self.mixed_precision_dtype,
@@ -1006,9 +1017,8 @@ class Trainer(TrainerBase):
 
             self.cf.general.istep += 1
 
-            # save model checkpoint (with designation _latest), after the step counter has been
-            # advanced: the saved istep counts the steps in the saved model, as for the checkpoint
-            # at the end of a mini-epoch, so a run resumed from it continues with the next batch
+            # save model checkpoint (with designation _latest), after the increment so that its
+            # istep is the number of completed optimizer steps
             if bidx % self.train_logging.checkpoint == 0 and bidx > 0:
                 self.save_model(-1)
 
@@ -1132,6 +1142,128 @@ class Trainer(TrainerBase):
         # avoid that there is a systematic bias in the validation subset
         self.dataset_val.advance()
 
+    def _dynamic_loss_emas(self) -> dict[str, DynamicLossEMA]:
+        """The dynamic-loss EMAs of the training loss terms (by loss term name)."""
+        return {
+            loss_term: calculator.dynamic_loss_ema
+            for loss_term, calc_term in self.loss_calculator.loss_calculators.items()
+            for _, calculator in calc_term
+            if getattr(calculator, "dynamic_loss_ema", None) is not None
+        }
+
+    def _restore_train_state(self, run_id_contd: str, mini_epoch_contd: int | None, istep: int):
+        """
+        Restore the optimizer and dynamic-loss state saved with the checkpoint this run resumes
+        from; `istep` is the step counter its config recorded. Collective: rank 0 reads the file
+        and sends the other ranks their optimizer shards and its dynamic-loss state (all ranks
+        continue with rank 0's EMAs). Without a saved state the run continues as before, with
+        a new optimizer state and the EMAs at ones.
+        """
+        mini_epoch = -1 if mini_epoch_contd is None else mini_epoch_contd
+        model_path = config.get_path_model(self.cf, run_id=run_id_contd)
+        file_state = train_state_path(model_path, run_id_contd, mini_epoch)
+
+        state = load_train_state(file_state) if is_root() else None
+        # every rank has to know whether there is a state, restoring the optimizer is collective
+        shared = [
+            None
+            if state is None
+            else (state["dynamic_loss"], state["istep"], "ema_teacher" in state)
+        ]
+        if torch.distributed.is_initialized():
+            torch.distributed.broadcast_object_list(shared, src=0)
+        if shared[0] is None:
+            return
+        dynamic_loss, istep_state, has_ema_teacher = shared[0]
+        # every rank holds a full EMA teacher: each reads it from the (memory-mapped) file
+        # instead of receiving gigabytes of pickled weights from rank 0
+        ema_teacher_state = None
+        if has_ema_teacher:
+            local_state = state if is_root() else load_train_state(file_state)
+            ema_teacher_state = local_state["ema_teacher"]
+        self._restore_ema_teachers(ema_teacher_state, file_state)
+
+        load_optimizer_state(self.model, self.optimizer, state["optimizer"] if is_root() else {})
+        if is_root():
+            if istep_state != istep:
+                logger.warning(
+                    f"Training state {file_state} was saved at istep={istep_state} but the run "
+                    f"config records istep={istep}: the run was probably stopped while saving, "
+                    "the checkpoint's weights and optimizer state may not match the step counter."
+                )
+            logger.info(
+                f"Resuming {run_id_contd}: restored optimizer state from {file_state} "
+                f"(saved at istep={istep_state})."
+            )
+
+        for loss_term, ema in self._dynamic_loss_emas().items():
+            if not ema.enabled:
+                continue
+            saved = dynamic_loss.get(loss_term)
+            if not saved:
+                if is_root():
+                    logger.warning(
+                        f"No dynamic-loss state for loss term {loss_term} in {file_state}: its "
+                        "channel weights start from ones."
+                    )
+                continue
+            ema.load_state_dict(saved)
+            if is_root():
+                logger.info(
+                    f"Resuming {run_id_contd}: restored dynamic-loss state of loss term "
+                    f"{loss_term} for streams {sorted(saved)}."
+                )
+
+    def _ema_teachers(self, with_val: bool = True) -> list[EMATeacher]:
+        """The EMATeacher target calculators of training (and validation)."""
+        calcs = [self.target_and_aux_calculators] + (
+            [self.target_and_aux_calculators_val] if with_val else []
+        )
+        return [
+            c for cs in calcs if cs is not None for c in cs.values() if isinstance(c, EMATeacher)
+        ]
+
+    def _ema_teacher_state(self) -> dict | None:
+        """State of the training EMA teacher (weights + target centering buffers), or None."""
+        teachers = self._ema_teachers(with_val=False)
+        if not teachers:
+            return None
+        teacher = teachers[0]
+        return {
+            "ema_model": {
+                k: v.detach().cpu() for k, v in teacher.ema_model.ema_model.state_dict().items()
+            },
+            "postprocess_targets": {
+                name: module.state_dict() for name, module in teacher.postprocess_targets.items()
+            },
+        }
+
+    def _restore_ema_teachers(self, ema_state: dict | None, file_state) -> None:
+        """
+        Load a saved EMA teacher into the training and validation teachers. Without one, a
+        resumed run keeps the teacher the EMA calculator reset from the student, as before.
+        """
+        teachers = self._ema_teachers()
+        if not teachers:
+            return
+        if ema_state is None:
+            if is_root():
+                logger.warning(
+                    f"No EMA teacher state in {file_state}: the teacher restarts from the student."
+                )
+            return
+        for teacher in teachers:
+            mkeys, ukeys = teacher.ema_model.ema_model.load_state_dict(
+                ema_state["ema_model"], strict=False
+            )
+            for name, module in teacher.postprocess_targets.items():
+                if name in ema_state.get("postprocess_targets", {}):
+                    module.load_state_dict(ema_state["postprocess_targets"][name], strict=False)
+            if is_root() and (mkeys or ukeys):
+                logger.warning(f"EMA teacher restore: missing keys {mkeys}, unused keys {ukeys}")
+        if is_root():
+            logger.info(f"Restored EMA teacher state from {file_state}.")
+
     def _get_full_model_state_dict(self):
         maybe_sharded_sd = (
             self.model.state_dict() if self.ema_model is None else self.ema_model.state_dict()
@@ -1148,41 +1280,12 @@ class Trainer(TrainerBase):
         else:
             return maybe_sharded_sd
 
-    def _get_full_optimizer_state_dict(self):
-        is_rank_zero = is_root()
-        sharded_sd = self.optimizer.state_dict()
-        sharded_state = sharded_sd["state"]
-        full_state = {}
-        for group_id, sharded_group in sharded_state.items():
-            group_state = {}
-            for attr, sharded_tensor in sharded_group.items():
-                if isinstance(sharded_tensor, DTensor):
-                    # "exp_avg" in AdamW is `DTensor`
-                    full_tensor = sharded_tensor.full_tensor()
-                else:
-                    # "step" in AdamW is plain tensor
-                    full_tensor = sharded_tensor
-                if is_rank_zero:
-                    group_state[attr] = full_tensor.cpu()
-                else:
-                    del full_tensor
-            if is_rank_zero:
-                full_state[group_id] = group_state
-            else:
-                del group_state
-        if is_rank_zero:
-            return {
-                "param_groups": sharded_sd["param_groups"],
-                "state": full_state,
-            }
-        else:
-            return {}
-
     def save_model(self, mini_epoch: int, name=None):
         # Saving at mini_epoch == max_mini_epoch means that we are saving the latest checkpoint.
         max_mini_epoch = self.training_cfg.num_mini_epochs
         assert mini_epoch <= max_mini_epoch, (mini_epoch, max_mini_epoch)
         model_state_dict = self._get_full_model_state_dict()
+        base_path = config.get_path_model(self.cf)
 
         if is_root():
             filename = "".join(
@@ -1193,7 +1296,6 @@ class Trainer(TrainerBase):
                     ("_" + name) if name is not None else "",
                 ]
             )
-            base_path = config.get_path_model(self.cf)
             file_out = base_path / (filename + ".chkpt")
             file_tmp = base_path / (filename + "_tmp.chkpt")
             # save temp file (slow)
@@ -1202,9 +1304,36 @@ class Trainer(TrainerBase):
             file_tmp.replace(file_out)
             if is_root():
                 logger.info(f"Saved model to {file_out}")
+        del model_state_dict
+
+        # optimizer and dynamic-loss state next to the model, continued when the run is resumed
+        # (only from unnamed checkpoints); gathering is collective and only rank 0 receives the
+        # full state (on its CPU)
+        optimizer_state = None
+        if name is None:
+            optimizer_state = gather_optimizer_state(self.model, self.optimizer)
+        if is_root():
+            if optimizer_state is not None:
+                dynamic_loss = {
+                    loss_term: ema.state_dict()
+                    for loss_term, ema in self._dynamic_loss_emas().items()
+                }
+                file_state = train_state_path(base_path, self.cf.general.run_id, mini_epoch)
+                save_train_state(
+                    file_state,
+                    optimizer_state,
+                    dynamic_loss,
+                    self.cf.general.istep,
+                    ema_teacher=self._ema_teacher_state(),
+                )
+                logger.info(
+                    f"Saved optimizer and dynamic-loss state (istep={self.cf.general.istep}) to "
+                    f"{file_state}"
+                )
 
             # save config
             config.save(self.cf, mini_epoch)
+        del optimizer_state
 
     def _log(self, stage: Stage):
         """
