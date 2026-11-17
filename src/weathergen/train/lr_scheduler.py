@@ -109,7 +109,7 @@ class LearningRateScheduler:
                 total_steps=n_steps,
                 pct_start=pct_start,
                 div_factor=self.lr_max_scaled / lr_cfg.lr_start,
-                final_div_factor=lr_final_decay_scaled / lr_cfg.lr_start,
+                final_div_factor=lr_cfg.lr_start / lr_final_decay_scaled,
             )
         else:
             if self.n_steps_warmup > 0:
@@ -210,6 +210,10 @@ class LearningRateScheduler:
             if cur_lr < self.lr:
                 for g in self.optimizer.param_groups:
                     g["lr"] = self.lr
+        elif self.policy_decay == "cosine" and self.i_step == end_decay:
+            # OneCycleLR already sits at its minimum; one more step would mirror the cosine
+            # upwards, so keep the end-of-decay value for the cool-down to start from
+            pass
         elif self.policy_cooldown == "linear" and phase_cooldown:
             n = self.i_step - end_decay
             frac = min(n / self.n_steps_cooldown, 1.0) if self.n_steps_cooldown > 0 else 1.0
