@@ -89,6 +89,13 @@ class LossLatentSSLStudentTeacher(LossModuleBase):
         has_deep_ssl = (
             self.level_weights is not None and deep_preds is not None and deep_targets is not None
         )
+        if self.level_weights is not None and not has_deep_ssl:
+            # without this the loss would silently fall back to the final level only
+            missing = "student" if deep_preds is None else "teacher"
+            raise ValueError(
+                f"deep_ssl is enabled but the {missing} produced no per-level predictions "
+                "(check that the teacher model keeps training_config.deep_ssl)"
+            )
 
         # Normalize both paths: name -> [(level_weight, student_data, teacher_data)]
         if has_deep_ssl:

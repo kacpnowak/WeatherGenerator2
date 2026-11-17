@@ -56,6 +56,15 @@ class EMAModel:
         if needs_strip:
             maybe_sharded_sd = {k.removeprefix("module."): v for k, v in maybe_sharded_sd.items()}
         mkeys, ukeys = self.ema_model.load_state_dict(maybe_sharded_sd, strict=False, assign=False)
+        # to_empty() also left the non-persistent buffers uninitialised and the state dict does
+        # not carry them: copy them from the model
+        src_buffers = {k.removeprefix("module."): b for k, b in self.original_model.named_buffers()}
+        for name, buf in self.ema_model.named_buffers():
+            if name in ema_keys:
+                continue
+            src = src_buffers.get(name)
+            if src is not None and src.shape == buf.shape:
+                buf.copy_(src)
         self.ema_model.eval()
 
     def requires_grad_(self, flag: bool):

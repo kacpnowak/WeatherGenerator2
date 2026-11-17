@@ -934,6 +934,7 @@ class Trainer(TrainerBase):
                     preds=preds,
                     targets_and_aux=targets_and_auxs,
                     metadata=extract_batch_metadata(batch),
+                    istep=self.cf.general.istep,
                 )
 
                 # TODO re-enable this, need to think on how to make it compatible with
@@ -1129,6 +1130,7 @@ class Trainer(TrainerBase):
                             preds=preds_full,
                             targets_and_aux=targets_and_auxs,
                             metadata=extract_batch_metadata(batch),
+                            istep=self.cf.general.istep,
                         )
 
                     pbar.update(batch_size)

@@ -1,0 +1,27 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# S2RoPE overlay for the temporal-JEPA FESOM pretraining: merge it after
+# config/fesom_jepa_pretrain.yml, which it changes only in the positional encoding.
+#
+#   .venv/bin/train --config config/fesom_jepa_pretrain.yml config/fesom_jepa_srope.yml
+#
+# The run config keeps these keys, so the probe, collapse checks and the forecast fine-tune
+# continued from the run (config/fesom_jepa_forecast_ft.yml) inherit them.
+#
+# Wigner-D RoPE (spherical_unitary) in every attention module: in the forecast-engine-only
+# grafts of fvnn003 it recovered better than the spherical-harmonic variant (val loss 0.037 vs
+# 0.067). The 64-dim aggregation and global heads hold bands l=1..7 (63 of 64 dims); the band
+# is pinned because the automatic choice depends on fe_num_blocks, which is 0 here and 16 in
+# the fine-tune (its 128-dim heads would allow more).
+# The absolute positional embedding (pe_global) stays on, as in the upstream JEPA recipe.
+
+rope_mode: spherical_unitary
+rope_modules: all
+rope_unitary_max_band: 7

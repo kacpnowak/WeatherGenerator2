@@ -151,6 +151,35 @@ def forcing_time_window_handler(
     )
 
 
+def resolve_teacher_time_offset(mode_cfg) -> int:
+    """Time windows the teacher's input is shifted forward relative to the student's.
+
+    teacher_time_offset (temporal JEPA) is only active with student_teacher training, so an
+    offset left in a pretraining config cannot leak into forecast finetuning or inference
+    (where it would shift every target time by that many windows). The target samples are
+    shared by all losses, so it also refuses a second training mode, whose physical targets
+    would be read at the shifted time as well.
+    """
+    configured_offset = int(mode_cfg.get("teacher_time_offset", 0) or 0)
+    modes = mode_cfg.get("training_mode", [])
+    # a single mode may be given as a plain string (e.g. integration_tests/jepa1.yaml)
+    modes = [modes] if isinstance(modes, str) else list(modes)
+    if "student_teacher" not in modes:
+        if configured_offset != 0:
+            logger.warning(
+                f"teacher_time_offset={configured_offset} is set but training_mode={modes} "
+                "does not include 'student_teacher'. Ignoring it (setting to 0)."
+            )
+        return 0
+    if configured_offset != 0 and modes != ["student_teacher"]:
+        raise NotImplementedError(
+            f"teacher_time_offset={configured_offset} requires training_mode "
+            f"['student_teacher'] alone (got {modes}): the physical targets of the other "
+            "modes would be shifted in time too."
+        )
+    return configured_offset
+
+
 def resolve_prefix_range(forecast_cfg: dict, stage: Stage) -> tuple[int, int]:
     """
     Range [min, max] of the unsupervised spin-up steps drawn per training step.
@@ -316,21 +345,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.forecast_policy = forecast_cfg["policy"]
         steps = np.array(forecast_cfg["num_steps"], dtype=np.int32).reshape(-1)
         self.list_num_forecast_steps = np.array(steps, dtype=np.int32)
-        # teacher_time_offset (temporal JEPA): number of time windows the teacher's input is
-        # shifted forward relative to the student's. Only active with student_teacher training,
-        # so an offset left in a pretraining config cannot leak into forecast finetuning or
-        # inference (where it would shift every target time by that many windows).
-        configured_offset = int(mode_cfg.get("teacher_time_offset", 0) or 0)
-        if "student_teacher" in mode_cfg.get("training_mode", []):
-            self.teacher_time_offset = configured_offset
-        else:
-            if configured_offset != 0:
-                logger.warning(
-                    f"teacher_time_offset={configured_offset} is set but training_mode="
-                    f"{mode_cfg.get('training_mode', [])} does not include 'student_teacher'. "
-                    "Ignoring it (setting to 0)."
-                )
-            self.teacher_time_offset = 0
+        self.teacher_time_offset = resolve_teacher_time_offset(mode_cfg)
         # unsupervised spin-up steps drawn per training step (training stage only)
         self._prefix_range = resolve_prefix_range(forecast_cfg, stage)
         self._prefix_zero_fraction = resolve_prefix_zero_fraction(forecast_cfg, stage)

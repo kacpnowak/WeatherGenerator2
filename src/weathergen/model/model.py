@@ -1225,33 +1225,47 @@ class Model(torch.nn.Module):
         latent_state = self.tokens_to_latent_state(tokens_post_norm, tokens)
         output.add_latent_prediction(step, "latent_state", latent_state)
 
-        # latent predictions for SSL training
+        deep = bool(intermediates) and step == 0
+        fused_heads = (
+            set(self.deep_ssl_level_projections)
+            if deep and self.deep_ssl_fusion is not None
+            else set()
+        )
+
+        # latent predictions for SSL training; a head on the fused deep-SSL path gets its
+        # final-level prediction below instead (a second predictor pass would be unused)
         for name, head in self.latent_heads.items():
-            output.add_latent_prediction(step, name, head(latent_state))
+            if name not in fused_heads:
+                output.add_latent_prediction(step, name, head(latent_state))
 
         # deep SSL: multi-level predictions
-        if intermediates and step == 0:
+        if deep:
             all_levels = intermediates + [tokens]
             if self.deep_ssl_fusion is not None:
                 # student: fuse all levels, predict once, project per level
                 fused = self.deep_ssl_fusion(all_levels)
                 fused_latent = self.tokens_to_latent_state(self.latent_pre_norm(fused), fused)
-                for name, head in self.latent_heads.items():
-                    predictor_out = head(fused_latent)
+                for name in fused_heads:
+                    predictor_out = self.latent_heads[name](fused_latent)
                     projections = self.deep_ssl_level_projections[name]
                     level_preds = [proj(predictor_out) for proj in projections]
                     output.add_deep_latent_prediction(step, name, level_preds)
+                    # the prediction of the final level is the one comparable to the teacher's
+                    # plain target (collapse monitor, validation output)
+                    output.add_latent_prediction(step, name, level_preds[-1])
             else:
-                # teacher: independent prediction per level (no fusion)
+                # teacher: independent prediction per level (no fusion); the final level is
+                # the plain prediction computed above
                 level_preds_per_head: dict[str, list[torch.Tensor]] = {
                     name: [] for name in self.latent_heads
                 }
-                for level_tokens in all_levels:
+                for level_tokens in intermediates:
                     level_post_norm = self.latent_pre_norm(level_tokens)
                     level_state = self.tokens_to_latent_state(level_post_norm, level_tokens)
                     for name, head in self.latent_heads.items():
                         level_preds_per_head[name].append(head(level_state))
                 for name, preds in level_preds_per_head.items():
+                    preds.append(output.latent[step][name])
                     output.add_deep_latent_prediction(step, name, preds)
 
         return output

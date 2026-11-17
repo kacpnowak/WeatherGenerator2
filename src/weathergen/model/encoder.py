@@ -71,6 +71,43 @@ def build_global_latent_queries(cf, q_cells, pe_global, num_healpix_cells, rs):
     return tokens_global.repeat(rs, 1, 1)
 
 
+def parse_deep_ssl_taps(deep_ssl_cfg, num_global_blocks: int) -> tuple[bool, set[int] | None]:
+    """Parse training_config.deep_ssl.tap_after into (tap local2global, global layers).
+
+    Taps are "local2global" (the encoder input to the global engine) and "global:<i>" (after
+    global layer i). The encoder emits them in forward order and the loss pairs them with
+    level_weights by position, so tap_after must already be in that order, without
+    duplicates. Without enabled deep SSL: (False, None).
+    """
+    if not (deep_ssl_cfg and deep_ssl_cfg.get("enabled", False) and deep_ssl_cfg.get("tap_after")):
+        return False, None
+    tap_local2global = False
+    tap_global_layers: set[int] = set()
+    positions: list[int] = []
+    for tap in deep_ssl_cfg.get("tap_after"):
+        tap_str = str(tap)
+        if tap_str == "local2global":
+            tap_local2global = True
+            positions.append(-1)
+        elif tap_str.startswith("global:"):
+            layer = int(tap_str.split(":")[1])
+            if not 0 <= layer < num_global_blocks:
+                raise ValueError(
+                    f"deep_ssl tap {tap_str!r} is outside the global engine "
+                    f"(ae_global_num_blocks={num_global_blocks})"
+                )
+            tap_global_layers.add(layer)
+            positions.append(layer)
+        else:
+            raise ValueError(f"Unknown deep_ssl tap {tap_str!r}")
+    if positions != sorted(set(positions)):
+        raise ValueError(
+            f"deep_ssl.tap_after {list(deep_ssl_cfg.get('tap_after'))} must list each tap once, "
+            "in forward order: local2global first, then global:<i> ascending"
+        )
+    return tap_local2global, (tap_global_layers or None)
+
+
 class EncoderModule(torch.nn.Module):
     name: "EncoderModule"
 
@@ -159,21 +196,11 @@ class EncoderModule(torch.nn.Module):
         # query aggregation engine
         self.ae_aggregation_engine = QueryAggregationEngine(cf, self.num_healpix_cells)
 
-        # deep SSL taps: "local2global" (encoder input to the global engine) and "global:<i>"
-        # (after global layer i); only parsed when training_config.deep_ssl is enabled
+        # deep SSL taps (only parsed when training_config.deep_ssl is enabled)
         deep_ssl_cfg = cf.get("training_config", {}).get("deep_ssl", None)
-        self.tap_local2global = False
-        tap_global_layers: set[int] | None = None
-        if deep_ssl_cfg and deep_ssl_cfg.get("enabled", False) and deep_ssl_cfg.get("tap_after"):
-            for tap in deep_ssl_cfg.tap_after:
-                tap_str = str(tap)
-                if tap_str == "local2global":
-                    self.tap_local2global = True
-                elif tap_str.startswith("global:"):
-                    tap_global_layers = tap_global_layers or set()
-                    tap_global_layers.add(int(tap_str.split(":")[1]))
-                else:
-                    raise ValueError(f"Unknown deep_ssl tap {tap_str!r}")
+        self.tap_local2global, tap_global_layers = parse_deep_ssl_taps(
+            deep_ssl_cfg, cf.ae_global_num_blocks
+        )
 
         # global assimilation engine
         self.ae_global_engine = GlobalAssimilationEngine(
