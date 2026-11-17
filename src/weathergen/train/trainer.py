@@ -681,16 +681,27 @@ class Trainer(TrainerBase):
         self.dataset = MultiStreamDataSampler(cf, self.training_cfg, stage=TRAIN)
         self.dataset_val = MultiStreamDataSampler(cf, self.validation_cfg, stage=VAL)
 
-        loader_params = {
-            "batch_size": None,
-            "batch_sampler": None,
-            "shuffle": False,
-            "num_workers": cf.data_loading.num_workers,
-        }
-        self.data_loader = torch.utils.data.DataLoader(self.dataset, **loader_params, sampler=None)
-        self.data_loader_validation = torch.utils.data.DataLoader(
-            self.dataset_val, **loader_params, sampler=None
-        )
+        # persistent workers keep their opened readers across mini-epochs instead of reopening
+        # every store at each one (the sampler advances their dataset copies itself)
+        persistent = cf.data_loading.get("persistent_workers", False)
+
+        def make_loader(dataset, num_workers):
+            return torch.utils.data.DataLoader(
+                dataset,
+                batch_size=None,
+                batch_sampler=None,
+                shuffle=False,
+                num_workers=num_workers,
+                # only valid with at least one worker
+                persistent_workers=persistent and num_workers > 0,
+                sampler=None,
+            )
+
+        num_workers_val = cf.data_loading.get("num_workers_validation", None)
+        if num_workers_val is None:
+            num_workers_val = cf.data_loading.num_workers
+        self.data_loader = make_loader(self.dataset, cf.data_loading.num_workers)
+        self.data_loader_validation = make_loader(self.dataset_val, num_workers_val)
 
         self.model, self.model_params = init_model_and_shard(
             cf,

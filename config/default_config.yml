@@ -160,6 +160,13 @@ train_logging:
 data_loading :
 
   num_workers: 12
+  # loader workers of the validation set; null: num_workers. Each worker opens every store,
+  # so a small validation set needs no more workers than its samples per rank.
+  num_workers_validation: null
+  # keep the loader workers (and their opened readers) alive across mini-epochs instead of
+  # starting new ones for every training and validation pass; the train and validation
+  # workers then exist at the same time, so CPU memory per rank grows accordingly
+  persistent_workers: False
   rng_seed: ???
   repeat_data_in_mini_epoch : False
 

@@ -57,6 +57,7 @@ def test_resumed_worker_runs_the_worker_it_takes_over(monkeypatch, worker, works
     monkeypatch.setattr(torch.utils.data, "get_worker_info", lambda: info)
     s = MultiStreamDataSampler.__new__(MultiStreamDataSampler)
     s.rank, s.world_size, s.len, s.batch_size, s.data_loader_rng_seed = 0, 1, 32, 1, 1
+    s._base_rng_seed = s.data_loader_rng_seed
     s.set_resume_position(0, 5)
     assert s.worker_workset() == workset
     assert s.data_loader_rng_seed == seed

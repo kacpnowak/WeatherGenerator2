@@ -124,6 +124,12 @@ train_logging:
 
 data_loading:
   num_workers: 8
+  # the workers keep their opened stores across mini-epochs: in fjepa001 starting new
+  # workers (each opens every yearly store) for every training and validation pass was most
+  # of the ~20 min of each ~45 min mini-epoch not spent in training steps
+  persistent_workers: True
+  # 16 validation samples are 2 per rank at world size 8
+  num_workers_validation: 2
   repeat_data_in_mini_epoch: False
 
 training_config:
@@ -221,7 +227,9 @@ training_config:
     policy: null
 
 validation_config:
-  samples_per_mini_epoch: 64
+  # small: the JEPA validation loss is only a sanity check (it falls with the token spread,
+  # not with skill); the collapse monitor on the training steps is the real signal
+  samples_per_mini_epoch: 16
   shuffle: False
   start_date: 2200-01-01T00:00
   end_date: 2200-12-31T00:00

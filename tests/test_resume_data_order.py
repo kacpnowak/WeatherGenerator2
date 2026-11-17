@@ -56,9 +56,13 @@ def new_sampler() -> MultiStreamDataSampler:
     return sampler
 
 
-def run_epochs(sampler: MultiStreamDataSampler, epochs: int) -> list[list[tuple[int, int, int]]]:
+def run_epochs(
+    sampler: MultiStreamDataSampler, epochs: int, persistent: bool = False
+) -> list[list[tuple[int, int, int]]]:
     """Records of every batch the trainer receives, per mini-epoch, as the trainer loops."""
-    loader = torch.utils.data.DataLoader(sampler, batch_size=None, num_workers=2)
+    loader = torch.utils.data.DataLoader(
+        sampler, batch_size=None, num_workers=2, persistent_workers=persistent
+    )
     records = []
     for _ in range(epochs):
         records.append([batch.record for batch in loader])
@@ -77,3 +81,21 @@ def test_resumed_mid_epoch_sees_the_uninterrupted_sequence():
 
 def test_without_resume_position_nothing_changes():
     assert run_epochs(new_sampler(), 1) == run_epochs(new_sampler(), 1)
+
+
+def test_persistent_workers_see_the_same_sequence():
+    # persistent workers keep their dataset copy, so they must advance it themselves and
+    # derive each mini-epoch's seed as a fresh worker would
+    full = run_epochs(new_sampler(), epochs=3)
+    assert run_epochs(new_sampler(), epochs=3, persistent=True) == full
+    # mini-epochs differ (the copies do advance)
+    assert full[0] != full[1]
+
+
+def test_persistent_workers_resumed_mid_epoch():
+    full = run_epochs(new_sampler(), epochs=3)
+    s = new_sampler()
+    s.set_resume_position(1, 5)
+    resumed = run_epochs(s, epochs=2, persistent=True)
+    assert resumed[0] == full[1][5:]
+    assert resumed[1] == full[2]

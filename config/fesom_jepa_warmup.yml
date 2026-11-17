@@ -1,0 +1,63 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Stage 0 of the temporal-JEPA FESOM pretraining: one mini-epoch of physical reconstruction
+# (masking mode, forecast offset 0: the decoders reconstruct the encoded day) that trains the
+# encoder from scratch, so that the JEPA stage starts from an encoder whose cell tokens carry
+# the ocean state. In the JEPA stage the EMA teacher starts as a copy of this encoder and, with
+# its slow EMA (half-life of half the run), stays close to it for long: the student predicts
+# physically meaningful targets rather than random features. fjepa001 started from random
+# init and its latent nearly collapsed (cells mapping to one vector) within 4 mini-epochs.
+#
+# Merged after the pretraining config and the same positional-encoding overlay as the JEPA
+# stage, so the encoder trains with the architecture it keeps:
+#   train --config config/fesom_jepa_pretrain.yml config/fesom_jepa_srope.yml \
+#       config/fesom_jepa_warmup.yml --run-id <stage-0 id>
+# then the JEPA stage, a new run (general.istep=0) from it; the JEPA heads start fresh and the
+# decoders are dropped. Stage 0 disabled the JEPA target entry, so re-enable it:
+#   train_continue --from-run-id <stage-0 id> -e -1 --run-id <id> \
+#       --config config/fesom_jepa_pretrain.yml config/fesom_jepa_srope.yml \
+#       --options general.istep=0 training_config.target_input.random_easy_target.enabled=True
+
+# latent_pre_norm only feeds the JEPA heads: without them it gets no gradient, which DDP with
+# ddp_find_unused_parameters: False refuses
+freeze_modules: "latent_pre_norm"
+
+training_config:
+  training_mode: ["masking"]
+  teacher_time_offset: 0
+  deep_ssl:
+    enabled: False
+  context_loss:
+    enabled: False
+
+  num_mini_epochs: 1
+  # 512 steps at world size 8
+  samples_per_mini_epoch: 4096
+  learning_rate_scheduling:
+    lr_start: 1e-6
+    lr_max: 1e-4
+    lr_final_decay: 1e-4
+    lr_final: 0.0
+    num_steps_warmup: 64
+    num_steps_cooldown: 64
+
+  losses:
+    student-teacher: {enabled: False, type: Disabled}
+    physical:
+      enabled: True
+      type: LossPhysical
+      loss_fcts:
+        mse: {}
+  target_input:
+    random_easy_target: {enabled: False}
+
+train_logging:
+  collapse_monitoring:
+    enabled: False

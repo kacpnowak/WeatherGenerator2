@@ -400,6 +400,11 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         rs = cf.data_loading.rng_seed
         nw = cf.data_loading.num_workers
         self.data_loader_rng_seed = rs if rs > nw else rs * 97
+        # each worker derives its seed from this one per mini-epoch (worker_workset)
+        self._base_rng_seed = self.data_loader_rng_seed
+        # iterations a loader worker's copy has served: a persistent worker
+        # (data_loading.persistent_workers) keeps its copy across mini-epochs
+        self._worker_passes = 0
         # spin-up lengths are seeded by the run seed alone (data_loader_rng_seed is made
         # unique per rank and worker), so every rank draws the same length for a step
         self._prefix_seed = int(rs)
@@ -1591,6 +1596,14 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         """
         from weathergen.model.forcing import ForcingUnavailableError
 
+        if torch.utils.data.get_worker_info() is not None:
+            # A fresh worker copies the template, which the trainer has advance()d to this
+            # mini-epoch. A persistent worker keeps its copy from the previous iteration, so it
+            # advances that copy itself, once per iteration like the trainer's template.
+            if self._worker_passes > 0:
+                self.advance()
+            self._worker_passes += 1
+
         iter_start, iter_end, num_skip = self.worker_workset()
         logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
         # position of this worker's first sample in the rank's share: the same on every rank
@@ -1712,9 +1725,10 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             # happens for each mini_epoch, for train and validation, and independently for each DDP
             # worker. After the bit-wise copy, the rng seed needs to be made unique for
             # DDP workers, loader process, mini_epoch. When resumed, worker_id is the original
-            # worker taken over, whose seed reproduces its samples.
+            # worker taken over, whose seed reproduces its samples. Derived from the base seed,
+            # not the previous value, so a persistent worker gets the seed a fresh one would.
             dist = torch.distributed
-            self.data_loader_rng_seed *= (
+            self.data_loader_rng_seed = self._base_rng_seed * (
                 (((dist.get_rank() + 1) * 73) if dist.is_initialized() else 1)
                 * ((worker_id + 1) * 37)
                 * (self.mini_epoch + 13)
