@@ -1,7 +1,8 @@
 # From-scratch ocean emulator with S2RoPE on all 46 levels: design
 
-Status: draft for approval (2026-11-17). Nothing is launched until the smoke test in
-"Verification before launch" has passed.
+Status: approved by the user on 2026-11-17. Nothing is launched until the smoke test in
+"Verification before launch" has passed. ECMWF `upstream/develop` is not merged until this
+training has finished (user decision).
 
 ## Intent
 
@@ -70,7 +71,6 @@ Base: `config/config_fesom_vars.yml` (the `fvnn003` family: HEALPix level 5, lat
 | Depth levels of TEMP, SALT, U, V | 31 | 46 | the request; 127 -> 187 channels |
 | RoPE | off | `spherical_unitary`, `rope_modules: all`, bands 1..10, `pe_global_enable: True` | the request; Wigner recovered better than SH in the graft |
 | Heads of the aggregation and global engines | 32 | 16 | 128-dim heads are needed for band 10 (64-dim heads stop at 7). No parameter change |
-| RoPE frame axis | geographic poles | an antipodal pair of land points | see "RoPE frame axis" |
 | Stream embedding width (TEMP, SALT, U, V) | 256 | 512 | embeddings (8 M) and decoders (25 M) are 3 % of 1.17 B parameters and take the 47 % more channels |
 | Decoder readout layers (TEMP, SALT, U, V) | 2 | 4 | same reason |
 | `fe_impute_latent_noise_std` | 1e-4 | 0 from the start | the noise caused the rollout blow-ups |
@@ -85,20 +85,29 @@ is kept.
 
 ### RoPE frame axis
 
-Each cell's rotation is R_z(phi) R_y(theta), which is singular where theta = 0 or pi. With the
-geographic poles as the axis, neighbouring cells get a relative frame rotation of up to 180
-degrees at 88-90 N and five times the normal amount at 80-85 N, in the Arctic Ocean (measured,
-`smoke46/review_rope/test_pole_twist.py`).
+**Changed after the first approval and confirmed by the user on 2026-11-17: the geographic
+axis is kept and no tilt is built.**
 
-Change: a config key `rope_unitary_pole: [lat, lon]` (degrees; default null keeps the
-geographic poles and therefore the upstream behaviour). The cell positions are rotated so that
-this point becomes the frame's pole before theta and phi are computed. The relative-position
-property is unaffected, because only the choice of frame changes.
+Each cell's rotation is R_z(phi) R_y(theta), which is singular where theta = 0 or pi. Near the
+axis the frames of neighbouring cells twist against each other by up to 1 / sin(angle from the
+axis) times the normal amount. The approved draft proposed moving the axis to an antipodal
+pair of land points. Measured on the mesh (`smoke46/pole/pole_metrics.py`; ocean cells are the
+HEALPix cells that hold mesh nodes, twist ratio is the worst-direction value at the cell
+centre):
 
-The point is chosen once, by a script, as the antipodal pair that maximises the smaller of the
-two distances to the nearest mesh node (expected: central Greenland and East Antarctica), and
-written into the config as numbers. The script reports the distance; it must be at least 5
-degrees for both points.
+| Axis | Nearest ocean (deg) | Ocean cells with ratio > 2 | > 5 | > 10 | Largest |
+|---|---|---|---|---|---|
+| Geographic poles | 0.0 / 11.5 | 12.0 % | 1.1 % | 0.25 % | 39 |
+| Central China / Argentina (the best land pair) | 5.0 / 5.5 | 10.7 % | 1.1 % | 0.06 % | 12 |
+| Central Greenland / East Antarctica | 3.6 / 4.3 | 13.5 % | 1.6 % | 0.18 % | 15 |
+
+No antipodal land pair is more than 5.5 degrees from the ocean, so a tilt only removes the
+extreme tail (about 24 cells around the North Pole). The share of ocean cells with a ratio
+above 2 stays at 11-13 % and moves from the polar seas to the Kuroshio region and the
+south-west Atlantic (China / Argentina) or to the subpolar North Atlantic (Greenland).
+Keeping the geographic axis also keeps the upstream RoPE unchanged, comparable with the other
+RoPE runs, and aligned with the east/north frame of u and v. `pe_global` stays on and gives
+every cell its absolute identity.
 
 ## Data
 
@@ -205,9 +214,7 @@ measures the loader start time with and without persistent workers.
 
 ## Verification before launch
 
-1. Unit tests: the scheduler ends the decay at `lr_final_decay` x sqrt(world size); the frame
-   axis keeps the representation and relative-position properties and removes the twist over
-   ocean cells (report the largest neighbour twist over cells that hold ocean points); data
+1. Unit tests: the scheduler ends the decay at `lr_final_decay` x sqrt(world size); data
    order with persistent workers equals the order without, over three mini-epochs and after a
    mid-epoch resume; `sample_stride`; the atomic write. The existing model tests keep their
    state (13 known failures in `tests/test_encoder_teacher.py`).
@@ -254,4 +261,4 @@ Rollout gate (120 days), then multi-year rollouts as in the recipe, compared wit
 ## Left to the builder
 
 File layout inside the configs, test names, the exact form of the worker-side mini-epoch
-counter, how the launcher detects a real traceback, the script that picks the frame axis.
+counter, how the launcher detects a real traceback.
