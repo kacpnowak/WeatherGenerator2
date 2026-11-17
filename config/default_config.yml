@@ -242,6 +242,7 @@ validation_config:
 
   samples_per_mini_epoch: 256
   shuffle: False
+  sample_stride: 1  # use every n-th start date (unshuffled only), to spread few samples over the period
 
   start_date: 2023-10-01T00:00
   end_date: 2023-12-31T00:00

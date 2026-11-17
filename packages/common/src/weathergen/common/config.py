@@ -204,8 +204,17 @@ def save(config: Config, mini_epoch: int | None):
     fname = _get_model_config_file_write_name(get_run_id_from_config(config), mini_epoch)
 
     json_str = json.dumps(OmegaConf.to_container(_strip_interpolation(config)))
-    with (dirname / fname).open("w") as f:
-        f.write(json_str)
+    # write to a temporary file and move it over the target, so a job killed mid-write
+    # never leaves a truncated config behind
+    target = dirname / fname
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        with tmp.open("w") as f:
+            f.write(json_str)
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def load_run_config(

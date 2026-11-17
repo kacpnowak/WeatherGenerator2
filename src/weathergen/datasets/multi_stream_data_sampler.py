@@ -250,6 +250,15 @@ def draw_prefix_steps(
     return prefix
 
 
+def stride_perms(perms: np.typing.NDArray, stride: int, shuffle: bool) -> np.typing.NDArray:
+    """Every stride-th start date, to spread an unshuffled mini-epoch over the whole period."""
+    if stride < 1:
+        raise ValueError(f"sample_stride must be at least 1, got {stride}")
+    if stride > 1 and shuffle:
+        raise ValueError("sample_stride > 1 is only supported with shuffle: False")
+    return perms if stride == 1 else perms[::stride]
+
+
 def worker_ranges(rank: int, len_per_rank: int, num_workers: int) -> list[tuple[int, int]]:
     """
     Sample range [iter_start, iter_end) of every DataLoader worker of `rank`.
@@ -375,6 +384,8 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # initialise fsm, but can change for future mini_epochs
         self.batch_size = get_batch_size_from_config(mode_cfg)
         self.shuffle = mode_cfg.shuffle
+        self.sample_stride = int(mode_cfg.get("sample_stride", 1))
+        stride_perms(np.empty(0), self.sample_stride, self.shuffle)  # validate the settings
 
         self.len_timedelta = mode_cfg.time_window_len
         self.step_timedelta = mode_cfg.time_window_step
@@ -435,7 +446,15 @@ accomodate any number of samples or forecast steps"
         )
 
         # choose correct num samples
-        if not self.repeat_data and self.samples_per_mini_epoch:
+        if self.sample_stride > 1 and not self.repeat_data and self.samples_per_mini_epoch:
+            strided_samples = -(-max_index // self.sample_stride) * self.batch_size
+            if self.samples_per_mini_epoch > strided_samples:
+                raise ValueError(
+                    f"samples_per_mini_epoch={self.samples_per_mini_epoch} exceeds the "
+                    f"{strided_samples} start dates left by sample_stride={self.sample_stride}. "
+                    "Lower sample_stride or samples_per_mini_epoch."
+                )
+        elif not self.repeat_data and self.samples_per_mini_epoch:
             if self.samples_per_mini_epoch >= available_samples:
                 logger.warning(
                     f"There are only {available_samples} available_samples, \
@@ -716,7 +735,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         # start dates must leave room for the longest spin-up before the supervised steps
         room = fsm + self._prefix_range[1]
         self.check_samples(room)
-        perms = self._calc_baseperms(room)
+        perms = stride_perms(self._calc_baseperms(room), self.sample_stride, self.shuffle)
 
         # rng changed, repeat if needed
         n_requested_idxs = self.samples_per_mini_epoch // self.batch_size
